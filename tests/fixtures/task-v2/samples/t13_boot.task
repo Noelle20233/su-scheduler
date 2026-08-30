@@ -1,0 +1,34 @@
+# Su Scheduler internal task object — schema_version=2
+# Provenance: tests/fixtures/legacy/config.txt (line 13)
+# Converted with the REAL parse_modifiers/extract_command of su-schedulerd v1.6.8
+# Legacy execution quirks preserved verbatim (docs/phase-1-baseline.md §6)
+schema_version=2
+id=t13_boot
+name=pkg
+enabled=1
+trigger=boot
+condition=
+action.command=pkg update && pkg upgrade -y
+action.notify_start=0
+action.notify_end=0
+action.delete=0
+action.termux=1
+action.interactive=0
+action.run_once_now=0
+action.boot=0
+action.msg=
+dependency=
+health.type=none
+recovery.type=none
+retry.max=0
+retry.interval=60
+source.type=line
+source.line=13
+source.raw=boot pkg update && pkg upgrade -y; : --termux
+runtime.state=idle
+runtime.run_count=0
+runtime.last_status=
+runtime.last_exit=
+runtime.last_start=
+runtime.last_end=
+runtime.pid=

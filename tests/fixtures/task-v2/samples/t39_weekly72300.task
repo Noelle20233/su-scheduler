@@ -1,0 +1,34 @@
+# Su Scheduler internal task object — schema_version=2
+# Provenance: tests/fixtures/legacy/config.txt (block 39-42)
+# Converted with the REAL parse_modifiers/extract_command of su-schedulerd v1.6.8
+# Legacy execution quirks preserved verbatim (docs/phase-1-baseline.md §6)
+schema_version=2
+id=t39_weekly72300
+name=sh
+enabled=1
+trigger=weekly:7:2300
+condition=
+action.command=sh 'echo "Weekly maintenance"\\ndf -h\\n'; :
+action.notify_start=1
+action.notify_end=1
+action.delete=0
+action.termux=0
+action.interactive=0
+action.run_once_now=0
+action.boot=0
+action.msg=Weekly backup
+dependency=
+health.type=none
+recovery.type=none
+retry.max=0
+retry.interval=60
+source.type=block
+source.line=39-42
+source.raw=weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"\necho "Weekly maintenance"\ndf -h
+runtime.state=idle
+runtime.run_count=0
+runtime.last_status=
+runtime.last_exit=
+runtime.last_start=
+runtime.last_end=
+runtime.pid=

@@ -1,0 +1,34 @@
+# Su Scheduler internal task object — schema_version=2
+# Provenance: tests/fixtures/legacy/config.txt (line 26)
+# Converted with the REAL parse_modifiers/extract_command of su-schedulerd v1.6.8
+# Legacy execution quirks preserved verbatim (docs/phase-1-baseline.md §6)
+schema_version=2
+id=t26_yearly12250800
+name=echo
+enabled=1
+trigger=yearly:12:25:0800
+condition=
+action.command=echo "Merry Christmas"
+action.notify_start=1
+action.notify_end=1
+action.delete=1
+action.termux=0
+action.interactive=0
+action.run_once_now=0
+action.boot=0
+action.msg=
+dependency=
+health.type=none
+recovery.type=none
+retry.max=0
+retry.interval=60
+source.type=line
+source.line=26
+source.raw=yearly:12:25:0800 echo "Merry Christmas"; : --delete --notify
+runtime.state=idle
+runtime.run_count=0
+runtime.last_status=
+runtime.last_exit=
+runtime.last_start=
+runtime.last_end=
+runtime.pid=
