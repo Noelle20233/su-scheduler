@@ -53,7 +53,7 @@
 | `source.type` | enum | `line` 或 `block` | 其他 | 回退：`line` | |
 | `source.line` | int 或 `a-b` | `a≥1，b≥a` | 0/负/`b<a`/非数字 | 回退：条目隔离（无来源 = 无法维护 `id`/审计） | 与实际行号一致性由审计比对（可选） |
 | `source.raw` | string | 可打印（转义存储） | 原始控制符未转义 | 回退：空 | 与 `source.line` 一致可审计 |
-| `runtime.*`（全部） | 各异 | 见 Schema §5 | 非法 | 回退：类型缺省（state=`idle`，run_count=`0`，余空） | 加载器可整体重置运行时段，但不得影响配置段；历史保留策略属于接线任务 |
+| `runtime.*`（全部） | 各异 | 见 Schema §5 | 非法 | 回退：类型缺省（state 取 P1-03 初态：enabled=1 → PENDING、enabled=0/隔离 → DISABLED；run_count=`0`，余空） | 加载器可整体重置运行时段，但不得影响配置段；历史保留策略属于接线任务；规范状态见 `docs/architecture/task-state-machine.md` |
 | **未知键** | — | — | — | **忽略 + 告警** | 未来扩展字段向后兼容（P1 宽容原则） |
 | **非 `key=value` 行**（无 `=`、空行、注释除外） | — | — | — | 忽略该行 + 告警（**不是**条目隔离） | 行级错误不株连条目 |
 

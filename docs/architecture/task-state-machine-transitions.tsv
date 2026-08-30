@@ -1,0 +1,40 @@
+# Task State Machine v2 — 允许状态转换表（单一事实源）
+# 列：FROM<TAB>TO<TAB>CAUSE<TAB>WIRING<TAB>NOTE
+# WIRING: wired = 当前可接线（config 加载/触发/结果/停止/重启/再武装）
+#         reserved = Supervisor/依赖/条件/重试 未接线（字段已预留，P1-03 只定义不接线）
+# CAUSE 令牌集合见 docs/architecture/task-state-machine.md §4 与 tests/state-machine/lib.sh
+DISABLED	PENDING	enable	wired	启用：enabled 0→1（手工/日后配置）
+PENDING	DISABLED	disable	wired	停用：enabled 1→0（配置加载/手工）
+PENDING	STARTING	time_trigger|manual_exec	wired	触发匹配（时间/boot 属 time_trigger 家族）或手动执行
+PENDING	WAITING	time_trigger	reserved	触发已匹配但被依赖/条件门控阻塞
+WAITING	PENDING	rearm	reserved	门控在窗口前解除/取消，回到待触发
+WAITING	STARTING	time_trigger|manual_exec	reserved	门控解除 → 启动
+WAITING	FAILED	action_failure	reserved	门控永久失败（如依赖任务终态失败）
+WAITING	DISABLED	disable	wired	停用（等待中）
+STARTING	RUNNING	spawn	wired	进程成功拉起（task 目录/工件就绪）
+STARTING	WAITING	spawn	reserved	启动被阻塞（资源/Supervisor 未就绪）— 预留语义，现由 spawn 失败走 FAILED
+STARTING	FAILED	action_failure	wired	spawn 失败（无法执行）
+STARTING	STOPPING	stop_request	wired	启动中收到停止请求
+RUNNING	STOPPED	action_success	wired	Action 成功（exit 0）— legacy 一次性任务主路径
+RUNNING	FAILED	action_failure|timeout	wired	Action 失败（exit≠0）或硬超时/崩溃
+RUNNING	STOPPING	stop_request|timeout|daemon_restart	wired	停止请求/超时软停/daemon 关闭
+RUNNING	HEALTHY	probe	reserved	Supervisor 健康探测通过
+HEALTHY	UNHEALTHY	probe	reserved	Supervisor 健康探测失败
+HEALTHY	STOPPED	action_success	reserved	Action 成功（运行中且健康时正常完成）
+HEALTHY	FAILED	action_failure|timeout	reserved	Action 失败/硬超时（健康态崩）
+HEALTHY	STOPPING	stop_request|daemon_restart	reserved	停止请求/daemon 关闭
+UNHEALTHY	RUNNING	probe	reserved	探测自然恢复（未触发恢复流程）
+UNHEALTHY	RECOVERING	supervisor	reserved	Supervisor 启动恢复流程
+UNHEALTHY	STOPPED	action_success	reserved	Action 仍成功完成
+UNHEALTHY	FAILED	action_failure|timeout	reserved	Action 失败/硬超时
+UNHEALTHY	STOPPING	stop_request|daemon_restart	reserved	停止请求/daemon 关闭
+RECOVERING	STARTING	supervisor	reserved	恢复完成 → 重新启动
+RECOVERING	FAILED	supervisor|action_failure	reserved	恢复失败/策略耗尽
+RECOVERING	STOPPING	stop_request	reserved	恢复中止 → 停止
+STOPPING	STOPPED	stop_request	wired	清理完成（正常停止/被干净终止）— legacy 一次性任务主路径
+STOPPING	FAILED	timeout|action_failure	wired	强制杀/清理失败
+FAILED	PENDING	rearm|manual_exec	wired	再武装：下一周期/手动重跑
+FAILED	WAITING	rearm	reserved	重试退避（retry.max/interval，P1-02 字段）
+FAILED	DISABLED	disable	wired	停用（失败后）
+STOPPED	PENDING	rearm|manual_exec	wired	再武装：下一周期/手动重跑
+STOPPED	DISABLED	disable	wired	停用（成功/停止后）

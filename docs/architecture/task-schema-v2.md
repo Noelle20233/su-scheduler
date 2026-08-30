@@ -244,29 +244,20 @@ key=value
 
 ## 9. 运行时状态机
 
-```
-        ┌──────── enabled=0 ─────────┐
-        ▼                            │
-   [disabled]                        │
-        ▲                            │  （P1 仅模型，不接线）
-        │                            │
-   [idle] ──matched/触发──▶ [running] ──退出码 0──▶ [success]
-     ▲                          │  └──退出码≠0──▶ [failed]
-     │                          │                     │
-     └────── daemon 重启清理 ◀───┴── running→[zombie]  │
-                                                       │
-                          [invalid]（校验隔离，非任务态）│
-```
+> **已由 P1-03 取代**：本节的 `runtime.state` 枚举（idle/running/success/failed/
+> zombie/disabled/invalid）是 P1-02 的**过渡占位**。规范状态机（11 态 + 35 条允许边）
+> 见 `docs/architecture/task-state-machine.md`；旧值与规范态的映射见该文档 §7
+> （`tests/state-machine/lib.sh` 的 `task_state_from_legacy` 实现）。后续任务一律
+> 使用规范状态——**不得**再向 `runtime.state` 写入本节约定之外的字符串。
 
-| v2 状态 | 对应 legacy 事实 | 转移条件 |
+| P1-02 旧值 | 规范态（P1-03） | 说明 |
 | :--- | :--- | :--- |
-| `idle` | 尚无执行记录 | 创建/重置 |
-| `running` | `status.txt=RUNNING` | 调度命中 |
-| `success` | `status.txt=SUCCESS` | exit 0 |
-| `failed` | `status.txt=FAILED` | exit ≠ 0 |
-| `zombie` | `status.txt=ZOMBIE_CRASHED` | daemon 启动发现 running 而无存活进程 |
-| `disabled` | （无对应） | enabled=0（P1 模型态） |
-| `invalid` | （无对应） | 条目校验隔离（§10.2/校验规则） |
+| `idle` | PENDING | 待触发 |
+| `running` | RUNNING | 执行中 |
+| `success` | STOPPED | 本轮成功（终态） |
+| `failed` | FAILED | 本轮失败（终态） |
+| `zombie` | FAILED | daemon 重启再水合语义（状态机 §6） |
+| `disabled` / `invalid` | DISABLED | 停用 / 隔离 |
 
 ## 10. 验收标准对照
 
