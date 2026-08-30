@@ -169,19 +169,40 @@ tpr_trigger_advanced_next_due() {
     return 1
 }
 
-# ── ActionProvider: command（现有 Shell 命令适配，全实现）──────────────────
-# 适配 legacy execute_task 语义（P1-01 §5）：异步 sh -c，输出落 task 目录。
+# ── ActionProvider: command（现有命令执行适配，P1-08 全模式）────────────────
+# 适配 legacy execute_task 语义（P1-01 §5 / su-schedulerd execute_task）：
+#   普通命令 / 脚本智能执行（chmod+x + sh -c + bash/sh 回退）/ Termux（helper
+#   status READY|LOCKED|其他 + exec，缺 helper 优雅失败，镜像 daemon L400-426）/
+#   Interactive（FIFO task.in/task.out + sh -i，镜像 daemon L345-380）。
+# 工件语义（镜像 execute_task）：
+#   standard/termux：prepare→ RUNNING+start_time；执行→ output.log（stdout+stderr
+#   合并）→ 结束 tpr_action_exec_finalize 写 exit_code.txt+end_time.txt +
+#   SUCCESS|FAILED（镜像 daemon L464-478）。
+#   interactive：结束 **只写 exit_code.txt**；status.txt 保持 prepare 的 RUNNING、
+#   无 end_time.txt/output.log（legacy 怪癖保真，daemon L369-380）。
+# start/stop/status/restart 统一四操作；P1 不实现 App/Process/Service Action。
 tpr_action_command_dir() { echo "${TPR_ACTION_DIR:-/tmp/su-scheduler-actions}/$1"; }
 tpr_action_command_validate() { [ -n "$1" ] && return 0 || return 1; }
 tpr_action_command_prepare() {
     dir=$(tpr_action_command_dir "$1")
     mkdir -p "$dir"
     echo "$2" > "$dir/command.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$dir/start_time.txt"
+    echo "RUNNING" > "$dir/status.txt"
     echo "$dir"
 }
-tpr_action_command_start() {
-    dir=$(tpr_action_command_dir "$1")
-    sh -c "$2" > "$dir/output.log" 2>&1 &
+tpr_action_command_start() {  # <id> <cmd> [termux=0|1] [interactive=0|1]
+    id=$1; cmd=$2; termux=${3:-0}; interactive=${4:-0}
+    dir=$(tpr_action_command_dir "$id")
+    (
+        if [ "$interactive" = "1" ]; then
+            tpr_action_exec_interactive "$id" "$dir" "$cmd"
+        elif [ "$termux" = "1" ]; then
+            tpr_action_exec_termux "$dir" "$cmd"
+        else
+            tpr_action_exec_smart "$dir" "$cmd"
+        fi
+    ) &
     echo $!
 }
 tpr_action_command_status() {
@@ -189,12 +210,83 @@ tpr_action_command_status() {
     [ -n "$pid" ] && [ -d "/proc/$pid" ] && return 0 || return 1
 }
 tpr_action_command_stop() { kill "$2" 2>/dev/null; }
-tpr_action_command_restart() {
+tpr_action_command_restart() {  # <id> <cmd> <old_pid> [termux] [interactive]
     tpr_action_command_stop "$1" "$3"
     sleep 1
-    tpr_action_command_start "$1" "$2"
+    tpr_action_command_start "$1" "$2" "${4:-0}" "${5:-0}"
 }
 
+# ── 内部执行器（镜像 daemon execute_task 各分支）────────────────────────────
+tpr_action_exec_finalize() {   # $1=dir $2=exit_code → 工件终态
+    dir=$1; rc=$2
+    echo "$rc" > "$dir/exit_code.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$dir/end_time.txt"
+    if [ "$rc" -eq 0 ]; then
+        echo "SUCCESS" > "$dir/status.txt"
+    else
+        echo "FAILED" > "$dir/status.txt"
+    fi
+}
+tpr_action_exec_smart() {     # $1=dir $2=cmd（普通命令 + 脚本智能执行镜像）
+    dir=$1; cmd=$2
+    first_arg=$(echo "$cmd" | awk '{print $1}')
+    if [ -f "$first_arg" ]; then
+        [ ! -x "$first_arg" ] && chmod +x "$first_arg" 2>/dev/null
+        sh -c "$cmd" > "$dir/output.log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ] && { [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; }; then
+            if command -v bash >/dev/null 2>&1; then
+                bash "$first_arg" $(echo "$cmd" | cut -d' ' -f2-) > "$dir/output.log" 2>&1
+                rc=$?
+            fi
+            if [ "$rc" -ne 0 ]; then
+                sh "$first_arg" $(echo "$cmd" | cut -d' ' -f2-) > "$dir/output.log" 2>&1
+                rc=$?
+            fi
+        fi
+    else
+        # 普通命令：sh -c 语义保持（镜像 daemon L457）
+        sh -c "$cmd" > "$dir/output.log" 2>&1
+        rc=$?
+    fi
+    tpr_action_exec_finalize "$dir" "$rc"
+}
+
+tpr_action_termux_helper() { echo "${TPR_TERMUX_HELPER:-/system/bin/su-scheduler-termux}"; }
+tpr_action_exec_termux() {    # $1=dir $2=cmd（镜像 daemon L400-426，优雅失败）
+    dir=$1; cmd=$2
+    helper=$(tpr_action_termux_helper)
+    if [ ! -x "$helper" ]; then
+        echo "ERROR: Termux helper missing" > "$dir/output.log"
+        rc=1
+    else
+        ts=$($helper status 2>/dev/null)
+        if [ "$ts" = "READY" ]; then
+            $helper exec "$cmd" > "$dir/output.log" 2>&1
+            rc=$?
+        elif [ "$ts" = "LOCKED" ]; then
+            echo "ERROR: User 0 locked" > "$dir/output.log"
+            rc=1
+        else
+            echo "ERROR: Termux not installed" > "$dir/output.log"
+            rc=1
+        fi
+    fi
+    tpr_action_exec_finalize "$dir" "$rc"
+}
+tpr_action_exec_interactive() { # $1=id $2=dir $3=cmd（镜像 daemon L345-380）
+    id=$1; dir=$2; cmd=$3
+    in="$dir/task.in"; out="$dir/task.out"
+    mkfifo "$in" 2>/dev/null || true
+    sh -i < "$in" > "$out" 2>&1 &
+    pid=$!
+    echo "$cmd" > "$in"
+    wait $pid
+    rc=$?
+    # legacy 保真（P1-01 §5 + daemon L369-380）：交互分支结束后**只写 exit_code.txt**；
+    # status.txt 保持 prepare 的 RUNNING，无 end_time.txt / output.log（基线怪癖）。
+    echo "$rc" > "$dir/exit_code.txt"
+}
 # ── HealthProvider: builtin（接口 + 空实现 stub）───────────────────────────
 tpr_health_builtin_validate() {
     case "$1" in

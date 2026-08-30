@@ -143,24 +143,115 @@ rm -f "$SF2"
 TPR_LOG=0 provider_dispatch trigger advanced matches 'nweekly:2:5:1400' >/dev/null 2>&1 \
     && bad "nweekly no-context should not match" || ok "nweekly no-context rejected"
 
-# ── 5) Action：CommandActionProvider 生命周期（真实异步进程） ────────────────
+# ── 5) Action：CommandActionProvider 生命周期与全模式（P1-08）───────────────
+# 引擎式调用约定：start/restart 的 stdout=PID，**引擎用文件接收后读取**（镜像
+# daemon `echo $! > pid.txt`），不用命令替换（命令替换内启动的后台子 shell 的
+# PID 在本测试环境 /proc 不可见——探针实证；引擎接线亦采用文件/变量接收）。
 ACT_DIR=$(mktemp -d)
 export TPR_ACTION_DIR="$ACT_DIR"
 TPR_LOG=0 provider_dispatch action command validate 'sleep 3' >/dev/null 2>&1 && ok "action validate cmd" || bad "action validate"
 TPR_LOG=0 provider_dispatch action command validate '' >/dev/null 2>&1 && bad "action validate empty should fail" || ok "action validate empty rejected"
 dir=$(TPR_LOG=0 provider_dispatch action command prepare task1 'sleep 3')
 [ -f "$dir/command.txt" ] && [ "$(cat "$dir/command.txt")" = 'sleep 3' ] && ok "action prepare creates task dir + command.txt" || bad "action prepare"
-pid=$(TPR_LOG=0 provider_dispatch action command start task1 'sleep 3')
+[ -f "$dir/start_time.txt" ] && [ "$(cat "$dir/status.txt")" = "RUNNING" ] && \
+    ok "action prepare writes start_time + status=RUNNING" || bad "action prepare start_time/status"
+TPR_LOG=0 provider_dispatch action command start task1 'sleep 3' > "$ACT_DIR/task1.pid" 2>/dev/null
+pid=$(cat "$ACT_DIR/task1.pid")
 [ -n "$pid" ] && ok "action start pid=$pid" || bad "action start"
 TPR_LOG=0 provider_dispatch action command status task1 "$pid" >/dev/null 2>&1 && ok "action status alive" || bad "action status alive"
 TPR_LOG=0 provider_dispatch action command stop task1 "$pid" >/dev/null 2>&1
 sleep 1
 TPR_LOG=0 provider_dispatch action command status task1 "$pid" >/dev/null 2>&1 && bad "action status should be dead after stop" || ok "action status dead after stop"
-pid2=$(TPR_LOG=0 provider_dispatch action command restart task1 'sleep 3' "$pid")
+TPR_LOG=0 provider_dispatch action command restart task1 'sleep 3' "$pid" > "$ACT_DIR/task1.pid2" 2>/dev/null
+pid2=$(cat "$ACT_DIR/task1.pid2")
 [ -n "$pid2" ] && [ "$pid2" != "$pid" ] && ok "action restart new pid=$pid2" || bad "action restart"
 TPR_LOG=0 provider_dispatch action command stop task1 "$pid2" >/dev/null 2>&1
 sleep 1
 TPR_LOG=0 provider_dispatch action command stop task1 "$pid2" >/dev/null 2>&1 || true
+
+# P1-08：运行一个任务到结束并返回任务目录（引擎式 start；轮询 exit_code.txt/进程）。
+act_run() {   # <id> <cmd> [termux] [interactive] → dir
+    d=$(TPR_LOG=0 provider_dispatch action command prepare "$1" "$2")
+    TPR_LOG=0 provider_dispatch action command start "$1" "$2" "${3:-0}" "${4:-0}" > "$ACT_DIR/$1.pid" 2>/dev/null
+    p=$(cat "$ACT_DIR/$1.pid")
+    i=0
+    while [ "$i" -lt 30 ]; do
+        [ -f "$d/exit_code.txt" ] && break
+        TPR_LOG=0 provider_dispatch action command status "$1" "$p" >/dev/null 2>&1 || break
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "$d"
+}
+act_assert_out() {  # <dir> <expect-substr> → ok/bad
+    if [ -f "$1/output.log" ] && grep -q "$2" "$1/output.log"; then
+        ok "act output.log contains '$2'"
+    else
+        bad "act output.log missing '$2'"
+    fi
+}
+
+# 5a) 普通命令成功：stdout+stderr 合并落 output.log；exit 0；SUCCESS；end_time 存在
+d=$(act_run plain_ok 'echo out-line; echo err-line >&2')
+[ -f "$d/exit_code.txt" ] && [ "$(cat "$d/exit_code.txt")" = "0" ] && ok "plain cmd exit_code=0" || bad "plain cmd exit_code"
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "SUCCESS" ] && ok "plain cmd status=SUCCESS" || bad "plain cmd status"
+act_assert_out "$d" "out-line"
+act_assert_out "$d" "err-line"
+[ -f "$d/end_time.txt" ] && ok "plain cmd end_time.txt written" || bad "plain cmd end_time missing"
+
+# 5b) 普通命令失败：FAILED + exit_code 非 0（验收：Action 失败能返回 failure 和 exit_code）
+d=$(act_run plain_fail 'echo bad; exit 3')
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "FAILED" ] && ok "fail cmd status=FAILED" || bad "fail cmd status"
+[ -f "$d/exit_code.txt" ] && [ "$(cat "$d/exit_code.txt")" = "3" ] && ok "fail cmd exit_code=3" || bad "fail cmd exit_code"
+
+# 5c) 脚本智能执行：无 shebang 脚本文件（镜像 daemon L428-454，sh 回退）
+SCRIPT1="$ACT_DIR/myscript.sh"
+printf 'echo from-plain-script\n' > "$SCRIPT1"
+d=$(act_run script_plain "$SCRIPT1")
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "SUCCESS" ] && ok "script (no shebang) SUCCESS" || bad "script (no shebang) status"
+act_assert_out "$d" "from-plain-script"
+
+# 5d) 脚本智能执行：坏 shebang → sh -c 126/127 → bash/sh 回退（镜像 daemon L442-453）
+SCRIPT2="$ACT_DIR/badshebang.sh"
+printf '#!/bin/definitely-not-exist\nprintf from-fallback\n' > "$SCRIPT2"
+d=$(act_run script_fallback "$SCRIPT2")
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "SUCCESS" ] && ok "script (bad shebang) fallback SUCCESS" || bad "script (bad shebang) fallback status"
+act_assert_out "$d" "from-fallback"
+
+# 5e) Termux：helper 缺失 → 优雅失败（镜像 daemon L422-426）
+TPR_TERMUX_HELPER="$ACT_DIR/no-such-helper" \
+    d=$(act_run termux_missing 'echo t' 1)
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "FAILED" ] && ok "termux missing status=FAILED" || bad "termux missing status"
+[ -f "$d/exit_code.txt" ] && [ "$(cat "$d/exit_code.txt")" = "1" ] && ok "termux missing exit_code=1" || bad "termux missing exit_code"
+act_assert_out "$d" "Termux helper missing"
+
+# 5f) Termux：helper READY → exec 执行（镜像 daemon L404-412）
+MOCK_TERMUX="$ACT_DIR/su-scheduler-termux"
+printf '#!/usr/bin/env bash\nif [ "$1" = status ]; then echo READY; elif [ "$1" = exec ]; then shift; bash -c "$*"; fi\n' > "$MOCK_TERMUX"
+chmod +x "$MOCK_TERMUX"
+TPR_TERMUX_HELPER="$MOCK_TERMUX" \
+    d=$(act_run termux_ready 'echo from-termux' 1)
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "SUCCESS" ] && ok "termux READY status=SUCCESS" || bad "termux READY status"
+act_assert_out "$d" "from-termux"
+
+# 5g) Termux：helper LOCKED → ERROR: User 0 locked（镜像 daemon L413-416）
+printf '#!/usr/bin/env bash\n[ "$1" = status ] && echo LOCKED\n' > "$MOCK_TERMUX"
+chmod +x "$MOCK_TERMUX"
+TPR_TERMUX_HELPER="$MOCK_TERMUX" \
+    d=$(act_run termux_locked 'echo t' 1)
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "FAILED" ] && ok "termux LOCKED status=FAILED" || bad "termux LOCKED status"
+act_assert_out "$d" "User 0 locked"
+
+# 5h) Interactive：FIFO + sh -i（镜像 daemon L345-380）——legacy 保真怪癖：
+#     结束后只写 exit_code.txt；status.txt 保持 RUNNING；无 end_time/output.log
+d=$(act_run inter 'echo hi-from-interactive; exit' 0 1)
+[ -f "$d/exit_code.txt" ] && [ "$(cat "$d/exit_code.txt")" = "0" ] && ok "interactive exit_code=0" || bad "interactive exit_code"
+[ -f "$d/task.out" ] && grep -q "hi-from-interactive" "$d/task.out" && ok "interactive task.out has output" || bad "interactive task.out"
+[ -f "$d/status.txt" ] && [ "$(cat "$d/status.txt")" = "RUNNING" ] && \
+    ok "interactive status stays RUNNING (legacy mirror)" || bad "interactive status should stay RUNNING"
+[ -f "$d/end_time.txt" ] && bad "interactive end_time should NOT exist (legacy mirror)" || ok "interactive no end_time (legacy mirror)"
+[ -f "$d/output.log" ] && bad "interactive output.log should NOT exist (legacy mirror)" || ok "interactive no output.log (legacy mirror)"
+
 rm -rf "$ACT_DIR"
 
 # ── 6) Health/Recovery 空实现 ───────────────────────────────────────────────

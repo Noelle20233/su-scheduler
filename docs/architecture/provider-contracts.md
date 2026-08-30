@@ -112,13 +112,14 @@ Provider = (kind, name, prefix)
 | :--- | :--- | :--- | :--- | :--- |
 | trigger | boot | `tpr_trigger_boot` | 全实现 | Boot 触发（daemon 启动上下文匹配，P1-01 §5.1 语义） |
 | trigger | time | `tpr_trigger_time` | 全实现 | HHMM/HH:MM 日常触发（P1-01 §5.2 语义） |
-| action | command | `tpr_action_command` | 全实现 | 现有 Shell 命令适配（§8） |
+| trigger | advanced | `tpr_trigger_advanced` | 全实现（P1-07 注册） | weekly/nweekly/monthly/nmonthly/yearly（镜像 daemon `should_run_advanced_schedule`，**只判断**不写状态；去重键写入归决策层 mark） |
+| action | command | `tpr_action_command` | 全实现（P1-08 全模式） | 现有命令/脚本/Termux/Interactive 适配（§8） |
 | health | builtin | `tpr_health_builtin` | 接口+空实现 | `check` 恒 ok（Supervisor 未接线，P1-02 health.type=none） |
 | recovery | builtin | `tpr_recovery_builtin` | 接口+空实现 | `recover` 恒 no-op（recovery.type=none） |
 
-> 进阶触发（weekly/nweekly/monthly/nmonthly/yearly）**不在**当前注册表——它们与
-> time 同属 trigger kind，后续作为新 trigger Provider 注册（或扩展 time Provider
-> 的 `parse`/`matches`），不改分发与状态机（§10 模板）。
+> 进阶触发（weekly/nweekly/monthly/nmonthly/yearly）与 time 同属 trigger kind，
+> 以独立 Provider `trigger>advanced` 注册（P1-07）；新增 Provider 不改分发与
+> 状态机（§10 模板）。
 
 ## 6. 接口调用约定
 
@@ -164,14 +165,25 @@ Provider = (kind, name, prefix)
 
 ## 8. CommandActionProvider 适配
 
-- **适配对象**：现有 Shell 命令任务（legacy `execute_task` 语义，P1-01 §5）。
-  映射：`sh -c "<command>" > <task_dir>/output.log 2>&1 &`（异步）；PID 回显；
-  `status` 用 `/proc/<pid>` 存活判定；`stop` 用 `kill`（与 `task-kill` 的杀法
-  一致，P1-01 §5.10）；`prepare` 建 task 目录并写 `command.txt`。
-- **局限（如实记录）**：当前实现是“无状态 shell 命令”适配。legacy 的
-  `--termux`/`--interactive`/智能脚本执行（P1-01 §5.4-5.5）属于**同一合同下的
-  后续 Provider 扩展**（可新注册 `action>termux`、`action>interactive`，或将命令
-  预处理留给引擎）——核心与分发零改动。
+- **适配对象**：现有 Shell 命令任务（legacy `execute_task` 语义，P1-01 §5），
+  即 `action>command` 注册（P1-04 起）并在 P1-08 扩展到**全执行模式**。
+- **统一四操作**（能力契约 §4）：`validate`/`prepare`（建任务目录 +
+  `command.txt`/`start_time.txt`/`status.txt`=RUNNING）/`start`（stdout=PID，
+  引擎式接收）/`stop`（`kill`，与 `task-kill` 思路一致）/`status`（`/proc/<pid>`
+  存活判定）/`restart`。
+- **执行模式（P1-08，镜像 daemon `execute_task` 各分支）**：
+  - 普通命令：`sh -c "<cmd>" > output.log 2>&1`（stdout+stderr 合并）；
+  - 脚本智能执行：首参为文件 → `chmod +x` → `sh -c`，126/127 时
+    `bash`/`sh` 回退（daemon L428-454）；
+  - Termux：`su-scheduler-termux status` READY→`exec` / LOCKED→`User 0 locked` /
+    其他→`Termux not installed` / helper 缺失→`Termux helper missing`（均
+    `output.log` + exit 1 优雅失败，daemon L400-426）；
+  - Interactive：FIFO `task.in`/`task.out` + `sh -i`（daemon L345-380）——
+    **legacy 保真怪癖**：结束后只写 `exit_code.txt`，status 留 RUNNING、无
+    `end_time.txt`/`output.log`（P1-01 基线 §6 记录）。
+- **结束工件**（普通/Termux/脚本）：`exit_code.txt` + `end_time.txt` +
+  `status.txt`(SUCCESS|FAILED)，镜像 daemon L464-478。
+- **P1 范围**：不实现 App/Process/Service Action（§12）。
 - 空命令语义：`command=""` 仍合法（legacy `sh -c ""` 退 0，P1-02 §5）。
 
 ## 9. Health / Recovery 接口与空实现
