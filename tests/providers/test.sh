@@ -56,10 +56,11 @@ done
 
 # ── 2) 静态注册表 ───────────────────────────────────────────────────────────
 count=$(echo "$TPR_REGISTRY" | tr ' ' '\n' | sed '/^$/d' | wc -l)
-[ "$count" -eq 5 ] && ok "registry has 5 providers (got $count)" || bad "registry expected 5, got $count"
+[ "$count" -eq 6 ] && ok "registry has 6 providers (got $count)" || bad "registry expected 6, got $count"
 
 [ "$(provider_lookup trigger boot)" = "tpr_trigger_boot" ]    && ok "lookup trigger>boot"    || bad "lookup trigger>boot"
 [ "$(provider_lookup trigger time)" = "tpr_trigger_time" ]    && ok "lookup trigger>time"    || bad "lookup trigger>time"
+[ "$(provider_lookup trigger advanced)" = "tpr_trigger_advanced" ] && ok "lookup trigger>advanced" || bad "lookup trigger>advanced"
 [ "$(provider_lookup action command)" = "tpr_action_command" ] && ok "lookup action>command" || bad "lookup action>command"
 [ "$(provider_lookup health builtin)" = "tpr_health_builtin" ]   && ok "lookup health>builtin"  || bad "lookup health>builtin"
 [ "$(provider_lookup recovery builtin)" = "tpr_recovery_builtin" ] && ok "lookup recovery>builtin" || bad "lookup recovery>builtin"
@@ -74,9 +75,9 @@ TPR_LOG=0 provider_register sensor x y >/dev/null 2>&1 && bad "register unknown 
 TPR_LOG=0 provider_dispatch trigger boot validate boot >/dev/null 2>&1 && ok "boot validate 'boot'" || bad "boot validate 'boot'"
 TPR_LOG=0 provider_dispatch trigger boot validate '08:30' >/dev/null 2>&1 && bad "boot provider should reject '08:30'" || ok "boot rejects '08:30'"
 [ "$(TPR_LOG=0 provider_dispatch trigger boot parse boot)" = "kind=boot" ] && ok "boot parse -> kind=boot" || bad "boot parse"
-TPR_LOG=0 TPR_BOOT_CONTEXT=1 provider_dispatch trigger boot matches boot >/dev/null 2>&1 && ok "boot matches in boot context" || bad "boot matches in context"
-TPR_LOG=0 TPR_BOOT_CONTEXT=0 provider_dispatch trigger boot matches boot >/dev/null 2>&1 && bad "boot should not match outside context" || ok "boot no match outside context"
-due=$(TPR_LOG=0 TPR_BOOT_CONTEXT=1 provider_dispatch trigger boot next_due boot) && [ "$due" = 0 ] && ok "boot next_due=0 in context" || bad "boot next_due in context"
+TPR_LOG=0 TRIGGER_BOOT_CONTEXT=1 provider_dispatch trigger boot matches boot >/dev/null 2>&1 && ok "boot matches in boot context" || bad "boot matches in context"
+TPR_LOG=0 TRIGGER_BOOT_CONTEXT=0 provider_dispatch trigger boot matches boot >/dev/null 2>&1 && bad "boot should not match outside context" || ok "boot no match outside context"
+due=$(TPR_LOG=0 TRIGGER_BOOT_CONTEXT=1 provider_dispatch trigger boot next_due boot) && [ "$due" = 0 ] && ok "boot next_due=0 in context" || bad "boot next_due in context"
 TPR_LOG=0 provider_dispatch trigger boot next_due boot >/dev/null 2>&1 && bad "boot next_due outside context should fail" || ok "boot next_due outside context rejected"
 
 # ── 3/4) Trigger：time ──────────────────────────────────────────────────────
@@ -104,6 +105,43 @@ fi
 # 默认分发（kind 第一个）：trigger 默认 = boot
 TPR_LOG=0 provider_dispatch_default trigger validate boot >/dev/null 2>&1 && ok "dispatch_default trigger validate 'boot' (first=boot)" || bad "dispatch_default trigger validate boot"
 TPR_LOG=0 provider_dispatch_default trigger validate '08:30' >/dev/null 2>&1 && bad "dispatch_default should use boot (reject 08:30)" || ok "dispatch_default first=boot rejects '08:30'"
+
+# ── 4b) Trigger：advanced（weekly/nweekly/monthly/nmonthly/yearly 封装）────────
+# P1-07：现有高级调度封装为 TriggerProvider（只判断；去重键读取，不写状态）。
+for t in weekly:1:0800 nweekly:2:5:1400 monthly:15:1200 nmonthly:3:01:0900 yearly:12:25:0800; do
+    TPR_LOG=0 provider_dispatch trigger advanced validate "$t" >/dev/null 2>&1 && ok "advanced validate '$t'" || bad "advanced validate '$t'"
+done
+TPR_LOG=0 provider_dispatch trigger advanced validate '08:30' >/dev/null 2>&1 && bad "advanced should reject '08:30'" || ok "advanced rejects plain time"
+TPR_LOG=0 provider_dispatch trigger advanced validate 'nweekly:0:5:1400' >/dev/null 2>&1 && ok "advanced accepts nweekly syntax (shape check)" || bad "advanced rejects nweekly"
+[ "$(TPR_LOG=0 provider_dispatch trigger advanced parse 'weekly:1:0800')" = "kind=advanced;family=weekly" ] && ok "advanced parse weekly" || bad "advanced parse weekly"
+TPR_LOG=0 provider_dispatch trigger advanced parse 'yearly:12:25:0800' >/dev/null 2>&1 && ok "advanced parse yearly" || bad "advanced parse yearly"
+
+# 星期匹配（注入 TRIGGER_TODAY=周一；状态文件为空 → 应匹配）——只判不写
+MON=$(date -d 'monday' +%Y%m%d 2>/dev/null || date +%Y%m%d)
+SF=$(mktemp)
+TRIGGER_TODAY=$MON TRIGGER_DECISION_NOW=0900 TRIGGER_DECISION_LINE='weekly:1:0800 echo w' \
+    TRIGGER_STATE_FILE="$SF" TPR_LOG=0 provider_dispatch trigger advanced matches 'weekly:1:0800' >/dev/null 2>&1 \
+    && ok "advanced weekly matches on Monday 09:00 (state empty, decision-only)" \
+    || bad "advanced weekly should match Monday 09:00"
+[ -s "$SF" ] && bad "advanced matches wrote state (decision-only violation!)" || ok "advanced matches did NOT write state (decision-only)"
+# 已记录去重键 → 不应再匹配（只在判断期 reads 的镜像）
+printf 'weekly_1_0800_%s_%s\n' "$(printf '%s\n' 'weekly:1:0800 echo w' | md5sum | cut -d' ' -f1)" "$(date -d "$MON" +%Y%m%d)" > "$SF"
+TRIGGER_TODAY=$MON TRIGGER_DECISION_NOW=0900 TRIGGER_DECISION_LINE='weekly:1:0800 echo w' \
+    TRIGGER_STATE_FILE="$SF" TPR_LOG=0 provider_dispatch trigger advanced matches 'weekly:1:0800' >/dev/null 2>&1 \
+    && bad "advanced should NOT re-match after dedup key exists" \
+    || ok "advanced dedup: no re-match on same period (state read respected)"
+rm -f "$SF"
+# 其他日期（周中）不匹配
+WED=$(date -d 'wednesday' +%Y%m%d 2>/dev/null || date +%Y%m%d)
+[ "$WED" != "$MON" ] || WED=$(date -d 'monday +2 days' +%Y%m%d)
+SF2=$(mktemp)
+TRIGGER_TODAY=$WED TRIGGER_DECISION_NOW=0900 TRIGGER_DECISION_LINE='weekly:1:0800 echo w' \
+    TRIGGER_STATE_FILE="$SF2" TPR_LOG=0 provider_dispatch trigger advanced matches 'weekly:1:0800' >/dev/null 2>&1 \
+    && bad "advanced weekly should not match on Wednesday" || ok "advanced weekly no match on Wednesday"
+rm -f "$SF2"
+# nweekly 语法可识别并接受（格式形状；实际周差在决策层测试）
+TPR_LOG=0 provider_dispatch trigger advanced matches 'nweekly:2:5:1400' >/dev/null 2>&1 \
+    && bad "nweekly no-context should not match" || ok "nweekly no-context rejected"
 
 # ── 5) Action：CommandActionProvider 生命周期（真实异步进程） ────────────────
 ACT_DIR=$(mktemp -d)
