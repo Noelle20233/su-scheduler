@@ -1,0 +1,24 @@
+# Golden: daemon heredoc reconstruction (config block -> single line)
+
+HEADER: 09:15 python <<EOF; : --termux --notify
+RECONSTRUCTED: 09:15 python 'print("hello from python")
+'; : : --termux --notify
+PARSE_MODIFIERS(RECON):
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=1 run_once_now=0
+  custom_msg=""
+EXTRACT_CMD(RECON): python 'print("hello from python")
+:
+
+HEADER: weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"
+RECONSTRUCTED: weekly:7:2300 sh 'echo "Weekly maintenance"
+df -h
+'; : : --notify --msg="Weekly backup"
+PARSE_MODIFIERS(RECON):
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg="Weekly backup"
+EXTRACT_CMD(RECON): sh 'echo "Weekly maintenance"
+-h
+:
+

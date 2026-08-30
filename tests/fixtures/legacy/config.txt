@@ -1,0 +1,45 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Su Scheduler — LEGACY CONFIG FIXTURE (baseline of existing behavior)
+# ───────────────────────────────────────────────────────────────────────────
+# Status : ACTIVATED GOLDEN INPUT — do NOT edit without re-deriving goldens.
+# Purpose: Locks the v1.6.8 config semantics: triggers, modifiers, heredoc.
+# Derive : bash tests/fixtures/legacy/tools/derive-goldens.sh
+# Format : <trigger> <command>; : <modifiers>   (per customize.sh template)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── trigger: boot ─────────────────────────────────────────────────────────
+boot echo "Boot marker written"; : --notify
+boot sh; : --interactive
+boot pkg update && pkg upgrade -y; : --termux
+
+# ─── trigger: HH:MM / HHMM (daily time) ───────────────────────────────────
+08:30 logcat -c; : --notify-end --msg="Logs cleared"
+0830 echo "Daily ping" >> /sdcard/ping.log
+
+# ─── triggers: weekly / nweekly ───────────────────────────────────────────
+weekly:1:0800 echo "Monday task"; : --notify-start
+nweekly:2:5:1400 echo "Biweekly Friday task"
+
+# ─── triggers: monthly / nmonthly / yearly ────────────────────────────────
+monthly:01:0000 echo "Month start"; : --notify
+nmonthly:3:15:1200 echo "Quarterly task"; : --msg="Quarterly done"
+yearly:12:25:0800 echo "Merry Christmas"; : --delete --notify
+
+# ─── modifiers: --termux / --delete / --run-once-now / --interactive ──────
+14:30 echo "Run me now"; : --run-once-now --notify
+08:00 echo "One-shot delete me"; : --delete
+10:00 echo "Interactive era"; : --interactive
+boot /sdcard/Documents/su-scheduler/backup.sh; : --delete
+
+# ─── heredoc multiline blocks ─────────────────────────────────────────────
+09:15 python <<EOF; : --termux --notify
+print("hello from python")
+EOF
+
+weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"
+echo "Weekly maintenance"
+df -h
+EOF
+
+# ─── plain line without modifiers ─────────────────────────────────────────
+22:00 echo "No modifiers at all"

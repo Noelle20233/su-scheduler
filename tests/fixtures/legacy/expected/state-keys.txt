@@ -1,0 +1,27 @@
+# Golden: structure of schedule_state.txt keys (should_run_advanced_schedule)
+# KEY FORMATS (daemon v1.6.8):
+#   weekly:   weekly_<dow>_<hhmm>_<md5(linenl)>_<YYYYMMDD>
+#   monthly:  monthly_<day>_<hhmm>_<md5(linenl)>_<YYYYMM>
+#   yearly:   yearly_<MMDD>_<hhmm>_<md5(linenl)>_<YYYY>
+#   nweekly:  nweekly_<n>_<dow>_<hhmm>_<md5(linenl)>=<week>
+#   nmonthly: nmonthly_<n>_<day>_<hhmm>_<md5(linenl)>=<month>
+# (md5 covers the whole line INCLUDING its trailing newline: echo + pipe.)
+
+LINE: weekly:1:0800 echo "Monday task"; : --notify-start
+  KEY: weekly_1_0800_6a689b08817b1050ab3b8bcf932e935b_YYYYMMDD
+
+LINE: nweekly:2:5:1400 echo "Biweekly Friday task"
+  KEY: nweekly_2_5_1400_3579b0a18831ba5c4f9d293d0e604614=<current_week>
+
+LINE: monthly:01:0000 echo "Month start"; : --notify
+  KEY: monthly_01_0000_b19f8efbb553468dcbe08aa3842a3968_YYYYMM
+
+LINE: nmonthly:3:15:1200 echo "Quarterly task"; : --msg="Quarterly done"
+  KEY: nmonthly_3_15_1200_bd27248c73c68d9cbd5017865e2dd02c=<current_month>
+
+LINE: yearly:12:25:0800 echo "Merry Christmas"; : --delete --notify
+  KEY: yearly_12_25_98285bf0ef2ff39364dd160e6cb2409c_YYYY
+
+LINE: weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"
+  KEY: weekly_7_2300_a8d3dab1ec3b51c8195376ebe005b3e0_YYYYMMDD
+

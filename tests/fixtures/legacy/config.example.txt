@@ -1,0 +1,137 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# 🔥 Su Scheduler Configuration File 🔥
+# ═══════════════════════════════════════════════════════════════════════════
+# Author: Rex Ackermann
+# Location: /sdcard/Documents/su-scheduler/config.txt
+# Edit: su-scheduler edit
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📖 QUICK START GUIDE
+# ═══════════════════════════════════════════════════════════════════════════
+# Format: <trigger> <command>; : <modifiers>
+#
+# TRIGGERS:
+#   boot              - Run on every boot
+#   HHMM or HH:MM     - Daily at specific time (e.g., 0830 or 08:30)
+#   weekly:DAY:HHMM   - Weekly (1=Mon, 7=Sun) e.g., weekly:1:0800
+#   monthly:DD:HHMM   - Monthly on day DD e.g., monthly:15:1200
+#   yearly:MM:DD:HHMM - Yearly e.g., yearly:01:01:0000
+#
+# MODIFIERS:
+#   : --delete        - Run once and remove from schedule
+#   : --boot          - Also run on boot (for time-based tasks)
+#   : --notify        - Send notification on start & completion
+#   : --notify-start  - Notify only on start
+#   : --notify-end    - Notify only on completion
+#   : --msg="text"    - Custom notification message
+#   : --interactive   - Run in interactive shell mode
+#   : --termux        - Execute in Termux environment
+#
+# COMMANDS:
+#   su-scheduler add <trigger> "<command>"  - Add new task
+#   su-scheduler list                       - List all tasks
+#   su-scheduler remove <line>              - Remove task
+#   su-scheduler edit                       - Edit this file
+#   su-scheduler log -f                     - Follow logs
+#   su-scheduler tasks                      - List running tasks
+#   su-scheduler help                       - Show full documentation
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🏁 BOOT TASKS - Run when device starts
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: Create boot marker
+# boot touch /sdcard/Documents/su-scheduler/boot-$(date +%Y%m%d-%H%M%S).log
+
+# Example: Boot notification
+# boot echo "Device booted at $(date)"; : --notify --msg="System Ready"
+
+# Example: Start interactive shell for debugging
+# boot sh; : --interactive
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ⏰ TIME-BASED TASKS - Run at specific times daily
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: Clear logs every morning at 8 AM
+# 08:00 logcat -c; : --notify-end --msg="Logs cleared"
+
+# Example: Night mode at 10 PM
+# 22:00 settings put system screen_brightness 10
+
+# Example: Backup at 3 AM
+# 03:00 /sdcard/Documents/su-scheduler/backup.sh; : --notify
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📅 WEEKLY TASKS - Run on specific day of week
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: Weekly backup every Sunday at 11 PM
+# weekly:7:2300 /sdcard/Documents/su-scheduler/weekly-backup.sh; : --notify
+
+# Example: Monday morning cleanup
+# weekly:1:0900 find /sdcard/Download -mtime +30 -delete; : --notify-end
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📆 MONTHLY TASKS - Run on specific day of month
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: Monthly report on the 1st at midnight
+# monthly:01:0000 /sdcard/Documents/su-scheduler/monthly-report.sh; : --notify
+
+# Example: Cleanup on the 15th
+# monthly:15:0300 find /sdcard -name ".cache" -type d -delete
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🎂 YEARLY TASKS - Run once per year
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: New Year celebration
+# yearly:01:01:0000 echo "Happy New Year!"; : --notify --msg="🎉 Happy New Year!"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 🐧 TERMUX TASKS - Execute in Termux environment
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: Python script in Termux
+# 09:00 python /sdcard/Documents/su-scheduler/backup.py; : --termux --notify
+
+# Example: Update Termux packages on boot
+# boot pkg update && pkg upgrade -y; : --termux --notify-end
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📜 MULTILINE CODE BLOCKS - Complex scripts
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Example: Multiline backup script
+# boot sh <<EOF; : --notify --msg="Backup Complete"
+# echo "Starting backup..."
+# cd /sdcard
+# mkdir -p Backups/$(date +%Y%m%d)
+# tar -czf Backups/$(date +%Y%m%d)/backup.tar.gz Documents/
+# echo "Backup complete!"
+# EOF
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 💡 MORE EXAMPLES
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Battery monitoring
+# 08:00 dumpsys battery > /sdcard/Documents/su-scheduler/battery-$(date +%H%M).log
+
+# WiFi scan
+# 12:00 dumpsys wifi > /sdcard/Documents/su-scheduler/wifi-scan.log
+
+# System info
+# boot uname -a > /sdcard/Documents/su-scheduler/system-info.txt
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 📚 DOCUMENTATION
+# ═══════════════════════════════════════════════════════════════════════════
+# Full documentation: su-scheduler help
+# Interactive guide: su-scheduler help --interactive
+# Termux guide: su-scheduler help --termux
+# Scheduling guide: su-scheduler help --scheduling
+# ═══════════════════════════════════════════════════════════════════════════

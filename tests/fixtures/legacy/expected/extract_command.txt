@@ -1,0 +1,68 @@
+# Golden: daemon extract_command() applied to every active fixture line
+
+LINE: boot echo "Boot marker written"; : --notify
+CMD: echo "Boot marker written"
+
+LINE: boot sh; : --interactive
+CMD: sh
+
+LINE: boot pkg update && pkg upgrade -y; : --termux
+CMD: pkg update && pkg upgrade -y
+
+LINE: 08:30 logcat -c; : --notify-end --msg="Logs cleared"
+CMD: logcat -c
+
+LINE: 0830 echo "Daily ping" >> /sdcard/ping.log
+CMD: echo "Daily ping" >> /sdcard/ping.log
+
+LINE: weekly:1:0800 echo "Monday task"; : --notify-start
+CMD: echo "Monday task"
+
+LINE: nweekly:2:5:1400 echo "Biweekly Friday task"
+CMD: echo "Biweekly Friday task"
+
+LINE: monthly:01:0000 echo "Month start"; : --notify
+CMD: echo "Month start"
+
+LINE: nmonthly:3:15:1200 echo "Quarterly task"; : --msg="Quarterly done"
+CMD: echo "Quarterly task"
+
+LINE: yearly:12:25:0800 echo "Merry Christmas"; : --delete --notify
+CMD: echo "Merry Christmas"
+
+LINE: 14:30 echo "Run me now"; : --run-once-now --notify
+CMD: echo "Run me now"
+
+LINE: 08:00 echo "One-shot delete me"; : --delete
+CMD: echo "One-shot delete me"
+
+LINE: 10:00 echo "Interactive era"; : --interactive
+CMD: echo "Interactive era"
+
+LINE: boot /sdcard/Documents/su-scheduler/backup.sh; : --delete
+CMD: /sdcard/Documents/su-scheduler/backup.sh
+
+LINE: 09:15 python <<EOF; : --termux --notify
+CMD: python <<EOF
+
+LINE: print("hello from python")
+CMD: from python")
+
+LINE: EOF
+CMD: EOF
+
+LINE: weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"
+CMD: sh <<EOF
+
+LINE: echo "Weekly maintenance"
+CMD: "Weekly maintenance"
+
+LINE: df -h
+CMD: -h
+
+LINE: EOF
+CMD: EOF
+
+LINE: 22:00 echo "No modifiers at all"
+CMD: echo "No modifiers at all"
+

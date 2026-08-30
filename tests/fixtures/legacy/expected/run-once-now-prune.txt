@@ -1,0 +1,5 @@
+# Golden: daemon --run-once-now prune of the config line
+
+ORIGINAL: 14:30 echo "Run me now"; : --run-once-now --notify
+PRUNED:   14:30 echo "Run me now"; : --notify
+

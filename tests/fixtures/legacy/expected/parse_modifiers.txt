@@ -1,0 +1,115 @@
+# Golden: daemon parse_modifiers() applied to every active fixture line
+# Flags correspond to the daemon global vars (v1.6.8).
+# NOTE: heredoc lines are shown raw here; see heredoc-reconstruction.txt
+#       for the reconstructed-line behaviour.
+
+LINE: boot echo "Boot marker written"; : --notify
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: boot sh; : --interactive
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=1 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: boot pkg update && pkg upgrade -y; : --termux
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=1 run_once_now=0
+  custom_msg=""
+
+LINE: 08:30 logcat -c; : --notify-end --msg="Logs cleared"
+  notify_start=0 notify_end=1 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg="Logs cleared"
+
+LINE: 0830 echo "Daily ping" >> /sdcard/ping.log
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: weekly:1:0800 echo "Monday task"; : --notify-start
+  notify_start=1 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: nweekly:2:5:1400 echo "Biweekly Friday task"
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: monthly:01:0000 echo "Month start"; : --notify
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: nmonthly:3:15:1200 echo "Quarterly task"; : --msg="Quarterly done"
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg="Quarterly done"
+
+LINE: yearly:12:25:0800 echo "Merry Christmas"; : --delete --notify
+  notify_start=1 notify_end=1 delete_after=1
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: 14:30 echo "Run me now"; : --run-once-now --notify
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=0 run_once_now=1
+  custom_msg=""
+
+LINE: 08:00 echo "One-shot delete me"; : --delete
+  notify_start=0 notify_end=0 delete_after=1
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: 10:00 echo "Interactive era"; : --interactive
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=1 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: boot /sdcard/Documents/su-scheduler/backup.sh; : --delete
+  notify_start=0 notify_end=0 delete_after=1
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: 09:15 python <<EOF; : --termux --notify
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=1 run_once_now=0
+  custom_msg=""
+
+LINE: print("hello from python")
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: EOF
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"
+  notify_start=1 notify_end=1 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg="Weekly backup"
+
+LINE: echo "Weekly maintenance"
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: df -h
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: EOF
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
+LINE: 22:00 echo "No modifiers at all"
+  notify_start=0 notify_end=0 delete_after=0
+  interactive=0 use_termux=0 run_once_now=0
+  custom_msg=""
+
