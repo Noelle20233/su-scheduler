@@ -91,7 +91,8 @@ emit_task() {
         echo "source.type=$stype"
         echo "source.line=$sline"
         echo "source.raw=$(esc "$sraw")"
-        echo "runtime.state=idle"
+        # P1-03 state machine: canonical default for enabled=1 is PENDING
+        echo "runtime.state=PENDING"
         echo "runtime.run_count=0"
         echo "runtime.last_status="
         echo "runtime.last_exit="

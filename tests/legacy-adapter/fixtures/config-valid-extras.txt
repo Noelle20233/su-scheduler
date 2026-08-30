@@ -1,0 +1,20 @@
+# Legacy Config Adapter — 有效扩展 fixture（P1-05）
+# 本文件只包含"合法但少见"的 legacy 形态（补充 tests/fixtures/legacy/config.txt）：
+#   形态 1：只有触发器、无命令的行（legacy 执行 = sh -c ""，exit 0 → 合法空命令任务）
+#   形态 2：注释行 / 空白行 / 全空白行（都被跳过，且不产生任务）
+#   形态 3：无 EOF 终止符的 heredoc（unterminated）——legacy daemon 读到文件尾
+#           接受（P1-01 §4.4），adapter 保持同一语义
+# 行号核对：由测试用 grep 定位（注释中的数字仅供参考；物理行号以 grep -n 为准）。
+# 行为要点：无 EOF 终止符的块在文件尾结束；但末尾行（无换行）不被内层 read
+# 消费（daemon 内层 heredoc read 无换行 guard——P1-01 §4.4 镜像语义）。
+
+boot
+
+# 注释行（本行物理行号 14）不产生任务
+
+    
+14:30
+
+08:00 sh <<EOF; : --notify
+echo "block without EOF terminator"
+df -h

@@ -25,7 +25,7 @@ retry.interval=60
 source.type=block
 source.line=39-42
 source.raw=weekly:7:2300 sh <<EOF; : --notify --msg="Weekly backup"\necho "Weekly maintenance"\ndf -h
-runtime.state=idle
+runtime.state=PENDING
 runtime.run_count=0
 runtime.last_status=
 runtime.last_exit=

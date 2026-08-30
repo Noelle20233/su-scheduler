@@ -49,6 +49,8 @@
 4. **source.raw** = legacy 原文（转义存储；heredoc 块不含 EOF 行，块体间为**真实换行**、
    存储转义为 `\n`；而 `action.command` 内的**字面** `\n`（daemon L641 拼接结果）转义为
    `\\n`——两种形态含义不同，解码器须区分）；
+5. **runtime.state** 使用 P1-03 规范初态 `PENDING`（enabled=1 默认态；P1-02 过渡值
+   `idle` 已废弃，映射见 `docs/architecture/task-state-machine.md` §7）；
 5. **怪癖禁止修正**：boot+`--delete` 不自毁、yearly 实现格式、`--boot` 保留标志等
    一律照录（Schema §8.3）。
 6. **编辑纪律**：改动 `tests/fixtures/legacy/config.txt` 后必须重跑生成器并 diff：
