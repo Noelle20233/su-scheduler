@@ -11,7 +11,8 @@ for suite in \
     "tests/scheduling/trigger-decision/test.sh" \
     "tests/execution/action-run/test.sh" \
     "tests/runtime/test.sh" \
-    "tests/lifecycle/test.sh"; do
+    "tests/lifecycle/test.sh" \
+    "tests/task-cli/test.sh"; do
     echo "== $suite =="
     out=$(bash "$suite" 2>&1)
     rc=$?
