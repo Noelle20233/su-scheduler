@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# ═══ P2-01 兼容保留 ═══
+# 本脚本已被 tests/run_tests.sh（唯一统一入口：L1+L2+L4，可选 L3）取代，
+# 保留仅为既有 P1 入口兼容；新任务/CI 一律使用 tests/run_tests.sh。
 # 全量回归（P1 五套）：全部 [PASS] 无 [FAIL] 且 exit 0 才算绿。
 set -u
 cd "$(dirname "$0")/.." || exit 2

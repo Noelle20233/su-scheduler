@@ -1,0 +1,44 @@
+name: Regression Test (P0 gates)
+
+# P2-01：补齐全量回归 CI 入口（P0 AGENTS T0 交付物）。
+# 只使用 GitHub Actions 标准 runner 自带工具（bash/sh/coreutils/grep/sed/
+# awk/zip/unzip —— C3 合规），无 adb/设备，L3 不参与；host 侧 L1+L2+L4 全绿
+# 即为 CI 门禁（P0 出口标准 1）。设备 L3 冒烟由本地 `--with-device` 人工执行
+# 并把结果回填 docs/P2-01.md（D3 例外流程）。
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'system/**'
+      - 'service.sh'
+      - 'customize.sh'
+      - 'build.sh'
+      - 'bump_version.sh'
+      - 'module.prop'
+      - 'update.json'
+      - 'README.md'
+      - 'tests/**'
+      - '.github/workflows/test.yml'
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  host-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run unified host regression (L1 + L2 + L4)
+        run: bash tests/run_tests.sh
+
+      - name: Upload trace log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run_tests-trace
+          path: tests/results/*.log
+          retention-days: 14

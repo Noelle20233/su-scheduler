@@ -12,6 +12,10 @@
 # 可选 --with-device：追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
 #   无 adb/设备时明示 DEVICE_SKIPPED，不计失败）。
 # 判定（AGENTS §4）：输出中不得出现 [FAIL]；全部套件通过则 exit 0。
+# ── P2-01 兼容保留 ─────────────────────────────────────────────────────────
+# 唯一回归入口已统一为 tests/run_tests.sh（L1 + L2 + L4，可选 L3 --with-device；
+# 含 lint、legacy golden、CLI 行为门禁与 trace 日志）。本脚本为 P1 层专用
+# 子入口，行为与判定不变，仍可单独使用。
 # ═══════════════════════════════════════════════════════════════════════════
 set -u
 cd "$(dirname "$0")/.." || exit 2   # 仓库根

@@ -1361,3 +1361,48 @@ su-scheduler task-output <task_id>
   `docs/P1-HANDOVER.md` §5，任何文档不得把它们表述为已完成。
 - **升级与回滚**：P1 零生产改动，升级 = 合入 P1 提交（无迁移）；回滚 =
   删除 P1 层与文档（生产零影响）。命令级手册见 `docs/P1-UPGRADE-ROLLBACK.md`。
+
+---
+
+## 🧪 回归测试（P2-01 追加）
+
+> 本章节为 P2-01 追加，不改动本文件既有任何章节。P0/P1 门禁的**唯一回归入口**
+> 已统一为 `tests/run_tests.sh`（取代并覆盖此前的 `tests/run_p1.sh` 与
+> `tests/_run_all.sh`；后两者保留为兼容子入口，见下）。
+
+### 唯一入口与层级
+
+```bash
+bash tests/run_tests.sh                # 全量：L1 + L2 + L4（无设备）
+bash tests/run_tests.sh --with-device  # 追加 L3 设备冒烟（无设备 → DEVICE_SKIPPED）
+bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检查）
+```
+
+| 层 | 内容 | 套件 |
+| :-- | :-- | :-- |
+| L1 | 静态语法（`sh -n` / `bash -n`，LF 归一，CRLF 检出亦通过） | `tests/lint/syntax.sh` |
+| L2 | legacy 解析 golden 锁定（真实函数复现 + 逐字节比对） | `tests/legacy/golden.sh` |
+| L2 | `--delete` 删除管线语义锁定（Q13：单激活行 `grep -v && mv` 短路） | `tests/legacy/delete-pipeline.sh` |
+| L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
+| L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
+| L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |
+| L3 | 设备冒烟（真实 KernelSU 设备，`adb` 通道） | `tests/p1-device/smoke.sh` |
+
+**判定**：输出不得出现 `[FAIL]`；允许跳过项仅限 L3（`DEVICE_SKIPPED` 明示）与
+CRLF 检出下的构建执行（`[SKIP]` 明示，CI/LF 为构建闸）。**结果可追溯**：每次
+运行把完整逐层输出落盘 `tests/results/run_tests-<时间戳>.log`（`*.log` 已被
+`.gitignore` 忽略，不污染工作树），末尾打印日志路径。
+
+### CI 门禁
+
+`.github/workflows/test.yml`：`main` push（生产/测试/文档变更路径）与 PR 上运行
+`bash tests/run_tests.sh`（`ubuntu-latest` 标准 runner 自带工具，C3 合规；
+无 adb → L3 不参与）。失败时上传 trace 日志工件（14 天保留）。
+
+### 兼容性说明
+
+- `bash tests/run_p1.sh` 仍可用：P1 层专用子入口（9 套 + p1-regression + build-check），
+  不含 L1 与 CLI 门禁——新任务请使用 `tests/run_tests.sh`。
+- `tests/_run_all.sh` 已由 `tests/run_tests.sh` 取代（不再作为推荐入口）。
+- Q1–Q4/Q9/Q11/Q12 处理与 Q10（`--boot`）决策记录见 `docs/P2-01.md`；基线文档
+  `docs/phase-1-baseline.md` §6.1 有逐项状态表。
