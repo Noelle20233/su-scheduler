@@ -44,6 +44,28 @@ mkdir -p "$SHELLS_DIR"
 mkdir -p "$AUDIT_DIR"
 [ ! -f "$AUDIT_LOG" ] && touch "$AUDIT_LOG"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# ⚙️ Production Runtime Library（P2-02）：与 su-scheduler（CLI）共用同一套
+#   Registry / Provider / State / Runtime / Lifecycle / Task-CLI 原语
+#   （/system/bin/su-scheduler-runtime）。加载契约见库头：
+#   - 库缺失 / 不可读 / 语法破损 / selfcheck 不通过 → RUNTIME_LOADED=0；
+#   - **legacy 路径原样继续**（本库是叠加层，不修改既有行为路径——C2）；
+#   - 本 daemon 启动时仅记录一次 WARNING（不中断、不重试、不降级功能）。
+# ═══════════════════════════════════════════════════════════════════════════
+RUNTIME_LIB="/system/bin/su-scheduler-runtime"
+RUNTIME_LOADED=0
+if [ -f "$RUNTIME_LIB" ] && [ -r "$RUNTIME_LIB" ]; then
+    . "$RUNTIME_LIB" 2>/dev/null && RUNTIME_LOADED=1 || RUNTIME_LOADED=0
+fi
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    runtime_lib_selfcheck >/dev/null 2>&1 || RUNTIME_LOADED=0
+fi
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] ⚙️ Runtime library loaded (v${RUNTIME_LIB_VERSION:-?})" >> "$LOG_FILE" 2>/dev/null
+else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Runtime library unavailable ($RUNTIME_LIB); legacy mode active" >> "$LOG_FILE" 2>/dev/null
+fi
+
 # 📝 Function to log events with pretty timestamps and colors
 log_msg() {
     local level="$1"

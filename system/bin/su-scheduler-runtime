@@ -1,0 +1,1147 @@
+#!/system/bin/sh
+# ═══════════════════════════════════════════════════════════════════════════
+# su-scheduler-runtime — 生产 Runtime 库（P2-02）
+# ═══════════════════════════════════════════════════════════════════════════
+# 性质：daemon（su-schedulerd）与 CLI（su-scheduler）**共用同一套**生产运行时
+#      原语的可加载 Shell 库。内容 = P1-01..P1-11 已验证原语的生产化整理：
+#        §1 State Machine  （P1-03）    task_state_* / TSM_*
+#        §2 Legacy Adapter （P1-05）    legacy_adapter_parse（内部助手 rt_* 前缀）
+#        §3 Provider 契约  （P1-04/07/08） provider_* / TPR_* + 静态 Provider
+#        §4 Runtime 状态/事件（P1-09）  runtime_*
+#        §5 Canonical Registry（P1-06） registry_*
+#        §6 Lifecycle      （P1-10）    lifecycle_*
+#        §7 Task 只读 CLI  （P1-11）    task_cli_*
+#      依赖顺序：§1→§2→§3→§4→§5→§6→§7（本文件内已按序排列；单文件自包含，
+#      不 source 任何外部文件——与测试域 P1 库**路径隔离**：测试库不改动，本库
+#      零引用测试域路径（路径隔离门禁由 P2-02 回归套件断言，记录见 docs/P2-02.md）。
+# ═══════════════════════════════════════════════════════════════════════════
+# 约束（C3）：纯 POSIX sh + Android 系统命令（echo/printf/sed/grep/awk/cut/
+#  sort/ls/date/mkdir/rm/mv/cat/mkfifo/kill/sleep/nohup/chmod/md5sum/type），
+#  无外部运行时。**不启用 set -u**（不改变宿主脚本的 nounset 状态）。
+# ═══════════════════════════════════════════════════════════════════════════
+# 命名空间：除 P1 契约名外，adapter 内部解析助手统一 `rt_` 前缀，避免覆盖
+#  daemon/CLI 既有同名 legacy 函数（parse_modifiers / extract_command 等——
+#  C2 保护：daemon 解析路径必须保持逐字节原样）。
+# ═══════════════════════════════════════════════════════════════════════════
+# 加载失败 fallback（daemon/CLI 加载契约，见两者头部加载块）：
+#   库缺失 / 不可读 / 语法破损 / selfcheck 不通过 → RUNTIME_LOADED=0；
+#   调用方**legacy 路径原样继续**（本库是叠加层，不修改既有行为路径）；
+#   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
+# ═══════════════════════════════════════════════════════════════════════════
+
+RUNTIME_LIB_VERSION="1.0.0"
+
+# ───────────────────────────────────────────────────────────────────────────
+# §1 State Machine（P1-03 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# 11 个规范状态 / 触发原因令牌 / 允许转换（单一事实源；与
+# docs/architecture/task-state-machine-transitions.tsv 镜像）。
+TSM_STATES='DISABLED PENDING WAITING STARTING RUNNING HEALTHY UNHEALTHY RECOVERING FAILED STOPPING STOPPED'
+TSM_CAUSES='config_load time_trigger manual_exec action_success action_failure timeout daemon_restart stop_request rearm enable disable supervisor spawn probe'
+TSM_ALLOWED='DISABLED>PENDING PENDING>DISABLED PENDING>STARTING PENDING>WAITING WAITING>PENDING WAITING>STARTING WAITING>FAILED WAITING>DISABLED STARTING>RUNNING STARTING>WAITING STARTING>FAILED STARTING>STOPPING RUNNING>STOPPED RUNNING>FAILED RUNNING>STOPPING RUNNING>HEALTHY HEALTHY>UNHEALTHY HEALTHY>STOPPED HEALTHY>FAILED HEALTHY>STOPPING UNHEALTHY>RUNNING UNHEALTHY>RECOVERING UNHEALTHY>STOPPED UNHEALTHY>FAILED UNHEALTHY>STOPPING RECOVERING>STARTING RECOVERING>FAILED RECOVERING>STOPPING STOPPING>STOPPED STOPPING>FAILED FAILED>PENDING FAILED>WAITING FAILED>DISABLED STOPPED>PENDING STOPPED>DISABLED'
+
+task_state_log() {
+    [ "${TSM_LOG:-1}" = "1" ] && echo "[WARNING] $1" >&2
+}
+
+task_state_is_valid() {
+    case " $TSM_STATES " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+task_state_cause_is_valid() {
+    case " $TSM_CAUSES " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+task_state_transition() {
+    from=$1
+    to=$2
+    cause=${3:-}
+    if ! task_state_is_valid "$from" || ! task_state_is_valid "$to"; then
+        task_state_log "state-machine: unknown state in transition '$from'->'$to'"
+        return 1
+    fi
+    case " $TSM_ALLOWED " in
+        *" $from>$to "*)
+            if [ -n "$cause" ] && ! task_state_cause_is_valid "$cause"; then
+                task_state_log "state-machine: unknown cause '$cause' for allowed edge '$from'->'$to'"
+                return 2
+            fi
+            return 0
+            ;;
+        *)
+            task_state_log "state-machine: ILLEGAL transition '$from'->'$to' rejected${cause:+ (cause=$cause)}"
+            return 1
+            ;;
+    esac
+}
+
+task_state_rehydrate() {
+    case "$1" in
+        STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|STOPPING) echo FAILED ;;
+        *) echo "$1" ;;
+    esac
+}
+
+task_state_from_legacy() {
+    case "$1" in
+        RUNNING|running)   echo RUNNING ;;
+        SUCCESS|success)   echo STOPPED ;;
+        FAILED|failed|ZOMBIE_CRASHED|zombie) echo FAILED ;;
+        invalid|disabled)  echo DISABLED ;;
+        idle)              echo PENDING ;;
+        *)                 echo "$1" ;;
+    esac
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# §2 Legacy Config Adapter（P1-05 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# config.txt → 内部 Task v2；legacy 全部语义保持（P1-01 基线）。返回码：
+#   0=全行成功 / 1=行级错误（合法行仍产出，错误行不产出）/ 2=文件级错误。
+# 内部助手以 rt_ 前缀命名（见库头命名空间说明），不覆盖 daemon/CLI 同名函数。
+rt_clean() { echo "$1" | tr -d '\r' | sed 's/^[ \t]*//;s/[ \t]*$//'; }
+rt_norm()  { echo "$1" | sed 's/://g'; }
+rt_first_word() { echo "$1" | awk '{print $1}'; }
+rt_esc() {
+    printf '%s' "$1" | awk '{ gsub(/\\/, "\\\\"); if (NR>1) printf "\\n"; printf "%s", $0 }'
+}
+rt_parse_modifiers() {
+    line=$1
+    notify_start=0; notify_end=0; delete_after=0; interactive=0
+    use_termux=0; run_once_now=0; custom_msg=""
+    mods=$(echo "$line" | sed -n 's/.* : //p')
+    if [ -n "$mods" ]; then
+        echo "$mods" | grep -q -- '--run-once-now' && run_once_now=1
+        echo "$mods" | grep -q -- '--notify-start' && notify_start=1
+        echo "$mods" | grep -q -- '--notify-end' && notify_end=1
+        if echo "$mods" | grep -q -- '--notify' && ! echo "$mods" | grep -E -q -- '--notify-(start|end)'; then
+            notify_start=1
+            notify_end=1
+        fi
+        echo "$mods" | grep -q -- '--delete' && delete_after=1
+        echo "$mods" | grep -q -- '--interactive' && interactive=1
+        echo "$mods" | grep -q -- '--termux' && use_termux=1
+        if echo "$mods" | grep -q -- '--msg='; then
+            custom_msg=$(echo "$mods" | sed -n 's/.*--msg="\([^"]*\)".*/\1/p')
+        fi
+    fi
+}
+# 单空格分隔（确定性：首 token 之后；无第二个 token → 空，镜像 P1-02）
+rt_extract_command() {
+    line=$1
+    raw_cmd=$(printf '%s' "$line" | awk '{ rest=$0; if (sub(/^[^ ]+[ ]/, "", rest)) print rest; else print "" }')
+    echo "$raw_cmd" | sed 's/[ \t]*;*[ \t]*:[ \t]*--.*//'
+}
+legacy_adapter_task_id() {   # <line> <trigger> → echo id
+    echo "t${1}_$(rt_norm "$2")"
+}
+_rt_emit_task() {
+    id=$1; trigger=$2; action=$3; stype=$4; sline=$5; sraw=$6; subject=$7
+    boot_flag=0
+    echo "$subject" | grep -q -- '--boot' && boot_flag=1
+    name=$(rt_first_word "$action")
+    [ -n "$name" ] || name="task"
+    name=$(printf '%s' "$name" | cut -c1-40)
+    f="$out/$id.task"
+    t="$f.tmp"
+    tmp="$t"
+    {
+        echo "schema_version=2"
+        echo "id=$id"
+        echo "name=$(rt_esc "$name")"
+        echo "enabled=1"
+        echo "trigger=$(rt_esc "$trigger")"
+        echo "condition="
+        echo "action.command=$(rt_esc "$action")"
+        echo "action.notify_start=$notify_start"
+        echo "action.notify_end=$notify_end"
+        echo "action.delete=$delete_after"
+        echo "action.termux=$use_termux"
+        echo "action.interactive=$interactive"
+        echo "action.run_once_now=$run_once_now"
+        echo "action.boot=$boot_flag"
+        echo "action.msg=$(rt_esc "$custom_msg")"
+        echo "dependency="
+        echo "health.type=none"
+        echo "recovery.type=none"
+        echo "retry.max=0"
+        echo "retry.interval=60"
+        echo "source.type=$stype"
+        echo "source.line=$sline"
+        echo "source.raw=$(rt_esc "$sraw")"
+        echo "runtime.state=PENDING"
+        echo "runtime.run_count=0"
+        echo "runtime.last_status="
+        echo "runtime.last_exit="
+        echo "runtime.last_start="
+        echo "runtime.last_end="
+        echo "runtime.pid="
+    } > "$t"
+    mv "$t" "$f"
+    tmp=""
+    echo "task=$id file=$f"
+}
+legacy_adapter_parse() {
+    config=$1
+    out=${2:-}
+    rc=0
+
+    if [ ! -f "$config" ]; then
+        echo "[legacy-adapter] ERROR: config file not found: $config" >&2
+        return 2
+    fi
+    if [ -z "$out" ]; then
+        echo "[legacy-adapter] ERROR: out_dir required" >&2
+        return 2
+    fi
+    if ! mkdir -p "$out"; then
+        echo "[legacy-adapter] ERROR: cannot create out_dir: $out" >&2
+        return 2
+    fi
+
+    tmp=""
+    trap 'rm -f "$tmp"' INT TERM HUP
+
+    lineno=0
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        cl=$(rt_clean "$line")
+        case "$cl" in
+            \#*|"") continue ;;
+        esac
+
+        trigger=$(echo "$cl" | awk '{print $1}')
+
+        if printf '%s' "$trigger" | grep -q '[[:cntrl:]]'; then
+            echo "[legacy-adapter] ERROR $config:${lineno}: trigger contains control character: '$trigger'" >&2
+            rc=1
+            continue
+        fi
+
+        if echo "$cl" | grep -q '<<EOF'; then
+            cmd_start=$(echo "$cl" | sed 's/^[^ ]* //' | sed 's/ *<<EOF.*//')
+            multiline_cmd=""
+            block_raw="$cl"
+            j=0
+            found_eof=0
+            while IFS= read -r block_line; do
+                if echo "$block_line" | grep -q '^EOF'; then
+                    found_eof=1
+                    break
+                fi
+                j=$((j + 1))
+                multiline_cmd="${multiline_cmd}${block_line}\n"
+                block_raw="$block_raw
+${block_line}"
+            done
+            mods=$(echo "$cl" | sed -n 's/.*\(: --[^;]*\).*/\1/p')
+            reconstructed="$trigger $cmd_start '$multiline_cmd'; : $mods"
+            if [ "$found_eof" -eq 1 ]; then
+                end=$((lineno + j + 1))
+            else
+                end=$((lineno + j))
+            fi
+
+            rt_parse_modifiers "$reconstructed"
+            action=$(rt_extract_command "$reconstructed")
+            id=$(legacy_adapter_task_id "$lineno" "$trigger")
+            _rt_emit_task "$id" "$trigger" "$action" "block" "${lineno}-${end}" "$block_raw" "$reconstructed"
+
+            if [ "$found_eof" -eq 1 ]; then
+                lineno=$((lineno + j + 1))
+            else
+                lineno=$((lineno + j))
+            fi
+            continue
+        fi
+
+        rt_parse_modifiers "$cl"
+        action=$(rt_extract_command "$cl")
+        id=$(legacy_adapter_task_id "$lineno" "$trigger")
+        _rt_emit_task "$id" "$trigger" "$action" "line" "$lineno" "$line" "$cl"
+    done < "$config"
+
+    trap - INT TERM HUP
+    return "$rc"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# §3 Provider 契约 + 静态 Provider（P1-04/07/08 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# kind: trigger | action | health | recovery；name 同 kind 内唯一；
+# prefix: 能力函数统一前缀；provider_dispatch 是引擎唯一依赖入口。
+TPR_KINDS='trigger action health recovery'
+TPR_CAPS_ALL='validate parse matches next_due prepare start stop status restart check recover'
+TPR_CAPS_TRIGGER='validate parse matches next_due'
+TPR_CAPS_ACTION='validate prepare start stop status restart'
+TPR_CAPS_HEALTH='validate check'
+TPR_CAPS_RECOVERY='validate recover'
+TPR_CAPS_REQUIRED='trigger>validate trigger>parse trigger>matches action>validate action>prepare action>start health>validate health>check recovery>validate recovery>recover'
+TPR_REGISTRY=''
+
+provider_log() {
+    [ "${TPR_LOG:-1}" = "1" ] && echo "[provider] $1" >&2
+}
+
+provider_kind_is_valid() {
+    case " $TPR_KINDS " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+provider_cap_is_valid() {
+    case " $TPR_CAPS_ALL " in
+        *" $1 "*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+provider_cap_is_of_kind() {
+    cap=$1
+    case "$2" in
+        trigger)  case " $TPR_CAPS_TRIGGER " in *" $cap "*) return 0 ;; *) return 1 ;; esac ;;
+        action)   case " $TPR_CAPS_ACTION " in *" $cap "*) return 0 ;; *) return 1 ;; esac ;;
+        health)   case " $TPR_CAPS_HEALTH " in *" $cap "*) return 0 ;; *) return 1 ;; esac ;;
+        recovery) case " $TPR_CAPS_RECOVERY " in *" $cap "*) return 0 ;; *) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+}
+
+provider_register() {
+    kind=$1; name=$2; prefix=$3
+    provider_kind_is_valid "$kind" || { provider_log "register: unknown kind '$kind'"; return 1; }
+    case " $TPR_REGISTRY " in
+        *" $kind>$name>"*) provider_log "register: duplicate '$kind>$name'"; return 1 ;;
+    esac
+    TPR_REGISTRY="$TPR_REGISTRY $kind>$name>$prefix"
+    return 0
+}
+
+provider_lookup() {
+    kind=$1; name=${2:-}
+    for entry in $TPR_REGISTRY; do
+        f1=${entry%%>*}
+        rest=${entry#*>}
+        f2=${rest%%>*}
+        pre=${rest#*>}
+        if [ "$f1" = "$kind" ] && { [ -z "$name" ] || [ "$f2" = "$name" ]; }; then
+            echo "$pre"
+            return 0
+        fi
+    done
+    return 1
+}
+
+provider_dispatch() {
+    kind=$1; name=$2; cap=$3
+    shift 3
+    provider_kind_is_valid "$kind" || { provider_log "dispatch: unknown kind '$kind'"; return 1; }
+    provider_cap_is_valid "$cap" || { provider_log "dispatch: unknown capability '$cap'"; return 2; }
+    provider_cap_is_of_kind "$cap" "$kind" || { provider_log "dispatch: capability '$cap' not in kind '$kind'"; return 2; }
+    prefix=$(provider_lookup "$kind" "$name") || {
+        provider_log "dispatch: no $kind provider named '$name' registered"
+        return 1
+    }
+    fn="${prefix}_${cap}"
+    type "$fn" >/dev/null 2>&1 || { provider_log "dispatch: provider '$prefix' lacks capability '$cap'"; return 2; }
+    "$fn" "$@"
+}
+
+provider_dispatch_default() {
+    kind=$1; cap=$2
+    shift 2
+    provider_kind_is_valid "$kind" || { provider_log "dispatch_default: unknown kind '$kind'"; return 1; }
+    provider_cap_is_valid "$cap" || { provider_log "dispatch_default: unknown capability '$cap'"; return 2; }
+    provider_cap_is_of_kind "$cap" "$kind" || { provider_log "dispatch_default: capability '$cap' not in kind '$kind'"; return 2; }
+    prefix=$(provider_lookup "$kind") || {
+        provider_log "dispatch_default: no $kind provider registered"
+        return 1
+    }
+    fn="${prefix}_${cap}"
+    type "$fn" >/dev/null 2>&1 || { provider_log "dispatch_default: provider '$prefix' lacks capability '$cap'"; return 2; }
+    "$fn" "$@"
+}
+
+# ── 上下文助手 ────────────────────────────────────────────────────────────
+tpr_ctx_now()  { echo "${TRIGGER_DECISION_NOW:-$(date +%H%M)}"; }
+tpr_ctx_date() { # $1 = strftime 格式；TRIGGER_TODAY=YYYYMMDD 时用 -d 镜像（测试确定性）
+    if [ -n "${TRIGGER_TODAY:-}" ]; then date -d "$TRIGGER_TODAY" "+$1"; else date "+$1"; fi
+}
+tpr_ctx_state_file() { echo "${TRIGGER_STATE_FILE:-/data/adb/su-scheduler/schedule_state.txt}"; }
+tpr_ctx_line_md5() {
+    printf '%s\n' "${TRIGGER_DECISION_LINE:-}" | md5sum | cut -d' ' -f1
+}
+
+# ── TriggerProvider: boot ─────────────────────────────────────────────────
+tpr_trigger_boot_validate() {
+    [ "$1" = "boot" ] && return 0 || return 1
+}
+tpr_trigger_boot_parse() { echo "kind=boot"; }
+tpr_trigger_boot_matches() {
+    [ "${TRIGGER_BOOT_CONTEXT:-0}" = "1" ] && return 0 || return 1
+}
+tpr_trigger_boot_next_due() {
+    if [ "${TRIGGER_BOOT_CONTEXT:-0}" = "1" ]; then echo 0; return 0; fi
+    return 1
+}
+
+# ── TriggerProvider: time（分钟级）────────────────────────────────────────
+tpr_trigger_time_norm() { echo "$1" | sed 's/://g'; }
+tpr_trigger_time_validate() {
+    case "$(tpr_trigger_time_norm "$1")" in
+        [0-9][0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+tpr_trigger_time_parse() {
+    echo "kind=time;time=$(tpr_trigger_time_norm "$1")"
+}
+tpr_trigger_time_matches() {
+    [ -n "$1" ] || return 1
+    [ "$(tpr_trigger_time_norm "$1")" = "$(tpr_ctx_now)" ] && return 0 || return 1
+}
+tpr_trigger_time_next_due() {
+    norm=$(tpr_trigger_time_norm "$1")
+    case "$norm" in
+        [0-9][0-9][0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    th=$(echo "$norm" | cut -c1-2); tm=$(echo "$norm" | cut -c3-4)
+    th=$(echo "$th" | sed 's/^0*//'); tm=$(echo "$tm" | sed 's/^0*//')
+    [ -z "$th" ] && th=0; [ -z "$tm" ] && tm=0
+    nh=$(date +%H | sed 's/^0*//'); nm=$(date +%M | sed 's/^0*//')
+    [ -z "$nh" ] && nh=0; [ -z "$nm" ] && nm=0
+    target=$((th * 60 + tm)); now=$((nh * 60 + nm))
+    if [ "$target" -gt "$now" ]; then
+        echo $(((target - now) * 60))
+    elif [ "$target" -eq "$now" ]; then
+        echo 0
+    else
+        echo $(((1440 - now + target) * 60))
+    fi
+    return 0
+}
+
+# ── TriggerProvider: advanced（镜像 should_run_advanced_schedule，只判断）───
+tpr_trigger_advanced_validate() {
+    case "$1" in
+        weekly:*|nweekly:*|monthly:*|nmonthly:*|yearly:*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+tpr_trigger_advanced_parse() {
+    case "$1" in
+        weekly:*)  echo "kind=advanced;family=weekly" ;;
+        nweekly:*) echo "kind=advanced;family=nweekly" ;;
+        monthly:*) echo "kind=advanced;family=monthly" ;;
+        nmonthly:*) echo "kind=advanced;family=nmonthly" ;;
+        yearly:*)  echo "kind=advanced;family=yearly" ;;
+    esac
+}
+_tpr_adv_read() {  # $1=行；返回 0 若状态文件含该行（去重判定，只读）
+    sf=$(tpr_ctx_state_file)
+    [ -f "$sf" ] && grep -qF "$1" "$sf"
+}
+tpr_trigger_advanced_matches() {
+    trigger=$1
+    now=$(tpr_ctx_now)
+    hash=$(tpr_ctx_line_md5)
+    yy=$(tpr_ctx_date %Y); mm=$(tpr_ctx_date %m); dd=$(tpr_ctx_date %d)
+    dow=$(tpr_ctx_date %u); wk=$(tpr_ctx_date %V)
+    mmdd="${mm}${dd}"; yymm="${yy}${mm}"; yymmdd="${yy}${mm}${dd}"
+
+    case "$trigger" in
+        weekly:*)
+            tdow=$(echo "$trigger" | cut -d: -f2); ttime=$(echo "$trigger" | cut -d: -f3)
+            if [ "$dow" = "$tdow" ] && [ "$now" -ge "$ttime" ] \
+               && ! _tpr_adv_read "weekly_${tdow}_${ttime}_${hash}_${yymmdd}"; then
+                return 0
+            fi ;;
+        nweekly:*)
+            n=$(echo "$trigger" | cut -d: -f2); tdow=$(echo "$trigger" | cut -d: -f3)
+            ttime=$(echo "$trigger" | cut -d: -f4)
+            key="nweekly_${n}_${tdow}_${ttime}_${hash}"
+            last=$(grep "^${key}=" "$(tpr_ctx_state_file)" 2>/dev/null | cut -d= -f2)
+            if [ "$dow" = "$tdow" ] && [ "$now" -ge "$ttime" ] && {
+                [ -z "$last" ] || [ $(((wk - last + 53) % 53)) -ge "$n" ]; }; then
+                return 0
+            fi ;;
+        monthly:*)
+            tdd=$(echo "$trigger" | cut -d: -f2); ttime=$(echo "$trigger" | cut -d: -f3)
+            if [ "$dd" = "$tdd" ] && [ "$now" -ge "$ttime" ] \
+               && ! _tpr_adv_read "monthly_${tdd}_${ttime}_${hash}_${yymm}"; then
+                return 0
+            fi ;;
+        nmonthly:*)
+            n=$(echo "$trigger" | cut -d: -f2); tdd=$(echo "$trigger" | cut -d: -f3)
+            ttime=$(echo "$trigger" | cut -d: -f4)
+            key="nmonthly_${n}_${tdd}_${ttime}_${hash}"
+            last=$(grep "^${key}=" "$(tpr_ctx_state_file)" 2>/dev/null | cut -d= -f2)
+            lt=$((yy * 12 + ${last:-0})); tt=$((yy * 12 + mm))
+            [ "$lt" -gt "$tt" ] && lt=$(((yy - 1) * 12 + last))
+            if [ "$dd" = "$tdd" ] && [ "$now" -ge "$ttime" ] && {
+                [ -z "$last" ] || [ $((tt - lt)) -ge "$n" ]; }; then
+                return 0
+            fi ;;
+        yearly:*)
+            tdate=$(echo "$trigger" | cut -d: -f2); ttime=$(echo "$trigger" | cut -d: -f3)
+            if [ "$mmdd" = "$tdate" ] && [ "$now" -ge "$ttime" ] \
+               && ! _tpr_adv_read "yearly_${tdate}_${ttime}_${hash}_${yy}"; then
+                return 0
+            fi ;;
+        *) return 1 ;;
+    esac
+    return 1
+}
+tpr_trigger_advanced_next_due() {
+    if tpr_trigger_advanced_matches "$1"; then echo 0; return 0; fi
+    return 1
+}
+
+# ── ActionProvider: command（P1-08 全模式，镜像 execute_task）──────────────
+tpr_action_command_dir() { echo "${TPR_ACTION_DIR:-/tmp/su-scheduler-actions}/$1"; }
+tpr_action_command_validate() { [ -n "$1" ] && return 0 || return 1; }
+tpr_action_command_prepare() {
+    dir=$(tpr_action_command_dir "$1")
+    mkdir -p "$dir"
+    echo "$2" > "$dir/command.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$dir/start_time.txt"
+    echo "RUNNING" > "$dir/status.txt"
+    echo "$dir"
+}
+tpr_action_command_start() {  # <id> <cmd> [termux] [interactive]
+    id=$1; cmd=$2; termux=${3:-0}; interactive=${4:-0}
+    dir=$(tpr_action_command_dir "$id")
+    (
+        if [ "$interactive" = "1" ]; then
+            tpr_action_exec_interactive "$id" "$dir" "$cmd"
+        elif [ "$termux" = "1" ]; then
+            tpr_action_exec_termux "$dir" "$cmd"
+        else
+            tpr_action_exec_smart "$dir" "$cmd"
+        fi
+    ) &
+    echo $!
+}
+tpr_action_command_status() {
+    pid=$2
+    [ -n "$pid" ] && [ -d "/proc/$pid" ] && return 0 || return 1
+}
+tpr_action_command_stop() { kill "$2" 2>/dev/null; }
+tpr_action_command_restart() {
+    tpr_action_command_stop "$1" "$3"
+    sleep 1
+    tpr_action_command_start "$1" "$2" "${4:-0}" "${5:-0}"
+}
+
+tpr_action_exec_finalize() {
+    dir=$1; rc=$2
+    echo "$rc" > "$dir/exit_code.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$dir/end_time.txt"
+    if [ "$rc" -eq 0 ]; then
+        echo "SUCCESS" > "$dir/status.txt"
+    else
+        echo "FAILED" > "$dir/status.txt"
+    fi
+}
+tpr_action_exec_smart() {
+    dir=$1; cmd=$2
+    first_arg=$(echo "$cmd" | awk '{print $1}')
+    if [ -f "$first_arg" ]; then
+        [ ! -x "$first_arg" ] && chmod +x "$first_arg" 2>/dev/null
+        sh -c "$cmd" > "$dir/output.log" 2>&1
+        rc=$?
+        if [ "$rc" -ne 0 ] && { [ "$rc" -eq 126 ] || [ "$rc" -eq 127 ]; }; then
+            if command -v bash >/dev/null 2>&1; then
+                bash "$first_arg" $(echo "$cmd" | cut -d' ' -f2-) > "$dir/output.log" 2>&1
+                rc=$?
+            fi
+            if [ "$rc" -ne 0 ]; then
+                sh "$first_arg" $(echo "$cmd" | cut -d' ' -f2-) > "$dir/output.log" 2>&1
+                rc=$?
+            fi
+        fi
+    else
+        sh -c "$cmd" > "$dir/output.log" 2>&1
+        rc=$?
+    fi
+    tpr_action_exec_finalize "$dir" "$rc"
+}
+
+tpr_action_termux_helper() { echo "${TPR_TERMUX_HELPER:-/system/bin/su-scheduler-termux}"; }
+tpr_action_exec_termux() {
+    dir=$1; cmd=$2
+    helper=$(tpr_action_termux_helper)
+    if [ ! -x "$helper" ]; then
+        echo "ERROR: Termux helper missing" > "$dir/output.log"
+        rc=1
+    else
+        ts=$($helper status 2>/dev/null)
+        if [ "$ts" = "READY" ]; then
+            $helper exec "$cmd" > "$dir/output.log" 2>&1
+            rc=$?
+        elif [ "$ts" = "LOCKED" ]; then
+            echo "ERROR: User 0 locked" > "$dir/output.log"
+            rc=1
+        else
+            echo "ERROR: Termux not installed" > "$dir/output.log"
+            rc=1
+        fi
+    fi
+    tpr_action_exec_finalize "$dir" "$rc"
+}
+tpr_action_exec_interactive() {
+    id=$1; dir=$2; cmd=$3
+    in="$dir/task.in"; out="$dir/task.out"
+    mkfifo "$in" 2>/dev/null || true
+    sh -i < "$in" > "$out" 2>&1 &
+    pid=$!
+    echo "$cmd" > "$in"
+    wait $pid
+    rc=$?
+    echo "$rc" > "$dir/exit_code.txt"
+}
+
+# ── HealthProvider / RecoveryProvider: builtin（接口 + 空实现 stub）────────
+tpr_health_builtin_validate() {
+    case "$1" in
+        ""|none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+tpr_health_builtin_check() { echo "ok"; return 0; }
+
+tpr_recovery_builtin_validate() {
+    case "$1" in
+        ""|none) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+tpr_recovery_builtin_recover() { echo "none"; return 0; }
+
+# ── 静态注册（加载即注册；重复注册被拒）───────────────────────────────────
+provider_register trigger boot     tpr_trigger_boot
+provider_register trigger time     tpr_trigger_time
+provider_register trigger advanced tpr_trigger_advanced
+provider_register action command   tpr_action_command
+provider_register health builtin   tpr_health_builtin
+provider_register recovery builtin tpr_recovery_builtin
+
+# ───────────────────────────────────────────────────────────────────────────
+# §4 Runtime State & Event Log（P1-09 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# 新状态源 <dir>/state.txt + 事件日志 <dir>/events.log（7 字段）；旧兼容文件
+# （status.txt/pid.txt/...）**只读不写**；日志失败不中止任务（仅返回非 0）。
+RT_EVENTS='create delete config_load time_trigger manual_exec spawn action_success action_failure timeout stop_request daemon_restart rearm enable disable supervisor probe recover'
+
+runtime_log() {
+    [ "${RT_LOG:-1}" = "1" ] && echo "[runtime] $1" >&2
+}
+
+runtime_state_file()  { echo "$1/state.txt"; }
+runtime_events_file() { echo "$1/events.log"; }
+
+runtime_current_state() {
+    dir=$1
+    sf=$(runtime_state_file "$dir")
+    if [ -f "$sf" ] && [ -s "$sf" ]; then
+        cat "$sf"
+        return 0
+    fi
+    if [ -f "$dir/status.txt" ]; then
+        task_state_from_legacy "$(cat "$dir/status.txt")"
+        return 0
+    fi
+    echo PENDING
+}
+
+runtime_log_event() {
+    dir=$1; task_id=$2; event=$3; state=$4; pid=${5:-}; exit_code=${6:-}; message=${7:-}
+    [ -n "$dir" ] || { runtime_log "ERROR log_event: dir required"; return 1; }
+    task_state_is_valid "$state" || {
+        runtime_log "WARNING log_event: illegal state '$state' rejected (task=$task_id)"
+        return 1
+    }
+    case " $RT_EVENTS " in
+        *" $event "*) ;;
+        *) runtime_log "WARNING log_event: unknown event '$event' rejected (task=$task_id)"; return 1 ;;
+    esac
+    [ -d "$dir" ] || mkdir -p "$dir" || { runtime_log "ERROR log_event: cannot mkdir $dir"; return 2; }
+
+    ts=$(date "+%Y-%m-%d %H:%M:%S")
+    msg=$(printf '%s' "$message" | sed 's/|/;/g')
+    line="$ts|$task_id|$event|$state|$pid|$exit_code|$msg"
+
+    if ( printf '%s\n' "$line" >> "$(runtime_events_file "$dir")" ) 2>/dev/null; then
+        :
+    else
+        runtime_log "ERROR log_event: append failed for $task_id (event=$event) — task continues"
+        return 2
+    fi
+    sf=$(runtime_state_file "$dir")
+    tmp="$sf.tmp"
+    if ( printf '%s\n' "$state" > "$tmp" && mv -f "$tmp" "$sf" ) 2>/dev/null; then
+        :
+    else
+        rm -f "$tmp" 2>/dev/null
+        runtime_log "ERROR log_event: state write failed for $task_id (state=$state) — task continues"
+        return 2
+    fi
+    return 0
+}
+
+runtime_scan_stale() {
+    root=$1
+    [ -d "$root" ] || { runtime_log "ERROR scan_stale: no tasks dir $root"; return 2; }
+    found=0
+    for p in "$root"/*; do
+        [ -d "$p" ] || continue
+        [ -f "$p/pid.txt" ] || continue
+        id=$(basename "$p")
+        pid=$(cat "$p/pid.txt" 2>/dev/null)
+        cur=$(runtime_current_state "$p")
+        case "$cur" in
+            STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|STOPPING) ;;
+            *) continue ;;
+        esac
+        if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+            continue
+        fi
+        newstate=$(task_state_rehydrate "$cur")
+        runtime_log_event "$p" "$id" daemon_restart "$newstate" "$pid" "" \
+            "stale running record detected at startup (legacy status.txt untouched)"
+        echo "$id"
+        found=$((found + 1))
+    done
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# §5 Canonical Task Registry（P1-06 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# 完整快照 <base>/snapshots/snap_<N>/（确定性序号）+ `current` 指针原子切换；
+# 无效配置 → KEPT 保留最后有效快照；防重复注册（id==文件名且唯一）。
+# 返回码：0=已提交生效 / 1=解析失败回退（KEPT）/ 2=硬错误（无 config/无 adapter）。
+TR_LOGGING=1
+registry_log() {
+    [ "${TR_LOGGING:-1}" = "1" ] && echo "[task-registry] $1" >&2
+}
+
+registry_init() {
+    TR_BASE=${1:-}
+    TR_CONFIG_PATH=${2:-}
+    [ -n "$TR_BASE" ] || { registry_log "ERROR init: base_dir required"; return 2; }
+    [ -n "$TR_CONFIG_PATH" ] || { registry_log "ERROR init: config required"; return 2; }
+    mkdir -p "$TR_BASE/snapshots" || { registry_log "ERROR init: cannot mkdir $TR_BASE/snapshots"; return 2; }
+    if [ -f "$TR_CONFIG_PATH" ]; then
+        registry_reload "$TR_CONFIG_PATH"
+    else
+        registry_log "ERROR init: config not found: $TR_CONFIG_PATH (no fallback on first load)"
+        TASK_REGISTRY_SNAPSHOT=""
+        return 1
+    fi
+}
+
+registry_snapshot_next() {
+    next=1
+    for d in "$TR_BASE"/snapshots/snap_*; do
+        [ -d "$d" ] || continue
+        n=${d##*snap_}
+        case "$n" in ''|*[!0-9]*) continue ;; esac
+        [ "$n" -ge "$next" ] && next=$((n + 1))
+    done
+    echo "snap_$next"
+}
+
+registry_current_snapshot_id() {
+    [ -f "$TR_BASE/current" ] && cat "$TR_BASE/current" || echo ""
+}
+
+registry_snapshot_dir() {
+    id=$(registry_current_snapshot_id)
+    [ -n "$id" ] && echo "$TR_BASE/snapshots/$id"
+}
+
+registry_has_task() {
+    d=$(registry_snapshot_dir)
+    [ -n "$d" ] && [ -f "$d/$1.task" ]
+}
+
+registry_task_file() {
+    d=$(registry_snapshot_dir)
+    if [ -n "$d" ] && [ -f "$d/$1.task" ]; then
+        echo "$d/$1.task"
+        return 0
+    fi
+    return 1
+}
+
+registry_task_ids() {
+    d=$(registry_snapshot_dir)
+    [ -n "$d" ] && ls "$d" 2>/dev/null | grep '\.task$' | sed 's/\.task$//' | sort
+}
+
+registry_manifest() {
+    d=$(registry_snapshot_dir)
+    [ -n "$d" ] && cat "$d/manifest" 2>/dev/null
+}
+
+_registry_snap_valid() {
+    sdir=$1
+    seen=""
+    count=0
+    for f in "$sdir"/*.task; do
+        [ -f "$f" ] || continue
+        count=$((count + 1))
+        id=$(basename "$f" .task)
+        iid=$(grep '^id=' "$f" | head -1 | cut -d= -f2)
+        [ "$id" = "$iid" ] || {
+            registry_log "ERROR snapshot $sdir: id field '$iid' != filename '$id'"
+            return 1
+        }
+        case " $seen " in
+            *" $id "*) registry_log "ERROR snapshot $sdir: duplicate task id '$id'"; return 1 ;;
+        esac
+        seen="$seen $id"
+    done
+    TASK_REGISTRY_COUNT=$count
+    return 0
+}
+
+registry_reload() {
+    config=${1:-$TR_CONFIG_PATH}
+    [ -n "$config" ] || { registry_log "ERROR reload: no config (init first)"; echo "HARD"; return 2; }
+    [ -f "$config" ] || {
+        registry_log "ERROR reload: config not found: $config (fallback: keeping current snapshot)"
+        echo "KEPT"
+        return 1
+    }
+    command -v legacy_adapter_parse >/dev/null 2>&1 || {
+        registry_log "ERROR reload: legacy_adapter_parse not sourced (adapter section missing)"
+        echo "HARD"
+        return 2
+    }
+
+    sid=$(registry_snapshot_next)
+    sdir="$TR_BASE/snapshots/$sid"
+    mkdir -p "$sdir" || { registry_log "ERROR reload: cannot mkdir $sdir"; echo "HARD"; return 2; }
+
+    stdout=$(legacy_adapter_parse "$config" "$sdir")
+    arc=$?
+    tcount=$(ls "$sdir" 2>/dev/null | grep -c '\.task$')
+
+    valid=0
+    if [ "$arc" -eq 0 ]; then
+        valid=1
+    elif [ "$arc" -eq 1 ] && [ "$tcount" -ge 1 ]; then
+        valid=1
+    fi
+
+    if [ "$valid" -eq 1 ]; then
+        if _registry_snap_valid "$sdir"; then
+            {
+                echo "snapshot=$sid"
+                echo "config=$config"
+                echo "parse_rc=$arc"
+                echo "task_count=$TASK_REGISTRY_COUNT"
+            } > "$sdir/manifest.tmp" && mv "$sdir/manifest.tmp" "$sdir/manifest"
+            echo "$sid" > "$TR_BASE/current.tmp" && mv "$TR_BASE/current.tmp" "$TR_BASE/current"
+            TASK_REGISTRY_SNAPSHOT=$sid
+            echo "$sid"
+            return 0
+        fi
+        registry_log "ERROR reload: snapshot $sid invalid (dup/mismatch); fallback"
+        rm -rf "$sdir"
+        TASK_REGISTRY_SNAPSHOT=$(registry_current_snapshot_id)
+        return 1
+    fi
+
+    registry_log "ERROR reload: parse rc=$arc tasks=$tcount -> invalid; keeping last valid snapshot"
+    rm -rf "$sdir"
+    TASK_REGISTRY_SNAPSHOT=$(registry_current_snapshot_id)
+    echo "KEPT"
+    return 1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# §6 Lifecycle（P1-10 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# 单实例锁 / stale 恢复 / 僵尸清理 / 启动初始化 / 停止 / 重启 / 看护单轮
+# （fail-safe：初始化失败回滚锁，不留半初始化状态）。
+lifecycle_log() {
+    [ "${LIFECYCLE_LOG:-1}" = "1" ] && echo "[lifecycle] $1" >&2
+}
+
+lifecycle_ensure_dirs() {
+    base=$1
+    [ -n "$base" ] || { lifecycle_log "ERROR ensure_dirs: base required"; return 1; }
+    for d in "$base" "$base/tasks" "$base/audit"; do
+        if ! mkdir -p "$d" 2>/dev/null; then
+            lifecycle_log "ERROR ensure_dirs: cannot mkdir $d"
+            return 1
+        fi
+        if ! chmod 755 "$d" 2>/dev/null; then
+            lifecycle_log "ERROR ensure_dirs: cannot chmod $d"
+            return 1
+        fi
+    done
+    return 0
+}
+
+lifecycle_lock_pid() { [ -f "$1" ] && cat "$1" 2>/dev/null; }
+
+lifecycle_lock_alive() {
+    pid=$(lifecycle_lock_pid "$1")
+    [ -n "$pid" ] && [ -d "/proc/$pid" ] && return 0
+    return 1
+}
+
+lifecycle_lock_acquire() {
+    lock=$1
+    if lifecycle_lock_alive "$lock"; then
+        lifecycle_log "WARNING lock_acquire: daemon already alive (pid=$(lifecycle_lock_pid "$lock")) — rejected"
+        return 1
+    fi
+    if [ -f "$lock" ]; then
+        lifecycle_log "INFO lock_acquire: stale lock removed (pid=$(cat "$lock" 2>/dev/null))"
+        rm -f "$lock" 2>/dev/null || { lifecycle_log "ERROR lock_acquire: cannot rm stale lock"; return 2; }
+    fi
+    if ! echo "$$" > "$lock" 2>/dev/null; then
+        lifecycle_log "ERROR lock_acquire: cannot write $lock"
+        return 2
+    fi
+    return 0
+}
+
+lifecycle_lock_force_reclaim() {
+    lock=$1
+    wait_s=${LIFECYCLE_LOCK_WAIT:-5}
+    i=0
+    while [ "$i" -lt "$wait_s" ]; do
+        lifecycle_lock_alive "$lock" || break
+        sleep 1
+        i=$((i + 1))
+    done
+    if [ -f "$lock" ]; then
+        lifecycle_log "INFO lock_force: reclaiming lock (old pid=$(cat "$lock" 2>/dev/null))"
+        rm -f "$lock" 2>/dev/null || { lifecycle_log "ERROR lock_force: cannot rm lock"; return 2; }
+    fi
+    if ! echo "$$" > "$lock" 2>/dev/null; then
+        lifecycle_log "ERROR lock_force: cannot write $lock"
+        return 2
+    fi
+    return 0
+}
+
+lifecycle_lock_release() {
+    rm -f "$1" 2>/dev/null
+    return 0
+}
+
+lifecycle_cleanup_zombies() {
+    tasks_dir=$1
+    [ -d "$tasks_dir" ] || { lifecycle_log "INFO cleanup: no tasks dir $tasks_dir"; echo 0; return 0; }
+    n=0
+    for p in "$tasks_dir"/*; do
+        [ -d "$p" ] || continue
+        cur=$(runtime_current_state "$p")
+        case "$cur" in
+            STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|STOPPING) ;;
+            *) continue ;;
+        esac
+        id=$(basename "$p")
+        old_state=$(cat "$p/status.txt" 2>/dev/null)
+        pid_rec=$(cat "$p/pid.txt" 2>/dev/null)
+        case "$old_state" in
+            *RUNNING*) echo "ZOMBIE_CRASHED" > "$p/status.txt" 2>/dev/null ;;
+        esac
+        newstate=$(task_state_rehydrate "$cur")
+        runtime_log_event "$p" "$id" daemon_restart "$newstate" "$pid_rec" "" \
+            "zombie cleanup at startup (legacy status.txt -> ZOMBIE_CRASHED)" >/dev/null 2>&1
+        lifecycle_log "INFO cleanup: recovered zombie task $id ($cur -> $newstate)"
+        n=$((n + 1))
+    done
+    echo "$n"
+    return 0
+}
+
+lifecycle_start() {
+    base=$1; config=$2; lock=$3
+    [ -n "$base" ] && [ -n "$config" ] && [ -n "$lock" ] || {
+        lifecycle_log "ERROR start: base/config/lock required"
+        return 2
+    }
+    lifecycle_ensure_dirs "$base" || return 2
+    lifecycle_lock_acquire "$lock" || return 1
+    lifecycle_cleanup_zombies "$base/tasks" >/dev/null 2>&1
+    registry_init "$base" "$config" >/dev/null 2>&1
+    if [ -n "$(registry_current_snapshot_id 2>/dev/null)" ]; then
+        lifecycle_log "INFO start: ready (base=$base snapshot=$(registry_current_snapshot_id 2>/dev/null))"
+        return 0
+    fi
+    lifecycle_log "ERROR start: registry init failed for $config (no valid snapshot fallback)"
+    lifecycle_lock_release "$lock"
+    return 2
+}
+
+lifecycle_stop() {
+    lock=$1
+    pid=$(lifecycle_lock_pid "$lock")
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null; then
+        kill "$pid" 2>/dev/null
+        i=0
+        while [ "$i" -lt 5 ]; do
+            [ -d "/proc/$pid" ] 2>/dev/null || break
+            sleep 1
+            i=$((i + 1))
+        done
+    fi
+    lifecycle_lock_release "$lock"
+    return 0
+}
+
+lifecycle_restart() {
+    lock=$1; base=$2; config=$3; daemon_cmd=${4:-}
+    lifecycle_stop "$lock"
+    sleep 1
+    if [ -n "$daemon_cmd" ]; then
+        nohup $daemon_cmd >/dev/null 2>&1 &
+        lifecycle_log "INFO restart: launched '$daemon_cmd' (new daemon re-locks itself)"
+        return 0
+    fi
+    lifecycle_log "ERROR restart: no daemon_cmd given"
+    return 2
+}
+
+lifecycle_watchdog_tick() {
+    lock=$1; daemon_cmd=${2:-}
+    if lifecycle_lock_alive "$lock"; then
+        return 0
+    fi
+    lifecycle_log "WARNING watchdog_tick: daemon not running — cleaning stale lock and (re)starting"
+    rm -f "$lock" 2>/dev/null
+    if [ -n "$daemon_cmd" ]; then
+        nohup $daemon_cmd >/dev/null 2>&1 &
+        lifecycle_log "INFO watchdog_tick: launched '$daemon_cmd'"
+    else
+        lifecycle_log "INFO watchdog_tick: no daemon_cmd given — handover to caller"
+    fi
+    return 1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# §7 Task 只读 CLI（P1-11 验证原语 → P2-02 生产化）
+# ───────────────────────────────────────────────────────────────────────────
+# 只读：task_cli_list / task_cli_status。数据源 = registry 快照（不重新解析
+# config.txt）；状态 = runtime_current_state（新 state.txt → 旧 status.txt
+# 推导 → 快照 runtime.state 回退）；错误三态 rc 1/2/3。
+task_cli_log() {
+    [ "${TASK_CLI_LOG:-1}" = "1" ] && echo "[task-cli] $1" >&2
+}
+
+task_cli_config_valid() {
+    [ -n "$(registry_current_snapshot_id 2>/dev/null)" ] && return 0
+    return 1
+}
+
+task_cli_task_exists() {
+    registry_task_file "$1" >/dev/null 2>&1
+}
+
+task_cli_state_for() {
+    id=$1; tf=$2
+    if [ -n "${TASK_CLI_TASKS_DIR:-}" ] && [ -d "$TASK_CLI_TASKS_DIR/$id" ]; then
+        runtime_current_state "$TASK_CLI_TASKS_DIR/$id"
+        return 0
+    fi
+    grep '^runtime.state=' "$tf" | head -1 | cut -d= -f2-
+}
+
+task_cli_daemon_running() {
+    [ -n "${TASK_CLI_LOCK:-}" ] || return 1
+    lifecycle_lock_alive "$TASK_CLI_LOCK"
+}
+
+task_cli_list() {
+    task_cli_config_valid || {
+        echo "ERROR: configuration invalid (no valid task snapshot)" >&2
+        return 2
+    }
+    for id in $(registry_task_ids); do
+        f=$(registry_task_file "$id") || continue
+        name=$(grep '^name=' "$f" | head -1 | cut -d= -f2-)
+        trigger=$(grep '^trigger=' "$f" | head -1 | cut -d= -f2)
+        action=$(grep '^action.command=' "$f" | head -1 | cut -d= -f2-)
+        enabled=$(grep '^enabled=' "$f" | head -1 | cut -d= -f2)
+        state=$(task_cli_state_for "$id" "$f")
+        echo "$id|$name|$trigger|$action|$enabled|$state"
+    done
+    return 0
+}
+
+task_cli_status() {
+    id=$1
+    [ -n "$id" ] || { echo "ERROR: usage: task status <id>" >&2; return 1; }
+    task_cli_config_valid || {
+        echo "ERROR: configuration invalid (no valid task snapshot)" >&2
+        return 2
+    }
+    f=$(registry_task_file "$id") || {
+        echo "ERROR: task not found: $id" >&2
+        return 1
+    }
+    if [ -n "${TASK_CLI_LOCK:-}" ] && ! task_cli_daemon_running; then
+        echo "ERROR: daemon is not running — cannot report live task state (disk state may be stale)" >&2
+        return 3
+    fi
+
+    rdir="${TASK_CLI_TASKS_DIR:-}/$id"
+    echo "id=$id"
+    echo "name=$(grep '^name=' "$f" | head -1 | cut -d= -f2-)"
+    echo "enabled=$(grep '^enabled=' "$f" | head -1 | cut -d= -f2)"
+    echo "trigger=$(grep '^trigger=' "$f" | head -1 | cut -d= -f2)"
+    echo "condition=$(grep '^condition=' "$f" | head -1 | cut -d= -f2-)"
+    echo "action=$(grep '^action.command=' "$f" | head -1 | cut -d= -f2-)"
+    echo "source.type=$(grep '^source.type=' "$f" | head -1 | cut -d= -f2)"
+    echo "source.line=$(grep '^source.line=' "$f" | head -1 | cut -d= -f2)"
+    echo "source.raw=$(grep '^source.raw=' "$f" | head -1 | cut -d= -f2-)"
+    echo "state=$(task_cli_state_for "$id" "$f")"
+    if [ -d "$rdir" ] && [ -f "$rdir/status.txt" ]; then
+        echo "legacy_status=$(cat "$rdir/status.txt" 2>/dev/null)"
+    else
+        echo "legacy_status="
+    fi
+    echo "run_count=$(grep '^runtime.run_count=' "$f" | head -1 | cut -d= -f2)"
+    echo "last_status=$(grep '^runtime.last_status=' "$f" | head -1 | cut -d= -f2-)"
+    echo "last_exit=$(grep '^runtime.last_exit=' "$f" | head -1 | cut -d= -f2-)"
+    echo "last_start=$(grep '^runtime.last_start=' "$f" | head -1 | cut -d= -f2-)"
+    echo "last_end=$(grep '^runtime.last_end=' "$f" | head -1 | cut -d= -f2-)"
+    if [ -n "${TASK_CLI_LOCK:-}" ]; then
+        if task_cli_daemon_running; then echo "daemon=running"; else echo "daemon=stopped"; fi
+    fi
+    if [ -d "$rdir" ] && [ -f "$rdir/events.log" ]; then
+        echo "last_event=$(tail -1 "$rdir/events.log" 2>/dev/null)"
+    else
+        echo "last_event="
+    fi
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Self-check（加载方引用）：全部 §1–§7 代表函数就绪 + 版本号存在 → 0。
+# ───────────────────────────────────────────────────────────────────────────
+runtime_lib_selfcheck() {
+    [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
+    for fn in task_state_transition legacy_adapter_parse provider_dispatch \
+              runtime_log_event registry_init lifecycle_start task_cli_list; do
+        type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
+    done
+    return 0
+}
