@@ -11,6 +11,16 @@
 > **验证方法**：本基线中的解析 golden 全部由 **bash 实际执行生产脚本内真实函数**推导
 > （`tests/fixtures/legacy/tools/derive-goldens.sh`），非手写；设备端行为标注为
 > `L3待验`（当前环境无 adb 设备，见 §10）。
+> **P2-01 注记（2026-09-02）**：P0 门禁收口（详见 `docs/P2-01.md`）——Q1–Q4
+> （CLI `log -n` / `add` 触发器集 / `list` 空态误报 / `task-output` 重复定义）
+> 已最小修复并由 `tests/cli/test.sh` **先失败后通过**锁定；Q9（yearly 文档/实现
+> 格式差异）决策为「CLI `add` 归一化写入 daemon 实现格式、daemon 解析不变」；
+> Q11（失败通知无条件）决策为「保留 legacy 语义，不新增开关字段」；Q12（docs
+> 头部 1.6.7 与 update.json changelog 残留）已修正，版本一致性校验扩至八处
+> （`tests/p1-build/build_check.sh`）；Q10（`--boot`）完成人工 Sign-off：
+> **继续延后实现**（P0/P1 不实现；Task v2 `action.boot` 仅为保留标志）。回归
+> 入口统一为 `tests/run_tests.sh`（L1+L2+L4，可选 L3），`.github/workflows/
+> test.yml` 上线 CI 门禁；设备 L3 冒烟与主机回归 trace 记录于 `docs/P2-01.md`。
 
 ---
 
@@ -322,7 +332,7 @@ EOF
 
 ## 6. 已登记行为怪癖与文档-实现差异
 
-> 编号 Q1–Q10；与 AGENTS.md §6 候选缺陷的对应关系标注。全部**仅记录，不修复**
+> 编号 Q1–Q12；与 AGENTS.md §6 候选缺陷的对应关系标注。全部**仅记录，不修复**
 > （修复权属 P0 T2 / 后续 P1 任务，且须先过回归门禁）。
 
 | ID | 位置 | 基线事实（输入 → 现状输出） | 关联 |
@@ -339,6 +349,31 @@ EOF
 | Q10 | daemon `parse_modifiers` | `: --boot` 文档化（README/模板/help）但**无任何实现分支** | AGENTS D5（需 Sign-off，P0 不实现） |
 | Q11 | 通知 L477 | 失败通知无条件发送（不依赖 notify flags）；`--msg` 仅双引号格式生效 | 新增登记 |
 | Q12 | 版本元数据 | `.su-scheduler-docs` 头部 1.6.7 vs 其余 1.6.8；`update.json` changelog 仍写 v1.6.7 | 新增登记（T4 关注） |
+
+### 6.1 P2-01 逐项处理状态（2026-09-02）
+
+> 原始 Q1–Q12 表保持为 P1-01 快照不修改；本表记录 P2-01 对每项的**处理终态**，
+> 与 `docs/P2-01.md` 执行记录一一对应。
+
+| ID | 处理终态（P2-01） | 承载测试 / 证据 |
+| :-- | :--- | :--- |
+| Q1 | **已修复**：`cmd_log` 支持 `-n NUM`（默认 20，`-f` 保留） | `tests/cli/test.sh`（先失败后通过，修复前 FAIL 记载于 docs/P2-01.md） |
+| Q2 | **已修复**：`cmd_add` 校验已文档化触发器集（boot/HHMM/HH:MM/weekly:/nweekly:/monthly:/nmonthly:/yearly:），仅 HH:MM 去冒号；写出行仍为 daemon 支持格式（C4） | 同上 |
+| Q3 | **已修复**：`cmd_list` 非管道循环（here-doc 承接，当前 shell 读行，空行不计匹配），有匹配不再误报空态 | 同上 |
+| Q4 | **已修复**：`cmd_task_output` 删除死代码重复定义（保留生效版），乱注释清理；行为零变化 | 同上（含静态唯一性断言） |
+| Q5 | 记录保留（heredoc 重组 ` : : ` 工件为基线语义，P0 不触碰） | legacy golden 锁定 |
+| Q6 | 记录保留（boot 扫描三怪癖为基线语义，P0 不触碰） | legacy golden 锁定；设备 R-16/R-17 待验 |
+| Q7 | 记录保留（audit 死代码为基线事实，P0 最小修复范围外） | 无（R-14 待验） |
+| Q8 | 记录保留（交互 `.fifo`/`pid.txt` 覆盖为基线事实） | 无（R-30 设备待验） |
+| Q9 | **已决策 + 已修复（CLI 侧）**：文档格式 `yearly:MM:DD:HHMM` 经 `add` 归一为 `yearly:MMDD:HHMM` 写入；**daemon 解析不变**（实现格式为基准，C4） | `tests/cli/test.sh`（add yearly 归一断言） |
+| Q10 | **Sign-off（人工决策）**：**继续延后实现**——P0/P1 不实现 `--boot`；Task v2 `action.boot` 仅为保留标志、不产生执行语义（AGENTS D5/D1 裁决） | `docs/P2-01.md` §决策；task-schema-v2.md §action.boot |
+| Q11 | **已决策（不修复）**：保留「失败通知无条件」legacy 语义；模型不新增失败通知开关字段；`--msg` 仅双引号亦为基线锁定 | task-schema-v2.md 兼容表；parse_modifiers golden |
+| Q12 | **已修复**：`.su-scheduler-docs` 头部/徽章 1.6.7 → 1.6.8；`update.json` changelog → v1.6.8；版本一致性校验由六处扩至**八处** | `tests/p1-build/build_check.sh`（Q12 两处新增断言） |
+| Q13 | **已修复（P2-01 设备冒烟新发现）**：daemon `--delete` 删除路径 `grep -v -F … > tmp && mv` 在配置激活内容**恰好只有删除行**时，`grep -v` 退出码 1 → `&&` 短路、行未删除（tmp 残留 0 字节，真机实测）。修复：两处（time/advanced）`&&` 改 `;`（mv 尽力而为） | `tests/legacy/delete-pipeline.sh`（单激活行+多行守卫）；真机直跑与全套冒烟验证（docs/P2-01.md §6） |
+
+> §8 R-08/R-09/R-10/R-11/R-13（CLI 行为）现由 `tests/cli/test.sh` 覆盖并锁定
+> **修复后**行为（R-09/R-10/R-11 的期望输出已随修复改变）；R-12/R-14 仍待
+> （P0 最小修复范围外）。
 
 ## 7. 旧配置样例与预期输出
 
