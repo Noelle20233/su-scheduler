@@ -604,6 +604,14 @@ if [ -d "$TASKS_DIR" ]; then
     done
 fi
 
+# ⚙️ 重启残留再水合（P2-07，RUNTIME_LOADED 门控旁路；不改 legacy 剪枝/执行路径）：
+#   剪枝后的运行态（status.txt=RUNNING/STARTING/ZOMBIE_CRASHED/STALE）→
+#   新 state.txt=FAILED + events.log daemon_restart 事件（旧 status.txt 不动——
+#   旧 CLI 仍按旧语义读取；状态机成为新事实源）。
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    state_rehydrate_residual "$TASKS_DIR" >/dev/null 2>&1
+fi
+
 # Stake our claim
 echo $$ > "$LOCK_FILE"
 
@@ -661,6 +669,10 @@ while true; do
             for tid in $(registry_task_ids); do
                 trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "0" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
             done
+            # ⚙️ 统一状态对账（P2-07，RUNTIME_LOADED 门控旁路）：exit_code.txt 出现
+            # → 终态双写（成功 → STOPPED，一次性任务不虚假 HEALTHY；失败 → FAILED）；
+            # 已终态幂等跳过。非法/异常目录不中止本轮（单目录错误只置 rc）。
+            state_sync_all "$TASKS_DIR" >/dev/null 2>&1
         fi
 
         task_counter=0

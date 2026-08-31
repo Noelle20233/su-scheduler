@@ -20,6 +20,7 @@
 #   L2  tests/idmap/test.sh             P2-04 Canonical↔Legacy Run ID 映射
 #   L2  tests/trigger/test.sh           P2-05 TriggerProvider 接入（25 断言）
 #   L2  tests/action/test.sh            P2-06 CommandActionProvider 接入
+#   L2  tests/state/test.sh             P2-07 统一状态与事件日志（双写/终态/健康门/重启残留）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -82,6 +83,7 @@ else
         "tests/idmap/test.sh" \
         "tests/trigger/test.sh" \
         "tests/action/test.sh" \
+        "tests/state/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

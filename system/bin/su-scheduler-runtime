@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.4.0"
+RUNTIME_LIB_VERSION="1.5.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1535,7 +1535,146 @@ action_run() {   # <id> <cmd> [termux] [interactive] [notify_start] [notify_end]
             > "$run_dir/pid.txt" 2>/dev/null || return 1
     fi
     pid=$(cat "$run_dir/pid.txt" 2>/dev/null)
+    # P2-07：启动即双写新状态（state.txt=RUNNING + events.log spawn；旧工件由
+    # execute_task/镜像执行器原样产出，本层只读旧、只写新——不碰 status.txt 等）。
+    state_log_event "$run_dir" "$id" spawn RUNNING "$pid" "" "launched via unified action entry" >/dev/null 2>&1
     echo "id=$id|mode=$mode|pid=$pid|dir=$run_dir"
+    return 0
+}
+# ───────────────────────────────────────────────────────────────────────────
+# §12 Unified State & Event Wiring（P2-07）
+# ═══════════════════════════════════════════════════════════════════════════
+# 生产事实源：新 `state.txt`（TSM v2 状态）+ `events.log`（7 字段事件行）成为
+# 权威状态记录；旧兼容工件（status.txt / pid.txt / output.log / exit_code.txt）
+# **只读、双写共存**（旧 CLI 按旧语义继续读取——P2-04/06 兼容边界）。本层叠在
+# §4 runtime_log_event（P1-09 原语：先事件行、后 state.txt 原子 tmp+mv）之上，
+# 增加三条生产策略：
+#   1) 健康族门槛：**只有注册了非 builtin 的真实 Health Provider 才允许写
+#      HEALTHY/UNHEALTHY**（`state_health_allowed`）——当前仅 builtin stub，
+#      故 HEALTHY 一律被拒（一次性任务成功 → STOPPED，绝不虚假 HEALTHY）。
+#   2) 状态机迁移校验：state.txt 已存在且目标不同时，按 TSM 允许边校验
+#      （task_state_transition；事件 ∈ TSM_CAUSES 时作 cause）；非法迁移 →
+#      WARNING + 拒绝写入（**非致命：不影响 daemon 主循环**）。
+#   3) 幂等对账（state_sync_all / state_sync_one）：主循环每轮以 exit_code.txt
+#      为准写终态——成功 → STOPPED（一次性任务），失败 → FAILED；已终态跳过；
+#      新源缺失时由旧工件推导并物化（旧工件不动）。
+# 重启残留（state_rehydrate_residual）：daemon 启动剪枝后旧 status.txt 为
+# RUNNING/STARTING/ZOMBIE_CRASHED/STALE 的运行目录 → state.txt=FAILED +
+# daemon_restart 事件（task_state_rehydrate 语义；旧 status.txt 不动）。
+# 返回约定：各入口非致命——任何拒绝/错误均 return != 0 且不中止调用方循环。
+# ═══════════════════════════════════════════════════════════════════════════
+state_log() {
+    [ "${STATE_LOG:-1}" = "1" ] && echo "[state] $1" >&2
+}
+
+# 健康族门槛：注册表中存在非 builtin 的真实 Health Provider → 0；否则 1。
+state_health_allowed() {
+    for entry in $TPR_REGISTRY; do
+        f1=${entry%%>*}
+        [ "$f1" = "health" ] || continue
+        rest=${entry#*>}; f2=${rest%%>*}; pre=${rest#*>}
+        [ "$f2" = "builtin" ] || { [ -n "$pre" ] && return 0; }
+    done
+    return 1
+}
+
+# 统一状态/事件写入（生产正式入口）：健康族门槛 + TSM 迁移校验 +
+# 双写 state.txt/events.log（委托 §4 runtime_log_event；旧工件只读不动）。
+state_log_event() {   # <dir> <task_id> <event> <state> [pid] [exit_code] [message]
+    dir=$1; task_id=$2; event=$3; state=$4; pid=${5:-}; exit_code=${6:-}; message=${7:-}
+    [ -n "$dir" ] || { state_log "ERROR log_event: dir required"; return 1; }
+    if [ "$state" = "HEALTHY" ] || [ "$state" = "UNHEALTHY" ]; then
+        state_health_allowed || {
+            state_log "WARNING log_event: HEALTHY/UNHEALTHY requires a real health provider (task=$task_id) — rejected, daemon loop unaffected"
+            return 1
+        }
+    fi
+    cur=""
+    [ -f "$dir/state.txt" ] && cur=$(cat "$dir/state.txt" 2>/dev/null)
+    if [ -n "$cur" ] && [ "$cur" != "$state" ]; then
+        case " $TSM_CAUSES " in
+            *" $event "*) cause=$event ;;
+            *) cause="" ;;
+        esac
+        TSM_LOG=0 task_state_transition "$cur" "$state" "$cause" >/dev/null 2>&1 || {
+            state_log "WARNING log_event: illegal transition '$cur'->'$state' rejected (task=$task_id; event=$event) — daemon loop unaffected"
+            return 1
+        }
+    fi
+    runtime_log_event "$dir" "$task_id" "$event" "$state" "$pid" "$exit_code" "$message"
+}
+
+# 单目录对账：exit_code.txt 存在 → 按退出码写终态（powered 一次性任务成功 →
+# STOPPED；失败 → FAILED）；新源缺失时由旧工件推导并物化。幂等：已终态跳过。
+state_sync_one() {   # <dir> → 0=ok 1=未完成（无终态可判定）2=硬错误（不中止循环）
+    dir=$1
+    [ -d "$dir" ] || return 2
+    id=$(basename "$dir")
+    [ -f "$dir/exit_code.txt" ] || return 1
+    ec=$(cat "$dir/exit_code.txt" 2>/dev/null)
+    cur=$(runtime_current_state "$dir")
+    case "$cur" in
+        STARTING|RUNNING|PENDING|WAITING)
+            if [ "$ec" = "0" ]; then
+                state_log_event "$dir" "$id" action_success STOPPED "" "$ec" "exit=$ec" >/dev/null 2>&1
+            else
+                state_log_event "$dir" "$id" action_failure FAILED "" "$ec" "exit=$ec" >/dev/null 2>&1
+            fi
+            ;;
+        STOPPED|FAILED|DISABLED)
+            if [ ! -f "$dir/state.txt" ]; then
+                # 新源缺失：由旧工件推导的终态 → 物化（旧工件不动）。
+                if [ "$cur" = "STOPPED" ]; then
+                    state_log_event "$dir" "$id" action_success STOPPED "" "$ec" "materialized from legacy" >/dev/null 2>&1
+                elif [ "$cur" = "FAILED" ]; then
+                    state_log_event "$dir" "$id" action_failure FAILED "" "$ec" "materialized from legacy" >/dev/null 2>&1
+                fi
+            fi
+            ;;
+        *) : ;;   # 未知/非法现态：不触碰（非致命，继续）
+    esac
+    return 0
+}
+
+# 全目录对账：单目录错误不中止（非法状态转换不破主循环）。
+state_sync_all() {   # <tasks_dir> → 0=ok 1=存在未完成/错误目录 2=目录不可用
+    tasks=$1
+    [ -d "$tasks" ] || { state_log "ERROR sync_all: no tasks dir $tasks"; return 2; }
+    rc=0
+    for p in "$tasks"/*; do
+        [ -d "$p" ] || continue
+        state_sync_one "$p" >/dev/null 2>&1 || rc=1
+    done
+    return "$rc"
+}
+
+# 重启残留再水合：daemon 启动剪枝后的运行态（RUNNING/STARTING/
+# ZOMBIE_CRASHED/STALE）→ state.txt=FAILED + daemon_restart 事件；旧工件不动。
+state_rehydrate_residual() {   # <tasks_dir>
+    tasks=$1
+    [ -d "$tasks" ] || { state_log "ERROR rehydrate: no tasks dir $tasks"; return 2; }
+    for p in "$tasks"/*; do
+        [ -d "$p" ] || continue
+        [ -f "$p/status.txt" ] || continue
+        id=$(basename "$p")
+        st=$(cat "$p/status.txt" 2>/dev/null)
+        case "$st" in
+            RUNNING|STARTING|ZOMBIE_CRASHED|STALE)
+                cur=$(runtime_current_state "$p")
+                case "$cur" in
+                    STARTING|RUNNING|PENDING|WAITING)
+                        state_log_event "$p" "$id" daemon_restart FAILED "" "" "residual after daemon restart" >/dev/null 2>&1
+                        ;;
+                    FAILED)
+                        # 旧源已推导 FAILED（如 ZOMBIE_CRASHED）但新源缺失 → 物化
+                        if [ ! -f "$p/state.txt" ]; then
+                            state_log_event "$p" "$id" daemon_restart FAILED "" "" "residual materialized from legacy" >/dev/null 2>&1
+                        fi
+                        ;;
+                esac
+                ;;
+        esac
+    done
     return 0
 }
 # ───────────────────────────────────────────────────────────────────────────
@@ -1543,7 +1682,9 @@ runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
               runtime_log_event registry_init lifecycle_start task_cli_list \
-              shadow_tick runtime_map_lookup trigger_decide action_run; do
+              shadow_tick runtime_map_lookup trigger_decide action_run \
+              state_log_event state_health_allowed state_sync_all \
+              state_rehydrate_residual; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
