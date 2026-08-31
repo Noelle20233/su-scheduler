@@ -135,18 +135,27 @@ cmd_add() {
         echo -e "${RED}${BOLD}❌ Error:${RESET} No command provided. I can't schedule silence!"
         exit 1
     fi
-    # Support both 0800 and 08:30 formats
-    if echo "$trigger" | grep -q ":"; then
-        trigger=$(echo "$trigger" | sed 's/://g')
-    fi
+    # 🕵️ Validation — 已文档化触发器集合（README/help §add）
+    # 仅对 HH:MM 去冒号（→ HHMM）；进阶触发器原样保留；yearly 文档格式
+    # yearly:MM:DD:HHMM 归一为 daemon 已支持格式 yearly:MMDD:HHMM（C4）。
+    case "$trigger" in
+        boot) ;;
+        [0-9][0-9]:[0-9][0-9]) trigger=$(echo "$trigger" | sed 's/://g') ;;
+        [0-9][0-9][0-9][0-9]) ;;
+        weekly:[1-7]:[0-9][0-9][0-9][0-9]) ;;
+        nweekly:[0-9]*:[1-7]:[0-9][0-9][0-9][0-9]) ;;
+        monthly:[0-9]*:[0-9][0-9][0-9][0-9]) ;;
+        nmonthly:[0-9]*:[0-9]*:[0-9][0-9][0-9][0-9]) ;;
+        yearly:[0-9][0-9]:[0-9][0-9]:[0-9][0-9][0-9][0-9])
+            trigger=$(echo "$trigger" | awk -F: '{printf "%s:%s%s:%s", $1, $2, $3, $4}') ;;
+        yearly:[0-9][0-9][0-9][0-9]:[0-9][0-9][0-9][0-9]) ;;
+        *)
+            echo -e "${RED}${BOLD}❌ Error:${RESET} Invalid trigger '${YELLOW}$trigger${RESET}'. Use boot, HH:MM, HHMM, weekly:DAY:HHMM, nweekly:N:DAY:HHMM, monthly:DD:HHMM, nmonthly:N:DD:HHMM or yearly:MM:DD:HHMM."
+            exit 1
+            ;;
+    esac
     
     cmd="$*" # Capture everything else as the command
-    
-    # 🕵️ Validation - Ensure trigger is either 'boot' or 4 digits
-    if [ "$trigger" != "boot" ] && ! echo "$trigger" | grep -qE '^[0-9]{4}$'; then
-        echo -e "${RED}${BOLD}❌ Error:${RESET} Invalid trigger '${YELLOW}$trigger${RESET}'. Use 'boot' or HH:MM."
-        exit 1
-    fi
 
     # ✍️ Persist the change
     echo "$trigger $cmd" >> "$CONFIG_FILE"
@@ -165,7 +174,12 @@ cmd_list() {
     
     found_any=0
     # Clean listing: ignore comments and empty lines
-    grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep -v '^[[:space:]]*$' | grep -iE "$pattern" | while read -r line; do
+    # 🛡️ Q3 修复：管道子 shell 内赋值不回流（found_any 恒 0 → 有匹配仍误报
+    # "No active missions"）。改用 here-doc 承接 grep 输出、当前 shell 内逐行
+    # 读取（POSIX 安全；不依赖 /tmp 可写性，heredoc 体按需字面传入）。
+    while IFS= read -r line || [ -n "$line" ]; do
+        # 空行（here-doc 展开为空时的尾随伪行）不计入匹配（daemon 同样跳过空行）
+        [ -z "$line" ] && continue
         found_any=1
         # Extract parts
         trigger=$(echo "$line" | awk '{print $1}')
@@ -247,7 +261,9 @@ cmd_list() {
         echo -e "   ${BOLD}${BLUE}Action:${RESET} ${MAGENTA}${cmd_text}${RESET}"
         echo -e "   ${BOLD}${YELLOW}Vibe:${RESET}   ${explanation}"
         echo -e "${BLUE}------------------------------------------------------------${RESET}"
-    done
+    done <<EOF
+$(grep -v '^[[:space:]]*#' "$CONFIG_FILE" | grep -v '^[[:space:]]*$' | grep -iE "$pattern")
+EOF
     
     if [ $found_any -eq 0 ]; then
         echo -e "${YELLOW}No active missions matching '$pattern' were found in the scrolls.${RESET}"
@@ -312,8 +328,13 @@ cmd_log() {
          echo -e "${CYAN}${BOLD}👀 Tailing logs... Press Ctrl+C to stop spying.${RESET}"
          tail -f "$LOG_FILE"
     else
-         echo -e "${BOLD}${MAGENTA}📖 Historical Log (Last 20):${RESET}"
-         tail -n 20 "$LOG_FILE"
+         # 🕵️ Q1 修复：支持 -n NUM（help/README 承诺 `log -n 50`），默认 20
+         lines=20
+         if [ "$1" = "-n" ] && [ -n "${2:-}" ]; then
+             lines="$2"
+         fi
+         echo -e "${BOLD}${MAGENTA}📖 Historical Log (Last $lines):${RESET}"
+         tail -n "$lines" "$LOG_FILE"
     fi
 }
 
@@ -468,29 +489,7 @@ cmd_task_info() {
     echo -e "${BLUE}============================================================${RESET}"
 }
 
-# 📄 View task output
-cmd_task_output() {
-    task_id="$1"
-    if [ -z "$task_id" ]; then
-        echo -e "${RED}❌ Provide a task ID.${RESET}"
-        exit 1
-    fi
-    
-    task_dir="$TASKS_DIR/$task_id"
-    output_file="$task_dir/output.log"
-    
-    if [ ! -f "$output_file" ]; then
-        echo -e "${YELLOW}No output file found for task: $task_id${RESET}"
-        exit 1
-    fi
-    
-    echo -e "${BOLD}${MAGENTA}📄 Task Output: $task_id${RESET}"
-    echo -e "${BLUE}------------------------------------------------------------${RESET}"
-    cat "$output_file"
-    echo -e "${BLUE}------------------------------------------------------------${RESET}"
-}
-
-# 💀 Kill# 📄 detailed task output
+# 📄 detailed task output
 cmd_task_output() {
     task_id="$1"
     if [ -z "$task_id" ]; then

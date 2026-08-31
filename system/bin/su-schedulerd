@@ -677,7 +677,11 @@ while true; do
                 
                 if [ $delete_after -eq 1 ]; then
                      log_msg "INFO" "💥 Boom. Task deleted."
-                     grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                     # Q13 修复（P2-01，设备冒烟实证）：`grep -v -F` 在配置只剩
+                     # 该删除行时输出为空且退出码 1 → `&&` 短路、行未被移除（tmp
+                     # 残留 0 字节）。改为分号连接：mv 始终执行（尽力而为删除）。
+                     grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+                     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
                 fi
             # 🎯 Check standard time
             elif [ "$trigger_norm" = "$current_time" ]; then
@@ -689,7 +693,11 @@ while true; do
                 
                 if [ $delete_after -eq 1 ]; then
                      log_msg "INFO" "💥 Boom. Task deleted."
-                     grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                     # Q13 修复（P2-01，设备冒烟实证）：`grep -v -F` 在配置只剩
+                     # 该删除行时输出为空且退出码 1 → `&&` 短路、行未被移除（tmp
+                     # 残留 0 字节）。改为分号连接：mv 始终执行（尽力而为删除）。
+                     grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+                     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
                 fi
             fi
         done
