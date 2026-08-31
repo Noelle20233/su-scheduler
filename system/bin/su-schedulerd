@@ -626,7 +626,12 @@ if [ -f "$CONFIG_FILE" ]; then
             cmd_to_run=$(extract_command "$clean_line")
             task_counter=$((task_counter + 1))
             task_id="startup_${task_counter}_$(date +%s)"
-            execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+            # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+            if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+            else
+                execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+            fi
         fi
     done
     exec 3<&-
@@ -698,7 +703,12 @@ while true; do
                 cmd_to_run=$(extract_command "$clean_line")
                 task_counter=$((task_counter + 1))
                 task_id="immediate_${task_counter}_$(date +%s)"
-                execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                else
+                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                fi
                 
                 # Prune the --run-once-now modifier from the file
                 log_msg "INFO" "✂️ Pruning --run-once-now from config"
@@ -715,7 +725,12 @@ while true; do
                 cmd_to_run=$(extract_command "$clean_line")
                 task_counter=$((task_counter + 1))
                 task_id="advanced_${task_counter}_$(date +%s)"
-                execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                else
+                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                fi
                 
                 if [ $delete_after -eq 1 ]; then
                      log_msg "INFO" "💥 Boom. Task deleted."
@@ -731,7 +746,12 @@ while true; do
                 cmd_to_run=$(extract_command "$clean_line")
                 task_counter=$((task_counter + 1))
                 task_id="time_${current_time}_${task_counter}_$(date +%s)"
-                execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                else
+                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                fi
                 
                 if [ $delete_after -eq 1 ]; then
                      log_msg "INFO" "💥 Boom. Task deleted."

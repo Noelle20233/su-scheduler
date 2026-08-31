@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.3.0"
+RUNTIME_LIB_VERSION="1.4.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -523,8 +523,18 @@ tpr_action_command_prepare() {
     echo "RUNNING" > "$dir/status.txt"
     echo "$dir"
 }
-tpr_action_command_start() {  # <id> <cmd> [termux] [interactive]
+tpr_action_command_start() {  # <id> <cmd> [termux] [interactive] [notify_start] [notify_end] [custom_msg]
     id=$1; cmd=$2; termux=${3:-0}; interactive=${4:-0}
+    notify_start=${5:-0}; notify_end=${6:-0}; custom_msg=${7:-}
+    if type execute_task >/dev/null 2>&1; then
+        # P2-06（委托既有执行器，不建立第二套命令执行器）：daemon 上下文——
+        # 7 参原样传递 execute_task；旧工件 status.txt/pid.txt/output.log/
+        # exit_code.txt/command.txt/start_time.txt/end_time.txt/exec_mode.txt
+        # 由 execute_task 原样产出（C2：零改动、零降级）。
+        execute_task "$id" "$cmd" "$notify_start" "$notify_end" "$custom_msg" \
+            "$interactive" "$termux" < /dev/null
+        return $?
+    fi
     dir=$(tpr_action_command_dir "$id")
     (
         if [ "$interactive" = "1" ]; then
@@ -1476,11 +1486,64 @@ trigger_decide() {
     esac
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §11 Action Execution Layer（P2-06）
+# ═══════════════════════════════════════════════════════════════════════════
+# 正式入口（唯一）：action_run —— 命令 / 脚本 / Termux / Interactive 四模式
+# 一律经 `provider_dispatch action command <cap>`（P1-04 唯一分发入口）。
+# **旧执行路径保留为 fallback**（C2）：RUNTIME_LOADED=0 时 daemon 直接调用
+# legacy execute_task（原样）；RUNTIME_LOADED=1 时 daemon 调用本正式入口
+# （接线见 su-schedulerd 四处执行点）。**Provider 内部委托既有 execute_task**
+# （不建立第二套命令执行器）：本库运行于 daemon 上下文（`type execute_task`
+# 命中——daemon 同 shell 注入）时，command Provider 的 start 能力以 7 参原样
+# 委托 execute_task——旧工件 status.txt / pid.txt / output.log / exit_code.txt
+# / command.txt / start_time.txt / end_time.txt / exec_mode.txt 由 execute_task
+# 原样产出（零改动、零降级）。非 daemon 上下文（CLI/测试）使用 §3 既有镜像
+# 执行器（P1-08 全模式，工件语义一致）——不引入新执行引擎。
+# 保留语义：notify_start/notify_end/custom_msg 仅随委托透传；本层不发送通知
+# （通知归 execute_task）；镜像路径不发送通知（与 P1-08/测试域一致）。
+# stdout（至多一行）：id=<id>|mode=<system|termux|interactive>|pid=<pid>|dir=<dir>
+# 返回：0=已启动 1=任务无效（缺 id/command）或分发失败（含碰撞跳过）2=硬错误。
+# ═══════════════════════════════════════════════════════════════════════════
+action_log() {
+    [ "${ACTION_LOG:-1}" = "1" ] && echo "[action] $1" >&2
+}
+
+action_run() {   # <id> <cmd> [termux] [interactive] [notify_start] [notify_end] [custom_msg]
+    id=$1; cmd=$2; termux=${3:-0}; interactive=${4:-0}
+    notify_start=${5:-0}; notify_end=${6:-0}; custom_msg=${7:-}
+    [ -n "$id" ] || { action_log "ERROR action_run: id required"; return 1; }
+    [ -n "$cmd" ] || { action_log "ERROR action_run: no command (id=$id)"; return 1; }
+    mode="system"
+    [ "$termux" = "1" ] && mode="termux"
+    [ "$interactive" = "1" ] && mode="interactive"
+    run_dir=""
+    if type execute_task >/dev/null 2>&1; then
+        # daemon 上下文：经 provider 分发；command Provider start 内部委托
+        # 既有 execute_task（7 参原样 → 旧工件原样产出；C2/不建第二执行器）。
+        provider_dispatch action command start "$id" "$cmd" "$termux" "$interactive" \
+            "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] || { action_log "ERROR action_run: start rc=$rc (id=$id)"; return 1; }
+        run_dir="${TASKS_DIR:-}/$id"
+    else
+        # 非 daemon 上下文（CLI/测试）：镜像路径（prepare → start，§3 全模式）。
+        run_dir=$(provider_dispatch action command prepare "$id" "$cmd") || {
+            action_log "ERROR action_run: prepare failed (id=$id)"
+            return 1
+        }
+        provider_dispatch action command start "$id" "$cmd" "$termux" "$interactive" \
+            > "$run_dir/pid.txt" 2>/dev/null || return 1
+    fi
+    pid=$(cat "$run_dir/pid.txt" 2>/dev/null)
+    echo "id=$id|mode=$mode|pid=$pid|dir=$run_dir"
+    return 0
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
               runtime_log_event registry_init lifecycle_start task_cli_list \
-              shadow_tick runtime_map_lookup trigger_decide; do
+              shadow_tick runtime_map_lookup trigger_decide action_run; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

@@ -16,6 +16,10 @@
 #   L2  tests/lifecycle/test.sh         P1 生命周期（56 断言）
 #   L2  tests/task-cli/test.sh          P1 只读 CLI（39 断言）
 #   L2  tests/runtime-lib/test.sh       P2-02 生产 Runtime 库边界（21 断言）
+#   L2  tests/shadow/test.sh            P2-03 Registry Shadow Mode（旁路比对）
+#   L2  tests/idmap/test.sh             P2-04 Canonical↔Legacy Run ID 映射
+#   L2  tests/trigger/test.sh           P2-05 TriggerProvider 接入（25 断言）
+#   L2  tests/action/test.sh            P2-06 CommandActionProvider 接入
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -77,6 +81,7 @@ else
         "tests/shadow/test.sh" \
         "tests/idmap/test.sh" \
         "tests/trigger/test.sh" \
+        "tests/action/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
