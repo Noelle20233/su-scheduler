@@ -111,6 +111,7 @@ print_help() {
     echo -e "  ${GREEN}edit${RESET} ${CYAN}[editor]${RESET}             Crack open the config 🎨"
     echo -e "  ${GREEN}log${RESET} ${YELLOW}[-f|-n NUM]${RESET}          View logs (-f=follow, -n=lines) 🕵️"
     echo -e "  ${GREEN}tasks${RESET}                    List only running tasks 📋"
+    echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id>}${RESET}   Registry-backed Task CLI (P2-08) 🗂️"
     echo -e "  ${GREEN}audit${RESET} ${YELLOW}[-f|-n NUM|clear]${RESET}    The Mission Auditor feed 🕵️"
     echo -e "  ${GREEN}history | all-tasks${RESET}      List all tasks (running & finished) 📜"
     echo -e "  ${GREEN}task-info${RESET} ${CYAN}<task_id>${RESET}       Get detailed task info 🔍"
@@ -1127,6 +1128,36 @@ cmd_help() {
     esac
 }
 
+# 🗂️ Production Task CLI（P2-08，RUNTIME_LOADED 门控；旧 CLI 命令零改动）
+# 数据源 = Registry 快照（registry_attach 只读挂载，不重新扫描配置——P2-08）；
+# 三态错误区分：task not found / configuration invalid / daemon is not running；
+# 支持稳定 Task ID 与旧运行 ID 查询（§9 idmap 双向解析）。
+cmd_task() {
+    if [ "$RUNTIME_LOADED" -ne 1 ]; then
+        echo "ERROR: task subcommand requires production runtime library (${RUNTIME_LIB} not loaded)" >&2
+        return 1
+    fi
+    sub="${1:-}"
+    case "$sub" in
+        list) shift; cmd_task_list "$@" ;;
+        status) shift; cmd_task_status "$@" ;;
+        ""|-h|--help) echo "Usage: su-scheduler task {list | status <id>}" >&2; return 0 ;;
+        *) echo "ERROR: unknown task subcommand: $sub (usage: task list | task status <id>)" >&2; return 1 ;;
+    esac
+}
+cmd_task_list() {
+    task_cli_attach "$DATA_DIR" >/dev/null 2>&1 || {
+        echo "ERROR: configuration invalid (no valid task snapshot) — start daemon first or fix config.txt" >&2
+        return 2
+    }
+    TASK_CLI_TASKS_DIR="$TASKS_DIR" task_cli_list
+}
+cmd_task_status() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task status <id>" >&2; return 1; }
+    task_cli_status_id "$DATA_DIR" "$TASKS_DIR" "/dev/.su_scheduler.lock" "$id"
+}
+
 # 🚦 Main Dispatcher - Routes your command to the right function
 case "$1" in
     add) shift; cmd_add "$@" ;;
@@ -1136,6 +1167,7 @@ case "$1" in
     log) shift; cmd_log "$@" ;;
     clear-log) echo -n "" > "$LOG_FILE"; echo -e "${GREEN}🧹 Log cleared.${RESET}" ;;
     tasks) cmd_tasks ;;
+    task) shift; cmd_task "$@" ;;
     audit) shift; cmd_audit "$@" ;;
     history|all-tasks) cmd_tasks_history ;;
     task-info) shift; cmd_task_info "$@" ;;

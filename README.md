@@ -1389,6 +1389,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | TriggerProvider 接入（P2-05：单一正式入口 trigger_decide、boot/time/advanced 经 Provider、保留 ron/delete/去重、新旧一致比对） | `tests/trigger/test.sh` |
 | L2 | CommandActionProvider 接入（P2-06：单一正式入口 action_run、Provider 委托既有 execute_task、四模式经统一 Action 入口、旧工件 status/pid/output/exit_code 保留、不建第二执行器） | `tests/action/test.sh` |
 | L2 | 统一状态与事件日志（P2-07：state.txt/events.log 双写与旧工件并存、一次性任务成功→STOPPED 不虚假 HEALTHY、健康 Provider 门槛、非法转换非致命、重启残留再水合、旧 CLI 仍读旧状态） | `tests/state/test.sh` |
+| L2 | 生产 Task CLI（P2-08：`task list|status`、Registry 只读挂载不重扫配置、稳定 Task ID 与旧运行 ID 双向查询、三态错误区分） | `tests/task-cli-prod/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.5.0"
+RUNTIME_LIB_VERSION="1.6.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -764,6 +764,16 @@ registry_init() {
         TASK_REGISTRY_SNAPSHOT=""
         return 1
     fi
+}
+
+# P2-08：只读挂载既有快照（CLI task 子命令数据源——**不重新解析 config**：
+# 仅设 TR_BASE 并读取 current 指针；不调用 adapter/parse/reload）。
+registry_attach() {
+    TR_BASE=${1:-}
+    [ -n "$TR_BASE" ] || { registry_log "ERROR attach: base_dir required"; return 2; }
+    TR_CONFIG_PATH=""
+    TASK_REGISTRY_SNAPSHOT=$(registry_current_snapshot_id)
+    [ -n "$TASK_REGISTRY_SNAPSHOT" ] && return 0 || return 1
 }
 
 registry_snapshot_next() {
@@ -1678,13 +1688,65 @@ state_rehydrate_residual() {   # <tasks_dir>
     return 0
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §13 Task CLI 接线（P2-08）
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI `su-scheduler task list | task status <id>` 的生产数据路径：**读取
+# Registry，不重新扫描配置**（registry_attach 只挂载当前快照；不调用
+# adapter/parse/reload）。三态错误区分沿 §7：rc1 task not found / rc2
+# configuration invalid / rc3 daemon is not running——均带明确 stderr 消息。
+# 支持**稳定 Task ID（t<line>_<trigger>）与旧运行 ID（time_/advanced_/
+# immediate_/startup_…）**双向查询：旧 ID 经 §9 idmap（runtime_map_refresh
+# 幂等刷新 + run→canonical 反向查询）。旧 CLI 命令零改动（P2-04 兼容边界）；
+# 本层只新增 task 前缀命令（不 alias、不覆盖 commands 同名函数）。
+# 返回：0=成功 / 1=任务未找到或用法错 / 2=配置无效（无有效快照）/ 3=daemon 未运行。
+# ═══════════════════════════════════════════════════════════════════════════
+task_cli_attach() {   # <base> → 0=已挂载当前快照 / 1=无有效快照 / 2=base 缺失
+    registry_attach "$1"
+}
+
+task_cli_resolve_id() {   # <base> <tasks_dir> <id> → echo canonical id（无则返回 1）
+    base=$1; tasks=$2; qid=$3
+    # 注：查询 ID 用 qid 而非 id —— runtime_map_refresh 内部以全局 `id` 作循环
+    # 变量（POSIX sh 无局部变量），复用同名会覆盖本函数参数（P2-08 实测修复）。
+    if registry_task_file "$qid" >/dev/null 2>&1; then
+        echo "$qid"
+        return 0
+    fi
+    # 旧运行 ID → canonical（§9 idmap：幂等刷新后反向查询 run→canonical）
+    runtime_map_refresh "$base" "$tasks" >/dev/null 2>&1
+    canon=$(runtime_map_run_task "$base" "$qid")
+    [ -n "$canon" ] || return 1
+    echo "$canon"
+    return 0
+}
+
+task_cli_status_id() {   # <base> <tasks_dir> <lock> <id> → rc 沿 §7 三态
+    base=$1; tasks=$2; lock=$3; qid=$4
+    [ -n "$qid" ] || { echo "ERROR: usage: task status <id>" >&2; return 1; }
+    task_cli_attach "$base" >/dev/null 2>&1 || {
+        echo "ERROR: configuration invalid (no valid task snapshot)" >&2
+        return 2
+    }
+    canon=$(task_cli_resolve_id "$base" "$tasks" "$qid")
+    if [ -z "$canon" ]; then
+        echo "ERROR: task not found: $qid" >&2
+        return 1
+    fi
+    if [ "$canon" != "$qid" ]; then
+        echo "queried_id=$qid"
+        echo "canonical_id=$canon"
+    fi
+    TASK_CLI_TASKS_DIR="$tasks" TASK_CLI_LOCK="$lock" task_cli_status "$canon"
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
               runtime_log_event registry_init lifecycle_start task_cli_list \
               shadow_tick runtime_map_lookup trigger_decide action_run \
               state_log_event state_health_allowed state_sync_all \
-              state_rehydrate_residual; do
+              state_rehydrate_residual registry_attach task_cli_attach \
+              task_cli_resolve_id task_cli_status_id; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
