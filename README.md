@@ -1386,6 +1386,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | 生产 Runtime 库边界（P2-02：daemon/CLI 共用原语、路径隔离、fallback） | `tests/runtime-lib/test.sh` |
 | L2 | Registry Shadow Mode（P2-03：启动快照、原子 reload、损坏 KEPT、旁路比对记录） | `tests/shadow/test.sh` |
 | L2 | Canonical↔Legacy Run ID 兼容（P2-04：双向映射、旧 CLI 原样可用、零改名） | `tests/idmap/test.sh` |
+| L2 | TriggerProvider 接入（P2-05：单一正式入口 trigger_decide、boot/time/advanced 经 Provider、保留 ron/delete/去重、新旧一致比对） | `tests/trigger/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

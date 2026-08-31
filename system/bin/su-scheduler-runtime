@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.2.0"
+RUNTIME_LIB_VERSION="1.3.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -469,8 +469,11 @@ tpr_trigger_advanced_matches() {
             ttime=$(echo "$trigger" | cut -d: -f4)
             key="nweekly_${n}_${tdow}_${ttime}_${hash}"
             last=$(grep "^${key}=" "$(tpr_ctx_state_file)" 2>/dev/null | cut -d= -f2)
+            # P2-05 修复：host bash 将 08/09 视为非法八进制 → 剥前导零后算术（POSIX；daemon mksh 等价）
+            wkz=$(echo "$wk" | sed -n 's/^0*\([0-9][0-9]*\)$/\1/p'); [ -z "$wkz" ] && wkz=0
+            lastz=$(echo "$last" | sed -n 's/^0*\([0-9][0-9]*\)$/\1/p'); [ -z "$lastz" ] && lastz=0
             if [ "$dow" = "$tdow" ] && [ "$now" -ge "$ttime" ] && {
-                [ -z "$last" ] || [ $(((wk - last + 53) % 53)) -ge "$n" ]; }; then
+                [ -z "$last" ] || [ $(((wkz - lastz + 53) % 53)) -ge "$n" ]; }; then
                 return 0
             fi ;;
         monthly:*)
@@ -484,8 +487,12 @@ tpr_trigger_advanced_matches() {
             ttime=$(echo "$trigger" | cut -d: -f4)
             key="nmonthly_${n}_${tdd}_${ttime}_${hash}"
             last=$(grep "^${key}=" "$(tpr_ctx_state_file)" 2>/dev/null | cut -d= -f2)
-            lt=$((yy * 12 + ${last:-0})); tt=$((yy * 12 + mm))
-            [ "$lt" -gt "$tt" ] && lt=$(((yy - 1) * 12 + last))
+            # P2-05 修复：host bash 将 08/09 视为非法八进制 → 剥前导零后算术（POSIX；daemon mksh 等价）
+            yyz=$(echo "$yy" | sed -n 's/^0*\([0-9][0-9]*\)$/\1/p'); [ -z "$yyz" ] && yyz=0
+            mmz=$(echo "$mm" | sed -n 's/^0*\([0-9][0-9]*\)$/\1/p'); [ -z "$mmz" ] && mmz=0
+            lastz=$(echo "$last" | sed -n 's/^0*\([0-9][0-9]*\)$/\1/p'); [ -z "$lastz" ] && lastz=0
+            lt=$((yyz * 12 + lastz)); tt=$((yyz * 12 + mmz))
+            [ "$lt" -gt "$tt" ] && lt=$(((yyz - 1) * 12 + lastz))
             if [ "$dd" = "$tdd" ] && [ "$now" -ge "$ttime" ] && {
                 [ -z "$last" ] || [ $((tt - lt)) -ge "$n" ]; }; then
                 return 0
@@ -1383,13 +1390,97 @@ runtime_map_lookup() {      # <base> <tasks_dir> <id>：双向自动识别
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Self-check（加载方引用）：全部 §1–§9 代表函数就绪 + 版本号存在 → 0。
+# §10 Trigger Decision Layer（P2-05）
+# ═══════════════════════════════════════════════════════════════════════════
+# 正式入口（唯一）：trigger_decide —— 每个 registry Task 的 boot / time /
+# advanced 判断一律经 `provider_dispatch trigger <family> matches`（P1-04 唯一
+# 分发入口）。**旧判断保留为 fallback**（daemon 内联决策原样；C2）；本层只做
+# 旁路决策 + 与新侧镜像的**一致性记录**（trigger.log）。
+# 保留语义（C4）：
+#   - heredoc：source.type=block 任务与单行同触发器语义（决策按 trigger 字段）；
+#   - --run-once-now：action.run_once_now=1 → 首扫即 due（legacy “立即执行”语义；
+#     修剪动作仍归执行层的既有权责，本层不修剪、不改配置）；
+#   - --delete：action.delete 仅是执行层动作语义，本层决策不含删除、不改配置；
+#   - 既有去重状态：advanced 家族只**读**状态文件（tpr_trigger_advanced_matches
+#     内部既有键检查）；键的**写**仍归 legacy 执行路径（本层零写入）。
+# 不引入：Dependency / Condition / 新 Trigger（仅 boot/time/advanced 三家族）。
+# ═══════════════════════════════════════════════════════════════════════════
+trigger_ctx_now()   { echo "${TRIGGER_DECISION_NOW:-$(date +%H%M)}"; }
+trigger_ctx_boot()  { echo "${TRIGGER_BOOT_CONTEXT:-0}"; }
+trigger_ctx_state() { echo "${TRIGGER_STATE_FILE:-/data/adb/su-scheduler/schedule_state.txt}"; }
+trigger_ctx_today() { echo "${TRIGGER_TODAY:-$(date +%Y%m%d)}"; }
+
+# advanced 去重键的**写**（仅执行层使用；P2-05 本层不调用——保留由 legacy 路径
+# should_run_advanced_schedule 写入既有格式键。此处仅供镜像比对构造只读键集合。）
+trigger_adv_key() {   # <trigger> <clean_line> <state_file> [today] → echo key（镜像 daemon 键格式）
+    trig=$1; line=$2; sf=${3:-$(trigger_ctx_state)}
+    today=${4:-$(trigger_ctx_today)}
+    yy=$(echo "$today" | cut -c1-4); mm=$(echo "$today" | cut -c5-6); dd=$(echo "$today" | cut -c7-8)
+    dow=$(date -d "$today" +%u 2>/dev/null || date +%u)
+    wk=$(date -d "$today" +%V 2>/dev/null || date +%V)
+    hash=$(printf '%s\n' "$line" | md5sum | cut -d' ' -f1)
+    case "$trig" in
+        weekly:*)  t=$(echo "$trig" | cut -d: -f3); echo "weekly_$(echo "$trig" | cut -d: -f2)_${t}_${hash}_${yy}${mm}${dd}" ;;
+        nweekly:*) n=$(echo "$trig" | cut -d: -f2); t=$(echo "$trig" | cut -d: -f4); echo "nweekly_${n}_$(echo "$trig" | cut -d: -f3)_${t}_${hash}=${wk}" ;;
+        monthly:*) t=$(echo "$trig" | cut -d: -f3); echo "monthly_$(echo "$trig" | cut -d: -f2)_${t}_${hash}_${yy}${mm}" ;;
+        nmonthly:*) n=$(echo "$trig" | cut -d: -f2); t=$(echo "$trig" | cut -d: -f4); echo "nmonthly_${n}_$(echo "$trig" | cut -d: -f3)_${t}_${hash}=${mm}" ;;
+        yearly:*)  t=$(echo "$trig" | cut -d: -f3); echo "yearly_$(echo "$trig" | cut -d: -f2)_${t}_${hash}_${yy}" ;;
+    esac
+}
+
+# ── 正式决策入口（唯一）：trigger_decide <base> <task_id> [now] [boot] [state_file]
+# → stdout 单行：task=<id>|trigger=<trig>|due=<Y|N>|cause=<boot|time_trigger|
+# advanced|manual_exec|>；返回 0=due / 1=not due / 2=硬错误。全部匹配经 provider
+# dispatch（单入口）。heredoc/--delete/--run-once-now/去重保留见 §10 头注释。
+trigger_decide() {
+    base=$1; tid=$2
+    now=${3:-$(trigger_ctx_now)}
+    boot=${4:-$(trigger_ctx_boot)}
+    sf=${5:-$(trigger_ctx_state)}
+    tf=$(registry_task_file "$tid") || { echo "task=$tid|due=N|err=no-task"; return 2; }
+    trig=$(grep '^trigger=' "$tf" | head -1 | cut -d= -f2)
+    stype=$(grep '^source.type=' "$tf" | head -1 | cut -d= -f2)
+    ron=$(grep '^action.run_once_now=' "$tf" | head -1 | cut -d= -f2)
+    if [ "$ron" = "1" ]; then
+        echo "task=$tid|trigger=$trig|due=Y|cause=manual_exec"
+        return 0
+    fi
+    case "$trig" in
+        boot)
+            if TRIGGER_BOOT_CONTEXT=$boot provider_dispatch trigger boot matches >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=boot"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        [0-9][0-9]:[0-9][0-9]|[0-9][0-9][0-9][0-9])
+            if TRIGGER_DECISION_NOW=$now provider_dispatch trigger time matches "$trig" >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=time_trigger"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        weekly:*|nweekly:*|monthly:*|nmonthly:*|yearly:*)
+            RAW=$(grep '^source.raw=' "$tf" | head -1 | cut -d= -f2-)
+            CLEAN=$(rt_clean "$RAW")
+            if TRIGGER_DECISION_NOW=$now TRIGGER_STATE_FILE=$sf \
+               TRIGGER_DECISION_LINE="$CLEAN" provider_dispatch trigger advanced matches "$trig" >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=advanced"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        *)
+            echo "task=$tid|trigger=$trig|due=N|err=unknown-trigger"
+            return 2 ;;
+    esac
+}
 # ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
               runtime_log_event registry_init lifecycle_start task_cli_list \
-              shadow_tick runtime_map_lookup; do
+              shadow_tick runtime_map_lookup trigger_decide; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

@@ -71,6 +71,9 @@ fi
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
     shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
     runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+    for tid in $(registry_task_ids); do
+        trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "${TRIGGER_BOOT_CONTEXT:-0}" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
+    done
 fi
 
 # 📝 Function to log events with pretty timestamps and colors
@@ -650,6 +653,9 @@ while true; do
         if [ "$RUNTIME_LOADED" -eq 1 ]; then
             shadow_tick "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
             runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+            for tid in $(registry_task_ids); do
+                trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "0" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
+            done
         fi
 
         task_counter=0
