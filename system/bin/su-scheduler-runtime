@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.0.0"
+RUNTIME_LIB_VERSION="1.1.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1135,12 +1135,168 @@ task_cli_status() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Self-check（加载方引用）：全部 §1–§7 代表函数就绪 + 版本号存在 → 0。
+# §8 Registry Shadow Mode（P2-03，旁路比对）
+# ───────────────────────────────────────────────────────────────────────────
+# **不改 legacy 执行路径**（C2）：本层只镜像旧扫描、不消耗 daemon 扫描结果、
+# 不触发任何执行/修剪——仅建 Registry 快照并比对记录。
+#   - shadow_init  <base> <config> [log]  —— daemon 启动：建首快照 + 基线比对；
+#   - shadow_tick  <base> <config> [log]  —— 每轮：config md5 变化 → 原子
+#     registry_reload（损坏配置 → KEPT 保留最后有效快照）；legacy 镜像扫描 ↔
+#     registry 触发器集比对；记录 shadow.log + shadow.last（原子 tmp+mv）。
+#   - legacy 镜像扫描与 daemon 主循环同法（修边/跳注释空行/heredoc 块计 1）。
+# 记录（shadow.log 追加，`|` 分隔）：op=<init|reload|compare>|agree=<Y|N>|
+# legacy=<n>|registry=<m>|snap=<id>|cfg_md5=<12>；agree=N 时另记 diff 行。
+# ═══════════════════════════════════════════════════════════════════════════
+shadow_log() {
+    [ "${SHADOW_LOG:-1}" = "1" ] && echo "$1" >> "${SHADOW_LOGFILE:-/dev/null}" 2>/dev/null
+}
+shadow_state_file() { echo "$1/shadow/shadow.last"; }
+
+# legacy 镜像扫描：stdout 每个激活行一个**归一触发器**（heredoc 块计 1 并
+# 消耗块体，与 daemon 主循环同法）。返回码 0=可扫 1=config 缺失。
+shadow_scan_legacy() {
+    config=$1
+    [ -f "$config" ] || return 1
+    while IFS= read -r line || [ -n "$line" ]; do
+        cl=$(echo "$line" | tr -d '\r' | sed 's/^[ \t]*//;s/[ \t]*$//')
+        case "$cl" in
+            \#*|"") continue ;;
+        esac
+        if echo "$cl" | grep -q '<<EOF'; then
+            echo "$(echo "$cl" | awk '{print $1}')" | sed 's/://g'
+            while IFS= read -r lin || [ -n "$lin" ]; do
+                echo "$lin" | grep -q '^EOF' && break
+            done
+            continue
+        fi
+        echo "$(echo "$cl" | awk '{print $1}')" | sed 's/://g'
+    done < "$config"
+    return 0
+}
+
+# registry 触发器集：当前快照每任务 trigger 字段（去冒号归一）。
+shadow_scan_registry() {
+    base=$1
+    [ -d "$base/snapshots" ] || return 1
+    for id in $(registry_task_ids); do
+        f=$(registry_task_file "$id") || continue
+        trig=$(grep '^trigger=' "$f" | head -1 | cut -d= -f2)
+        echo "$trig" | sed 's/://g'
+    done
+    return 0
+}
+
+# 比对两清单：$1=legacy 清单文件 $2=registry 清单文件 → stdout 判定行 +
+# 差异详情（各限 5）。comm 差集：legacy_only / registry_only。
+shadow_compare() {
+    leg=$1; reg=$2
+    agree=Y
+    ln=$(wc -l < "$leg" 2>/dev/null || echo 0)
+    rn=$(wc -l < "$reg" 2>/dev/null || echo 0)
+    [ "$ln" = "$rn" ] || agree=N
+    sort "$leg" 2>/dev/null > "$leg.s"
+    sort "$reg" 2>/dev/null > "$reg.s"
+    lo=$(comm -23 "$leg.s" "$reg.s" 2>/dev/null | head -5 | tr '\n' ',')
+    ro=$(comm -13 "$leg.s" "$reg.s" 2>/dev/null | head -5 | tr '\n' ',')
+    [ -z "$lo$ro" ] || agree=N
+    echo "agree=$agree"
+    echo "legacy=$ln registry=$rn"
+    [ -n "$lo" ] && echo "legacy_only=$lo"
+    [ -n "$ro" ] && echo "registry_only=$ro"
+    rm -f "$leg.s" "$reg.s"
+}
+
+# 单轮旁路比对核心：$1=base $2=config $3=log(缺省 base/shadow/shadow.log)
+# 0=一致 1=不一致（含 config 缺失）2=状态目录不可建。
+shadow_tick() {
+    base=$1; config=$2
+    SHADOW_LOGFILE=${3:-$base/shadow/shadow.log}
+    [ -f "$config" ] || { shadow_log "$(date '+%Y-%m-%d %H:%M:%S')|SHADOW|op=compare|agree=N|legacy=0|registry=?|snap=|cfg_md5=|msg=config-missing"; return 1; }
+    mkdir -p "$base/shadow" 2>/dev/null || return 2
+
+    mdfile=$(shadow_state_file "$base")
+    newmd5=$(md5sum "$config" | cut -d' ' -f1)
+    oldmd5=$(grep '^last_md5=' "$mdfile" 2>/dev/null | cut -d= -f2)
+    op="compare"
+    changed=0
+    if [ -n "$oldmd5" ] && [ "$oldmd5" = "$newmd5" ]; then
+        :   # 未变化：沿用当前快照（不 reload）
+    else
+        # 配置变化 → 原子 reload（损坏/无效 → KEPT：快照与指针不动）
+        registry_reload "$config" >/dev/null 2>&1; rrc=$?
+        op="reload"
+        changed=1
+    fi
+    snap=$(registry_current_snapshot_id)
+
+    L="$base/shadow/leg.tmp"
+    R="$base/shadow/reg.tmp"
+    shadow_scan_legacy "$config" > "$L"
+    shadow_scan_registry "$base" > "$R"
+    out=$(shadow_compare "$L" "$R")
+    agree=$(echo "$out" | sed -n 's/^agree=//p')
+    ln=$(echo "$out" | sed -n 's/.*legacy=\([0-9]*\).*/\1/p')
+    rn=$(echo "$out" | sed -n 's/.*registry=\([0-9]*\).*/\1/p')
+    cm=$(echo "$newmd5" | cut -c1-12)
+
+    {
+        echo "last_md5=$newmd5"
+        echo "last_snap=$snap"
+        echo "last_agree=$agree"
+        echo "last_legacy=$ln"
+        echo "last_registry=$rn"
+    } > "$mdfile.tmp" && mv "$mdfile.tmp" "$mdfile"
+
+    shadow_log "$(date '+%Y-%m-%d %H:%M:%S')|SHADOW|op=$op|agree=$agree|legacy=$ln|registry=$rn|snap=$snap|cfg_md5=$cm|rrc=${rrc:-0}"
+    if [ "$agree" = "N" ]; then
+        shadow_log "$(date '+%Y-%m-%d %H:%M:%S')|SHADOW|diff|legacy_only=$(echo "$out" | sed -n 's/^legacy_only=//p')|registry_only=$(echo "$out" | sed -n 's/^registry_only=//p')"
+    fi
+    rm -f "$L" "$R" 2>/dev/null
+    [ "$agree" = "Y" ] && return 0 || return 1
+}
+
+# daemon 启动旁路：建首快照 + 基线比对（op=init，不 reload）。
+shadow_init() {
+    base=$1; config=$2
+    SHADOW_LOGFILE=${3:-$base/shadow/shadow.log}
+    mkdir -p "$base/shadow" 2>/dev/null || return 2
+    registry_init "$base" "$config" >/dev/null 2>&1
+    snap=$(registry_current_snapshot_id)
+    [ -n "$snap" ] || {
+        shadow_log "$(date '+%Y-%m-%d %H:%M:%S')|SHADOW|op=init|agree=N|legacy=?|registry=0|snap=|cfg_md5=|msg=no-valid-snapshot"
+        return 1
+    }
+    L="$base/shadow/leg.tmp"; R="$base/shadow/reg.tmp"
+    shadow_scan_legacy "$config" > "$L"
+    shadow_scan_registry "$base" > "$R"
+    out=$(shadow_compare "$L" "$R")
+    agree=$(echo "$out" | sed -n 's/^agree=//p')
+    ln=$(echo "$out" | sed -n 's/.*legacy=\([0-9]*\).*/\1/p')
+    rn=$(echo "$out" | sed -n 's/.*registry=\([0-9]*\).*/\1/p')
+    cm=$(md5sum "$config" | cut -d' ' -f1 | cut -c1-12)
+    {
+        echo "last_md5=$(md5sum "$config" | cut -d' ' -f1)"
+        echo "last_snap=$snap"
+        echo "last_agree=$agree"
+        echo "last_legacy=$ln"
+        echo "last_registry=$rn"
+    } > "$base/shadow/shadow.last.tmp" && mv "$base/shadow/shadow.last.tmp" "$base/shadow/shadow.last"
+    shadow_log "$(date '+%Y-%m-%d %H:%M:%S')|SHADOW|op=init|agree=$agree|legacy=$ln|registry=$rn|snap=$snap|cfg_md5=$cm"
+    if [ "$agree" = "N" ]; then
+        shadow_log "$(date '+%Y-%m-%d %H:%M:%S')|SHADOW|diff|legacy_only=$(echo "$out" | sed -n 's/^legacy_only=//p')|registry_only=$(echo "$out" | sed -n 's/^registry_only=//p')"
+    fi
+    rm -f "$L" "$R" 2>/dev/null
+    [ "$agree" = "Y" ] && return 0 || return 1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Self-check（加载方引用）：全部 §1–§8 代表函数就绪 + 版本号存在 → 0。
 # ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
-              runtime_log_event registry_init lifecycle_start task_cli_list; do
+              runtime_log_event registry_init lifecycle_start task_cli_list \
+              shadow_tick; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

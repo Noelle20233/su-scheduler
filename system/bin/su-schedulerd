@@ -66,6 +66,11 @@ else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Runtime library unavailable ($RUNTIME_LIB); legacy mode active" >> "$LOG_FILE" 2>/dev/null
 fi
 
+# ⚙️ Registry Shadow Mode 启动旁路（P2-03）：建首快照 + 基线比对记录
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
+fi
+
 # 📝 Function to log events with pretty timestamps and colors
 log_msg() {
     local level="$1"
@@ -636,6 +641,11 @@ while true; do
         if [ "$CURRENT_MTIME" != "$LAST_MTIME" ]; then
             log_msg "INFO" "🔥 New configuration detected! Hot reloading presets..."
             LAST_MTIME=$CURRENT_MTIME
+        fi
+
+        # ⚙️ Registry Shadow Mode tick（P2-03，旁路比对；不改 legacy 执行路径）
+        if [ "$RUNTIME_LOADED" -eq 1 ]; then
+            shadow_tick "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
         fi
 
         task_counter=0
