@@ -2,7 +2,7 @@
   "version": "v1.6.8",
   "versionCode": 11608,
   "downloadURL": "https://github.com/rexackermann/su-scheduler/releases/download/v1.6.8/su-scheduler-v1.6.8.zip",
-  "changelog": "chore: Finalizing v1.6.7 Mission Auditor release",
+  "changelog": "chore: bump version to v1.6.8 [skip ci]",
   "forumURL": "https://github.com/rexackermann/su-scheduler",
   "updateType": "stable"
 }

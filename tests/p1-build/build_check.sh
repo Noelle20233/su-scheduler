@@ -7,9 +7,11 @@
 #   1) bash build.sh 产出 su-scheduler-v<ver>.zip
 #   2) unzip -t 完整性通过（无错误）
 #   3) zip 内含 module.prop / service.sh / customize.sh / system/
-#   4) 六处版本号一致（取 build.sh 的 VERSION 为基准，其余五处必须匹配）：
+#   4) 八处版本号一致（取 build.sh 的 VERSION 为基准，其余七处必须匹配）：
 #      module.prop(version/versionCode) / 两个 bin(VERSION) / README badge /
-#      update.json(version/versionCode/downloadURL)
+#      update.json(version/versionCode/downloadURL) /
+#      system/bin/.su-scheduler-docs 头部 Version / update.json changelog
+#      （P2-01 Q12 扩展：后两处原为 v1.6.7 残留，已修正并纳入一致性校验）
 #   5) 演练后还原工作树：删 zip + git checkout system/bin/.su-scheduler-docs
 #      （build.sh 会重建该文件；还原防止污染 P1 工作树，同 P0 T4 惯例）
 # ═══════════════════════════════════════════════════════════════════════════
@@ -75,6 +77,8 @@ grep -q "Version-$NVVER-blue" README.md && ok "README badge Version-$NVVER" || b
 grep -q "\"version\": \"$BVER\"," update.json && ok "update.json version=$BVER" || bad "update.json version"
 grep -q "\"versionCode\": [0-9]*," update.json && ok "update.json versionCode present" || bad "update.json versionCode"
 grep -q "releases/download/$BVER/su-scheduler-$BVER.zip" update.json && ok "update.json downloadURL -> $BVER" || bad "update.json downloadURL"
+grep -q "^# Version: $NVVER" system/bin/.su-scheduler-docs && ok "docs header Version=$NVVER (Q12)" || bad "docs header Version (Q12)"
+grep -q "\"changelog\": \".*v$NVVER" update.json && ok "update.json changelog references v$NVVER (Q12)" || bad "update.json changelog (Q12)"
 
 # ── 5) 还原工作树（仅 LF 环境跑过构建时需要；CRLF 下未构建无污染）───────────
 if [ "$CRLF_TREE" -eq 0 ]; then
