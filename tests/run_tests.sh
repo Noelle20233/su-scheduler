@@ -22,6 +22,7 @@
 #   L2  tests/action/test.sh            P2-06 CommandActionProvider 接入
 #   L2  tests/state/test.sh             P2-07 统一状态与事件日志（双写/终态/健康门/重启残留）
 #   L2  tests/task-cli-prod/test.sh     P2-08 生产 Task CLI（registry 只读挂载/稳定+旧运行 ID/三态错误）
+#   L2  tests/lifecycle-prod/test.sh    P2-09 daemon 生命周期（启动序列/最后有效快照/stale PID/stop/restart/看护）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -86,6 +87,7 @@ else
         "tests/action/test.sh" \
         "tests/state/test.sh" \
         "tests/task-cli-prod/test.sh" \
+        "tests/lifecycle-prod/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

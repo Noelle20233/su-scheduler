@@ -71,6 +71,9 @@ fi
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
     shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
     runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+    # ⚙️ 生命周期 Registry 引导（P2-09）：shadow_init 之后补**最后有效快照**回退
+    #   （config 缺失 → registry_attach 只读挂载历史快照；KEPT 语义，不重扫配置）
+    lifecycle_startup_registry "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
     for tid in $(registry_task_ids); do
         trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "${TRIGGER_BOOT_CONTEXT:-0}" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
     done
@@ -608,7 +611,11 @@ fi
 #   剪枝后的运行态（status.txt=RUNNING/STARTING/ZOMBIE_CRASHED/STALE）→
 #   新 state.txt=FAILED + events.log daemon_restart 事件（旧 status.txt 不动——
 #   旧 CLI 仍按旧语义读取；状态机成为新事实源）。
+# ⚙️ 生命周期恢复（P2-09）：stale PID 扫描（§4 runtime_scan_stale）接入同一
+#   启动序列——pid.txt 指向已死进程的运行态 → state.txt=FAILED + daemon_restart
+#   事件（与 §14 lifecycle_startup_recover 一致；旧工件不动）。
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    runtime_scan_stale "$TASKS_DIR" >/dev/null 2>&1
     state_rehydrate_residual "$TASKS_DIR" >/dev/null 2>&1
 fi
 

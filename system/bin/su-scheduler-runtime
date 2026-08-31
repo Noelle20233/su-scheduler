@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.6.0"
+RUNTIME_LIB_VERSION="1.7.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1739,6 +1739,49 @@ task_cli_status_id() {   # <base> <tasks_dir> <lock> <id> → rc 沿 §7 三态
     TASK_CLI_TASKS_DIR="$tasks" TASK_CLI_LOCK="$lock" task_cli_status "$canon"
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §14 Daemon Lifecycle Startup（P2-09）
+# ═══════════════════════════════════════════════════════════════════════════
+# daemon 启动生命周期（**单次执行，不创建第二个常驻循环**；**不重复实现锁逻辑**
+# ——daemon 既有 LOCK_FILE 单实例保护与 service.sh 60 秒看护循环原样保留）。
+# 两个正式入口：
+#   lifecycle_startup_registry <base> <config> —— Registry 引导：当前已有快照
+#     （shadow_init 已建 / reload KEPT）即就绪；否则 config 存在 → registry_init
+#     （新快照）；config 缺失 → registry_attach **只读挂载最后有效快照**（KEPT
+#     语义，不重新扫描配置）。返回 0=快照就绪 / 1=无有效快照 / 2=参数错。
+#   lifecycle_startup_recover <tasks_dir> —— 恢复序列（幂等，单目录错误不中止）：
+#     = runtime_scan_stale（stale PID：pid.txt 指向已死进程的运行态 →
+#       state.txt=FAILED + daemon_restart 事件）+ state_rehydrate_residual
+#       （剪枝后运行态 status.txt=RUNNING/STARTING/ZOMBIE_CRASHED/STALE →
+#       state.txt=FAILED + daemon_restart 事件）；旧工件（status.txt/pid.txt/…）
+#       **只读不动**（旧 CLI 仍按旧语义读取）。
+# daemon 接线：su-schedulerd 启动区按同一序列组合（P2-03 shadow_init →
+# P2-04 runtime_map_refresh → 本层 registry 引导 → P2-05 trigger_decide 预热 →
+# legacy 剪枝后本层恢复序列）；本层亦供测试以同一序列做真实链路验证
+# （daemon 重启 / stop / restart / stale lock / service 看护）。
+# ═══════════════════════════════════════════════════════════════════════════
+lifecycle_startup_registry() {   # <base> <config> → 0=快照就绪 / 1=无有效快照 / 2=参数错
+    base=$1; config=$2
+    [ -n "$base" ] && [ -n "$config" ] || {
+        lifecycle_log "ERROR startup_registry: base/config required"; return 2; }
+    if [ -n "$(registry_current_snapshot_id 2>/dev/null)" ]; then
+        return 0
+    fi
+    if [ -f "$config" ]; then
+        registry_init "$base" "$config" >/dev/null 2>&1
+    else
+        registry_attach "$base" >/dev/null 2>&1
+    fi
+    [ -n "$(registry_current_snapshot_id 2>/dev/null)" ] && return 0 || return 1
+}
+
+lifecycle_startup_recover() {   # <tasks_dir> → 0=完成（幂等；单目录错误不中止）
+    tasks=$1
+    [ -d "$tasks" ] || { lifecycle_log "INFO startup_recover: no tasks dir $tasks"; return 0; }
+    runtime_scan_stale "$tasks" >/dev/null 2>&1
+    state_rehydrate_residual "$tasks" >/dev/null 2>&1
+    return 0
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -1746,7 +1789,8 @@ runtime_lib_selfcheck() {
               shadow_tick runtime_map_lookup trigger_decide action_run \
               state_log_event state_health_allowed state_sync_all \
               state_rehydrate_residual registry_attach task_cli_attach \
-              task_cli_resolve_id task_cli_status_id; do
+              task_cli_resolve_id task_cli_status_id runtime_scan_stale \
+              lifecycle_startup_registry lifecycle_startup_recover; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
