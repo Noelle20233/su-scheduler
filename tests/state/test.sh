@@ -44,7 +44,7 @@ trap 'rm -rf "$T"' EXIT
 n=$(grep -cE '^state_(log_event|health_allowed|sync_one|sync_all|rehydrate_residual)' "$RTLIB")
 [ "$n" -eq 5 ] && ok "P2-07 entry: 5 §12 functions each defined exactly once" || bad "P2-07 entry: §12 defs count=$n (expect 5)"
 n=$(grep -c 'state_log_event "\$run_dir" "\$id" spawn RUNNING' "$RTLIB")
-[ "$n" -eq 1 ] && ok "P2-07 entry: action_run spawn anchor (state.txt=RUNNING + events.log) wired once" || bad "P2-07 entry: spawn anchor count=$n"
+[ "$n" -ge 1 ] && ok "P2-07 entry: action_run spawn anchor wired (command + app paths, P2-10)" || bad "P2-07 entry: spawn anchor count=$n"
 
 # ── 2) 双写：新源与旧兼容工件并存（sync 后旧工件逐字节不变）─────────────────
 D="$T/dual/run_t100_0000"

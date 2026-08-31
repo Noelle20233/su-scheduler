@@ -38,8 +38,8 @@ n=$(grep -cE '^action_run\(\)' "$RTLIB")
 [ "$n" -eq 1 ] && ok "P2-06 entry: action_run defined exactly once (single formal action entry)" || bad "P2-06 entry: action_run count=$n (expect 1)"
 n=$(grep -cE 'provider_dispatch action command (start|prepare)' "$RTLIB")
 [ "$n" -eq 3 ] && ok "P2-06 entry: provider_dispatch action command called exactly 3x (prepare×1 + start×2)" || bad "P2-06 entry: dispatch-action count=$n (expect 3)"
-n=$(grep -cE 'provider_register action ' "$RTLIB")
-[ "$n" -eq 1 ] && ok "P2-06 entry: single action provider registered (command)" || bad "P2-06 entry: action registrations=$n"
+n=$(grep -cE '^provider_register action ' "$RTLIB")
+[ "$n" -eq 2 ] && ok "P2-06 entry: action providers = command + app (app added by P2-10)" || bad "P2-06 entry: action registrations=$n (expect 2: command + app)"
 
 # ── 2) Provider 委托既有 execute_task（daemon 上下文：同 shell 注入）────────
 TASKS_DIR="$T/tasks"
@@ -141,8 +141,8 @@ mirror_wait "$mdir"
 # ── 4) 不建立第二套命令执行器 ───────────────────────────────────────────────
 code=$(grep -vE '^[ \t]*#' "$RTLIB")
 printf '%s\n' "$code" | grep -q 'type execute_task >/dev/null 2>&1' && ok "P2-06 no-second-executor: command start contains delegation branch (type execute_task)" || bad "P2-06 no-second-executor: delegation branch missing"
-n=$(printf '%s\n' "$code" | grep -cE '^tpr_action_exec_[a-zA-Z_]+\(\)')
-[ "$n" -eq 4 ] && ok "P2-06 no-second-executor: mirror exec helpers = §3 existing 4 (finalize/smart/termux/interactive), no new engine" || bad "P2-06 no-second-executor: helper count=$n (expect 4)"
+n=$(printf '%s\n' "$code" | grep -cE '^tpr_action_exec_(finalize|smart|termux|interactive)\(\)')
+[ "$n" -eq 4 ] && ok "P2-06 no-second-executor: command mirror exec helpers = §3 existing 4 (finalize/smart/termux/interactive); app exec (P2-10) is an am-argv template, not a shell command engine" || bad "P2-06 no-second-executor: helper count=$n (expect 4)"
 
 # ── 5) 接线：daemon 4 处执行点经 action_run（RUNTIME_LOADED 门控）──────────
 n=$(grep -c 'action_run' "$DAEMON")

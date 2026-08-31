@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.7.0"
+RUNTIME_LIB_VERSION="1.8.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -648,6 +648,7 @@ provider_register trigger boot     tpr_trigger_boot
 provider_register trigger time     tpr_trigger_time
 provider_register trigger advanced tpr_trigger_advanced
 provider_register action command   tpr_action_command
+provider_register action app       tpr_action_app
 provider_register health builtin   tpr_health_builtin
 provider_register recovery builtin tpr_recovery_builtin
 
@@ -1526,6 +1527,20 @@ action_run() {   # <id> <cmd> [termux] [interactive] [notify_start] [notify_end]
     mode="system"
     [ "$termux" = "1" ] && mode="termux"
     [ "$interactive" = "1" ] && mode="interactive"
+    # P2-10：结构化 App Action（app:op:target[:extras]）——参数全校验后经 app
+    # Provider 启动（固定 am 模板 + 校验片段，绝不经 shell 拼接任意 Root Shell）；
+    # 本分支先于 execute_task 委托：daemon 上下文中 app 任务也不得落入 shell 执行。
+    if [ "${cmd#app:}" != "$cmd" ]; then
+        run_dir=$(provider_dispatch action app prepare "$id" "$cmd") || {
+            action_log "ERROR action_run: app prepare rejected (id=$id)"
+            return 1
+        }
+        provider_dispatch action app start "$id" "$cmd" > "$run_dir/pid.txt" 2>/dev/null || return 1
+        pid=$(cat "$run_dir/pid.txt" 2>/dev/null)
+        state_log_event "$run_dir" "$id" spawn RUNNING "$pid" "" "app action via provider" >/dev/null 2>&1
+        echo "id=$id|mode=app|pid=$pid|dir=$run_dir"
+        return 0
+    fi
     run_dir=""
     if type execute_task >/dev/null 2>&1; then
         # daemon 上下文：经 provider 分发；command Provider start 内部委托
@@ -1782,6 +1797,161 @@ lifecycle_startup_recover() {   # <tasks_dir> → 0=完成（幂等；单目录�
     return 0
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §15 App Action Provider（P2-10）
+# ═══════════════════════════════════════════════════════════════════════════
+# 结构化 App Action（P1-04 契约预留；Shizuku/GKD 类应用可经结构化 Task 启动）：
+#   spec = `app:<op>:<target>[:<extras>]`
+#     op     ∈ package | activity | broadcast | service
+#     target ：
+#       package   包名（com.example.app）
+#       activity/service 组件（com.example/.Main 或 com.example/.a.b.C；
+#                         允许包内相对类；含 `$` 的内部类组件暂不支持——安全集
+#                         拒绝 `$`，属后续扩展点）
+#       broadcast 意图动作（com.example.ACTION_GO / android.intent.action.X）
+#     extras （仅 broadcast）可选：k1=v1,k2=v2（字符串 extra，--es 透传）
+# **安全门（所有参数校验，不允许 Web/CLI 拼接任意 Root Shell）**：
+#   1) 全局安全字符集门：spec 仅允许 `[A-Za-z0-9._:/=+%-]`（无空格、无引号、
+#      无反引号/$、无 ;|&<>(){} 等任何 shell 元字符）——case 负向类一票否决；
+#   2) 逐操作结构校验：包名/组件/意图动作的正则白名单；
+#   3) 执行构建 = **固定 am 模板 + 已校验片段**（直接 argv 调用 am，不经
+#      sh -c / eval；校验失败 → 拒启、零执行、写 FAILED 工件）。
+# 能力（沿 action 契约）：validate / prepare / start / status / stop / restart；
+# 注册 `provider_register action app tpr_action_app`（核心引擎零改动——
+# provider_dispatch 只认 kind+cap）。工件语义与 §3 command 一致：
+# command.txt(spec)/start_time/status RUNNING → am 执行 → output.log/
+# exit_code.txt/end_time/SUCCESS|FAILED。
+# ═══════════════════════════════════════════════════════════════════════════
+tpr_action_app_log() {
+    [ "${TPR_LOG:-1}" = "1" ] && echo "[app-action] $1" >&2
+}
+
+# 解析 + 全校验：置 op/target/extras（全局；POSIX sh 无局部变量）；非法 → 1。
+tpr_action_app_parse() {   # <spec>
+    spec=$1
+    # 全局安全门（负向字符类）：任何不在安全集内的字符一票否决（含空格与全部
+    # shell 元字符——Web/CLI 无法经 spec 注入任意 Root Shell 命令）。
+    # 安全集 = 字母数字 + . _ : / = + - % ,（`$`/`!`/`@` 等一律拒绝——内部类
+    # 组件含 `$` 的 spec 暂不支持，属后续扩展点）。
+    case "$spec" in
+        *[!A-Za-z0-9._:/\=%+-,]*) return 1 ;;
+    esac
+    op=$(echo "$spec" | cut -d: -f2)
+    target=$(echo "$spec" | cut -d: -f3)
+    extras=$(echo "$spec" | cut -d: -f4-)
+    [ -n "$op" ] && [ -n "$target" ] || return 1
+    case "$op" in
+        package)
+            echo "$target" | grep -E '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+$' >/dev/null || return 1
+            [ -z "$extras" ] || return 1
+            ;;
+        activity|service)
+            echo "$target" | grep -E '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)+(/\.?[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*)?$' >/dev/null || return 1
+            [ -z "$extras" ] || return 1
+            ;;
+        broadcast)
+            echo "$target" | grep -E '^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z][A-Za-z0-9_]*)*$' >/dev/null || return 1
+            if [ -n "$extras" ]; then
+                oldifs=$IFS; IFS=','
+                for pair in $extras; do
+                    [ -n "$pair" ] || continue
+                    k=${pair%%=*}; v=${pair#*=}
+                    [ -n "$k" ] && [ -n "$v" ] || { IFS=$oldifs; return 1; }
+                    echo "$k" | grep -E '^[A-Za-z][A-Za-z0-9_]*$' >/dev/null || { IFS=$oldifs; return 1; }
+                    echo "$v" | grep -E '^[A-Za-z0-9._:/%+\-]*$' >/dev/null || { IFS=$oldifs; return 1; }
+                done
+                IFS=$oldifs
+            fi
+            ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+
+tpr_action_app_validate() {   # <spec> → 0=合法 / 1=非法（安全门）
+    tpr_action_app_parse "$1" >/dev/null 2>&1
+}
+
+tpr_action_app_dir() { echo "${TPR_ACTION_DIR:-/tmp/su-scheduler-actions}/$1"; }
+
+tpr_action_app_prepare() {   # <id> <spec> → echo dir；非法 spec 拒启（不建目录）
+    id=$1; spec=$2
+    tpr_action_app_parse "$spec" >/dev/null 2>&1 || {
+        tpr_action_app_log "ERROR prepare: invalid app spec rejected (id=$id): $spec"
+        return 1
+    }
+    dir=$(tpr_action_app_dir "$id")
+    mkdir -p "$dir" || return 2
+    echo "$spec" > "$dir/command.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$dir/start_time.txt"
+    echo "RUNNING" > "$dir/status.txt"
+    echo "$dir"
+}
+
+tpr_action_app_start() {   # <id> <spec> → 后台执行（固定 am 模板）+ echo pid
+    id=$1; spec=$2
+    tpr_action_app_parse "$spec" >/dev/null 2>&1 || {
+        tpr_action_app_log "ERROR start: invalid app spec rejected — no shell execution (id=$id): $spec"
+        return 1
+    }
+    dir=$(tpr_action_app_dir "$id")
+    (
+        tpr_action_exec_app "$id" "$dir" "$spec"
+    ) &
+    echo $!
+}
+
+tpr_action_app_status() {   # <id> <pid>
+    pid=$2
+    [ -n "$pid" ] && [ -d "/proc/$pid" ] && return 0 || return 1
+}
+
+tpr_action_app_stop() { kill "$2" 2>/dev/null; }
+
+tpr_action_app_restart() {   # <id> <spec> <old_pid>
+    tpr_action_app_stop "$1" "$3"
+    sleep 1
+    tpr_action_app_start "$1" "$2"
+}
+
+tpr_action_exec_app() {   # <id> <dir> <spec>（spec 已全校验；构建固定 am 模板）
+    id=$1; dir=$2; spec=$3
+    tpr_action_app_parse "$spec" >/dev/null 2>&1 || {
+        echo "ERROR: invalid app action spec: $spec" > "$dir/output.log" 2>/dev/null
+        echo "1" > "$dir/exit_code.txt" 2>/dev/null
+        echo "FAILED" > "$dir/status.txt" 2>/dev/null
+        return 1
+    }
+    case "$op" in
+        package)
+            am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p "$target" ;;
+        activity)
+            am start -n "$target" ;;
+        service)
+            am startservice -n "$target" ;;
+        broadcast)
+            set -- am broadcast -a "$target"
+            if [ -n "$extras" ]; then
+                oldifs=$IFS; IFS=','
+                for pair in $extras; do
+                    [ -n "$pair" ] || continue
+                    k=${pair%%=*}; v=${pair#*=}
+                    set -- "$@" --es "$k" "$v"
+                done
+                IFS=$oldifs
+            fi
+            "$@" ;;
+    esac > "$dir/output.log" 2>&1
+    rc=$?
+    echo "$rc" > "$dir/exit_code.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$dir/end_time.txt"
+    if [ "$rc" -eq 0 ]; then
+        echo "SUCCESS" > "$dir/status.txt"
+    else
+        echo "FAILED" > "$dir/status.txt"
+    fi
+    return "$rc"
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -1790,7 +1960,8 @@ runtime_lib_selfcheck() {
               state_log_event state_health_allowed state_sync_all \
               state_rehydrate_residual registry_attach task_cli_attach \
               task_cli_resolve_id task_cli_status_id runtime_scan_stale \
-              lifecycle_startup_registry lifecycle_startup_recover; do
+              lifecycle_startup_registry lifecycle_startup_recover \
+              tpr_action_app_validate tpr_action_app_start; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
