@@ -12,6 +12,10 @@
 > 状态机（P1-03）——provider 只返回结果/退出码，状态转换由引擎按桥接表触发
 > （§7）。
 > **日期**：2026-08-30
+> **P1-13 注记（2026-09-01）**：契约已兑现（`tests/providers`，136 断言）；P1-07/08
+> 已接线 `trigger>advanced` 与 `action>command` 全模式（CommandActionProvider）。
+> **P1 未实现（不得宣称完成）**：App/Process/Service Action、Health/Recovery 真实
+> 探测（builtin stub 仅占位）——见 §12 非目标与 `docs/P1-HANDOVER.md` §5。
 
 ---
 

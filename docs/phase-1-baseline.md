@@ -4,6 +4,10 @@
 > **基线版本**：v1.6.8（Git `main` @ `3fe7631`，working tree 含本任务新增文件）
 > **文档性质**：固化当前 Su Scheduler 的**真实**行为，作为后续一切回归的标准。
 > **日期**：2026-08-30
+> **P1-13 注记（2026-09-01）**：本基线为 P1 全部回归的兼容基准（P1-01）；P1-02~
+> P1-12 的实现层未改动本基线任何旧行为（生产文件零改动，`docs/P1-HANDOVER.md`
+> §4 核对）。AGENTS §9 与本基线所述 Watchdog（增强）、WebUI、Dependency 在 P1
+> **同样未实现**（仅接口预留，`docs/P1-HANDOVER.md` §5），不得宣称为已完成。
 > **验证方法**：本基线中的解析 golden 全部由 **bash 实际执行生产脚本内真实函数**推导
 > （`tests/fixtures/legacy/tools/derive-goldens.sh`），非手写；设备端行为标注为
 > `L3待验`（当前环境无 adb 设备，见 §10）。

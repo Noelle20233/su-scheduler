@@ -1323,3 +1323,41 @@ su-scheduler task-output <task_id>
 | 10 | October |
 | 11 | November |
 | 12 | December |
+
+---
+
+## 🔗 兼容性与 P1 阶段状态（P1-13 追加）
+
+> 本章节为 P1 阶段（P1-01..P1-13）**追加**，不改动本文件既有任何章节。
+> 详细交接资料见 `docs/P1-HANDOVER.md`；兼容层架构见
+> `docs/architecture/compatibility-layer.md`。
+
+### 兼容性承诺
+
+- **配置格式不变**：`config.txt` 行格式 `<trigger> <command>[;] : <modifiers>`
+  与全部触发格式（boot / HHMM / HH:MM / weekly / nweekly / monthly /
+  nmonthly / yearly）、modifiers（--notify / --delete / --interactive /
+  --termux / --run-once-now / --msg）、heredoc 语义保持 v1.6.8 基线（基线
+  见 `docs/phase-1-baseline.md`）。
+- **旧解析与执行路径保留**：daemon、CLI、`service.sh`、`customize.sh`、
+  `build.sh` 与既有看护循环在 P1 期间零改动。
+- **P1 新增全部在测试域与文档**：内部 Task 模型（Schema v2）、状态机、
+  Provider 契约、Legacy Adapter、Task Registry、Trigger 决策、Action 执行、
+  运行时状态/事件、生命周期、只读 `task list` / `task status`——均不触碰
+  生产文件、不写回 `config.txt`。
+- **新旧状态不互覆盖**：旧工件（`status.txt`/`pid.txt`/`output.log`/
+  `exit_code.txt`/`end_time.txt`/`start_time.txt`）保持原义；新
+  `state.txt`/`events.log` 为**新增文件**，不与旧件同名。
+
+### P1 状态
+
+- **已实现**：P1-01..P1-12（基线、Task Schema v2、状态机、Provider 契约、
+  Legacy Adapter、Task Registry、Trigger 决策、Action 执行、运行时状态/事件、
+  生命周期、只读 Task CLI、P1 回归与设备冒烟脚本）。回归入口：
+  `bash tests/run_p1.sh`（11 套全绿，无 `[FAIL]`）。
+- **未实现（下一阶段，不视为已完成）**：**Watchdog 增强**、**WebUI**、
+  **Dependency**（依赖/条件触发）、App/Process/Service Action、
+  Health/Recovery 真实探测、daemon/CLI 生产接线——接口预留见
+  `docs/P1-HANDOVER.md` §5，任何文档不得把它们表述为已完成。
+- **升级与回滚**：P1 零生产改动，升级 = 合入 P1 提交（无迁移）；回滚 =
+  删除 P1 层与文档（生产零影响）。命令级手册见 `docs/P1-UPGRADE-ROLLBACK.md`。

@@ -8,6 +8,11 @@
 > 模型是"投影"：从旧配置行推导出 Task 对象，供后续 P1 任务（调度/依赖/健康/
 > WebUI 等）消费。
 > **日期**：2026-08-30
+> **P1-13 注记（2026-09-01）**：本文档为 Task Schema v2 规范来源。P1 阶段已由
+> Legacy Adapter（P1-05）与 Task Registry（P1-06）兑现「任意旧配置行 → 合法内部
+> Task」；运行时字段（runtime.*）由 P1-09 在运行目录落地（`state.txt`/`events.log`）；
+> P1-11 只读 CLI 可观察快照。**P1 未实现**：完整 JSON/YAML 用户配置解析（P1-02
+> 明确不做）；生产接线（Registry 供 daemon 消费）——见 `docs/P1-HANDOVER.md` §5。
 
 ---
 

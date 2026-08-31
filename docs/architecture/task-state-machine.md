@@ -12,6 +12,10 @@
 > UNHEALTHY/RECOVERING、重试退避）由后续任务（依赖/条件、Supervisor、重试）接线；
 > 本次只定义与预留，**不接线**（验收条件：Supervisor 未实现时这些状态也已预留）。
 > **日期**：2026-08-30
+> **P1-13 注记（2026-09-01）**：状态机已实现并被 P1-09/10/11 复用（daemon 重启
+> 再水合、僵尸恢复、CLI 状态列）。**P1 未接线（不得宣称完成）**：HEALTHY/
+> UNHEALTHY/RECOVERING 与 WAITING 门控为 reserved 边（Supervisor / Dependency
+> 未实现，见 §非目标与 `docs/P1-HANDOVER.md` §5）。
 
 ---
 
