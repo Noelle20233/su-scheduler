@@ -9,7 +9,8 @@ for suite in \
     "tests/legacy-adapter/test.sh" \
     "tests/task-registry/test.sh" \
     "tests/scheduling/trigger-decision/test.sh" \
-    "tests/execution/action-run/test.sh"; do
+    "tests/execution/action-run/test.sh" \
+    "tests/runtime/test.sh"; do
     echo "== $suite =="
     out=$(bash "$suite" 2>&1)
     rc=$?
