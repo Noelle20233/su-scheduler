@@ -75,6 +75,7 @@ else
         "tests/task-cli/test.sh" \
         "tests/runtime-lib/test.sh" \
         "tests/shadow/test.sh" \
+        "tests/idmap/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

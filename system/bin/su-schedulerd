@@ -67,8 +67,10 @@ else
 fi
 
 # ⚙️ Registry Shadow Mode 启动旁路（P2-03）：建首快照 + 基线比对记录
+# 🗺️ Canonical↔Legacy Run ID 映射（P2-04）：建映射供新 ID 查询；**不碰旧运行目录**
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
     shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
+    runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
 fi
 
 # 📝 Function to log events with pretty timestamps and colors
@@ -644,8 +646,10 @@ while true; do
         fi
 
         # ⚙️ Registry Shadow Mode tick（P2-03，旁路比对；不改 legacy 执行路径）
+        # 🗺️ ID 映射随快照刷新（P2-04，幂等；不重命名旧运行目录）
         if [ "$RUNTIME_LOADED" -eq 1 ]; then
             shadow_tick "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
+            runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
         fi
 
         task_counter=0

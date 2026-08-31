@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.1.0"
+RUNTIME_LIB_VERSION="1.2.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1289,14 +1289,107 @@ shadow_init() {
     [ "$agree" = "Y" ] && return 0 || return 1
 }
 
+# §9 Canonical↔Legacy Run ID 映射（P2-04）
+# ═══════════════════════════════════════════════════════════════════════════
+# 目标：新版 Canonical Task ID（t<line>_<trigger>，registry 快照）与旧运行
+# 目录 ID（time_<HHMM>_<n>_<epoch> / advanced_<n>_<epoch> / immediate_<n>_<epoch>
+# / startup_<n>_<epoch>）之间建立**双向映射**；**不重命名旧运行目录、不改旧
+# CLI 命令**（C2/C4：task-info/task-output/task-kill 继续按旧 ID 原路径操作，
+# 映射层只读旁路）。匹配键：主=命令文本（command.txt == action.command）；
+# 回退=触发器（startup→boot / time_<HHMM> / advanced→adv 家族 / immediate→
+# 命令匹配）。映射文件：<base>/runtime/idmap，行 `task=<canonical>|run=<run_id>`，
+# sort -u + tmp+mv 原子写（幂等：重复 refresh 无重复行）。
+# ═══════════════════════════════════════════════════════════════════════════
+runtime_idmap_file() { echo "$1/runtime/idmap"; }
+
+runtime_map_refresh() {   # <base> <tasks_dir> → 0 成功 / 2 目录不可建
+    base=$1; tasks=$2
+    mkdir -p "$base/runtime" 2>/dev/null || return 2
+    f=$(runtime_idmap_file "$base")
+    : > "$f.tmp"
+    if [ -d "$tasks" ]; then
+        for p in "$tasks"/*; do
+            [ -d "$p" ] || continue
+            [ -f "$p/command.txt" ] || continue
+            run=$(basename "$p")
+            cmd=$(cat "$p/command.txt" 2>/dev/null)
+            canon=""
+            # 主键：命令文本匹配 registry task action.command
+            for id in $(registry_task_ids); do
+                tf=$(registry_task_file "$id") || continue
+                ac=$(grep '^action.command=' "$tf" | head -1 | cut -d= -f2-)
+                [ "$ac" = "$cmd" ] && canon=$id && break
+            done
+            # 回退键：触发器（run 前缀）
+            if [ -z "$canon" ]; then
+                case "$run" in
+                    startup_*)
+                        for id in $(registry_task_ids); do
+                            tf=$(registry_task_file "$id") || continue
+                            tr=$(grep '^trigger=' "$tf" | head -1 | cut -d= -f2)
+                            [ "$tr" = "boot" ] && canon=$id && break
+                        done ;;
+                    time_*)
+                        hhmm=$(echo "$run" | cut -d_ -f2)
+                        for id in $(registry_task_ids); do
+                            tf=$(registry_task_file "$id") || continue
+                            tr=$(echo "$(grep '^trigger=' "$tf" | head -1 | cut -d= -f2)" | sed 's/://g')
+                            [ "$tr" = "$hhmm" ] && canon=$id && break
+                        done ;;
+                    advanced_*)
+                        for id in $(registry_task_ids); do
+                            tf=$(registry_task_file "$id") || continue
+                            tr=$(grep '^trigger=' "$tf" | head -1 | cut -d= -f2)
+                            case "$tr" in
+                                weekly:*|nweekly:*|monthly:*|nmonthly:*|yearly:*) canon=$id; break ;;
+                            esac
+                        done ;;
+                esac
+            fi
+            [ -n "$canon" ] && echo "task=$canon|run=$run" >> "$f.tmp"
+        done
+    fi
+    sort -u "$f.tmp" > "$f.tmp.s" && mv "$f.tmp.s" "$f"
+    rm -f "$f.tmp" 2>/dev/null
+    return 0
+}
+
+runtime_map_task_runs() {   # <base> <canonical_id> → 各旧 run id（每行一个）
+    f=$(runtime_idmap_file "$1")
+    [ -f "$f" ] || return 1
+    grep "^task=$2|" "$f" | sed 's/^task=[^|]*|run=//'
+}
+
+runtime_map_run_task() {    # <base> <run_id> → canonical id（无则空）
+    f=$(runtime_idmap_file "$1")
+    [ -f "$f" ] || return 1
+    grep "|run=$2$" "$f" | head -1 | cut -d= -f2 | cut -d'|' -f1
+}
+
+runtime_map_lookup() {      # <base> <tasks_dir> <id>：双向自动识别
+    base=$1; tasks=$2; id=$3
+    if [ -n "$(runtime_map_task_runs "$base" "$id")" ]; then
+        echo "task=$id"
+        runtime_map_task_runs "$base" "$id" | sed 's/^/run=/' 2>/dev/null
+        return 0
+    fi
+    if [ -d "$tasks/$id" ]; then
+        canon=$(runtime_map_run_task "$base" "$id")
+        [ -n "$canon" ] && echo "task=$canon" || echo "task="
+        echo "run=$id"
+        return 0
+    fi
+    return 1
+}
+
 # ───────────────────────────────────────────────────────────────────────────
-# Self-check（加载方引用）：全部 §1–§8 代表函数就绪 + 版本号存在 → 0。
+# Self-check（加载方引用）：全部 §1–§9 代表函数就绪 + 版本号存在 → 0。
 # ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
               runtime_log_event registry_init lifecycle_start task_cli_list \
-              shadow_tick; do
+              shadow_tick runtime_map_lookup; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
