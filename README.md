@@ -1383,6 +1383,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L1 | 静态语法（`sh -n` / `bash -n`，LF 归一，CRLF 检出亦通过） | `tests/lint/syntax.sh` |
 | L2 | legacy 解析 golden 锁定（真实函数复现 + 逐字节比对） | `tests/legacy/golden.sh` |
 | L2 | `--delete` 删除管线语义锁定（Q13：单激活行 `grep -v && mv` 短路） | `tests/legacy/delete-pipeline.sh` |
+| L2 | 生产 Runtime 库边界（P2-02：daemon/CLI 共用原语、路径隔离、fallback） | `tests/runtime-lib/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

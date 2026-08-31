@@ -15,6 +15,7 @@
 #   L2  tests/runtime/test.sh           P1 运行时状态/事件（45 断言）
 #   L2  tests/lifecycle/test.sh         P1 生命周期（56 断言）
 #   L2  tests/task-cli/test.sh          P1 只读 CLI（39 断言）
+#   L2  tests/runtime-lib/test.sh       P2-02 生产 Runtime 库边界（21 断言）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -72,6 +73,7 @@ else
         "tests/runtime/test.sh" \
         "tests/lifecycle/test.sh" \
         "tests/task-cli/test.sh" \
+        "tests/runtime-lib/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

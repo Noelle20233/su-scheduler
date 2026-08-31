@@ -40,6 +40,7 @@ for f in \
     system/bin/su-scheduler \
     system/bin/su-schedulerd \
     system/bin/su-scheduler-termux \
+    system/bin/su-scheduler-runtime \
     service.sh \
     customize.sh; do
     [ -f "$f" ] || { bad "missing script: $f"; continue; }
