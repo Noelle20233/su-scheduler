@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.9.0"
+RUNTIME_LIB_VERSION="1.10.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2079,6 +2079,142 @@ health_check() {
     provider_dispatch health "$kind" check "$spec"
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §17 Supervisor Core（P2-12）
+# ═══════════════════════════════════════════════════════════════════════════
+# 驱动受监督任务的完整生命周期（TSM 允许边 + §16 健康检查）：
+#   RUNNING → HEALTHY（首检通过）
+#   HEALTHY → UNHEALTHY（探针失败）
+#   UNHEALTHY → RECOVERING（进入恢复）
+#   RECOVERING → STARTING（恢复=重跑任务 action 成功）→ spawn → RUNNING（循环）
+#   RECOVERING → FAILED（重试超过策略 retry.max）
+# **统一事件循环**：`supervisor_tick <tasks_dir> <base>` 为唯一入口——每 tick
+# 对每个受监督任务**至多一步**（一次健康检查 + 一次状态迁移）；**不创建任何
+# 每任务常驻线程/循环**（无 while、无后台 `&` 派生；与 shadow_tick/state_sync_all
+# 同构，由 daemon 唯一主循环每轮调用）。
+# 任务健康配置（task v2 字段，缺省不监督）：health.type ∈ process|port、
+# health.target（P2-11 spec 目标）、retry.max（恢复重试次数，0=不重试直接
+# FAILED）、retry.interval（秒，重试节奏）。运行目录内监督工件：
+# recovery.count / recovery.next（epoch 秒，原子 tmp+mv 语义的幂等文件）。
+# 事件：state_log_event event=supervisor（∈ RT_EVENTS/TSM_CAUSES）驱动迁移；
+# 探针结果 UNKNOWN → 不迁移（保持现态）。恢复重跑经 action_run（统一 Action
+# 入口，含 app 分支）——重跑成功 → STARTING（spawn 锚点随即 → RUNNING）。
+# ═══════════════════════════════════════════════════════════════════════════
+supervisor_log() {
+    [ "${SUPERVISOR_LOG:-1}" = "1" ] && echo "[supervisor] $1" >&2
+}
+
+supervisor_health_spec() {   # <task_file> → echo health spec（process:<t>/port:<t>；无配置 → 空）
+    tf=$1
+    htype=$(grep '^health.type=' "$tf" | head -1 | cut -d= -f2-)
+    htarget=$(grep '^health.target=' "$tf" | head -1 | cut -d= -f2-)
+    case "$htype" in
+        process|port)
+            [ -n "$htarget" ] && echo "$htype:$htarget"
+            ;;
+    esac
+}
+
+supervisor_policy() {   # <task_file> → 置 retry_max / retry_interval（缺省 0 / 60）
+    tf=$1
+    retry_max=$(grep '^retry.max=' "$tf" | head -1 | cut -d= -f2-)
+    retry_interval=$(grep '^retry.interval=' "$tf" | head -1 | cut -d= -f2-)
+    [ -n "$retry_max" ] || retry_max=0
+    [ -n "$retry_interval" ] || retry_interval=60
+}
+
+supervisor_task_file() {   # <base> <tasks_dir> <id> → 注册表任务文件（旧运行 ID 经 idmap 解析）
+    base=$1; tasks=$2; qid=$3
+    f=$(registry_task_file "$qid" 2>/dev/null) && { echo "$f"; return 0; }
+    runtime_map_refresh "$base" "$tasks" >/dev/null 2>&1
+    canon=$(runtime_map_run_task "$base" "$qid")
+    [ -n "$canon" ] || return 1
+    f=$(registry_task_file "$canon" 2>/dev/null) || return 1
+    echo "$f"
+    return 0
+}
+
+# 单任务单步（每 tick 至多一步；无循环、无后台派生）：
+# <run_dir> <task_file> → 0=无动作/保持 1=发生迁移 2=FAILED（策略超限）3=无健康配置/目录缺失
+supervisor_step() {
+    rd=$1; tf=$2
+    [ -d "$rd" ] || return 3
+    spec=$(supervisor_health_spec "$tf")
+    [ -n "$spec" ] || return 3
+    id=$(basename "$rd")
+    cur=$(runtime_current_state "$rd")
+    kind=${spec%%:*}
+    target=${spec#*:}
+    case "$cur" in
+        RUNNING)
+            # 首检通过 → HEALTHY（TSM: RUNNING>HEALTHY）；失败/UNKNOWN → 保持 RUNNING
+            if health_check "$kind" "$target" >/dev/null 2>&1; then
+                state_log_event "$rd" "$id" supervisor HEALTHY "" "" "probe ok" >/dev/null 2>&1 && return 1
+            fi
+            return 0 ;;
+        HEALTHY)
+            st=$(health_check "$kind" "$target" 2>/dev/null | cut -d'|' -f1)
+            if [ "$st" = "UNHEALTHY" ]; then
+                state_log_event "$rd" "$id" supervisor UNHEALTHY "" "" "probe unhealthy" >/dev/null 2>&1 && return 1
+            fi
+            return 0 ;;
+        UNHEALTHY)
+            state_log_event "$rd" "$id" supervisor RECOVERING "" "" "recovery started" >/dev/null 2>&1 && return 1
+            return 0 ;;
+        RECOVERING)
+            supervisor_policy "$tf"
+            # 节奏：retry.interval 秒内不重试（recovery.next = epoch 秒）
+            now=$(date +%s)
+            nxt=$(cat "$rd/recovery.next" 2>/dev/null)
+            if [ -n "$nxt" ] && [ "$now" -lt "$nxt" ]; then
+                return 0
+            fi
+            cnt=$(cat "$rd/recovery.count" 2>/dev/null)
+            [ -n "$cnt" ] || cnt=0
+            if [ "$cnt" -ge "$retry_max" ]; then
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "retry-exhausted (max=$retry_max)" >/dev/null 2>&1 && return 2
+            fi
+            act=$(grep '^action.command=' "$tf" | head -1 | cut -d= -f2-)
+            if [ -z "$act" ]; then
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "no-action-for-recovery" >/dev/null 2>&1 && return 2
+            fi
+            cnt=$((cnt + 1))
+            echo "$cnt" > "$rd/recovery.count"
+            echo $((now + retry_interval)) > "$rd/recovery.next"
+            rm -f "$rd/exit_code.txt" 2>/dev/null
+            # 恢复=重跑任务 action：**先** RECOVERING→STARTING（唯一合法边），再由
+            # action_run 的 spawn 锚点 STARTING→RUNNING；重跑失败 → STARTING>FAILED
+            # （不能回 RECOVERING——TSM 无此边）。
+            if state_log_event "$rd" "$id" supervisor STARTING "" "" "recovery relaunching (attempt $cnt)" >/dev/null 2>&1 \
+               && action_run "$id" "$act" >/dev/null 2>&1; then
+                rm -f "$rd/recovery.count" "$rd/recovery.next" 2>/dev/null
+                return 1
+            fi
+            state_log_event "$rd" "$id" supervisor FAILED "" "" "recovery-relaunch-failed" >/dev/null 2>&1
+            return 2 ;;
+    esac
+    return 0
+}
+
+# 统一事件循环（唯一入口）：<tasks_dir> <base> → 每 tick 每任务至多一步；0=完成
+supervisor_tick() {
+    tasks=$1; base=$2
+    [ -d "$tasks" ] || { supervisor_log "INFO tick: no tasks dir $tasks"; return 0; }
+    n=0; f=0
+    for rd in "$tasks"/*; do
+        [ -d "$rd" ] || continue
+        id=$(basename "$rd")
+        tf=$(supervisor_task_file "$base" "$tasks" "$id") || continue
+        supervisor_step "$rd" "$tf" >/dev/null 2>&1
+        rc=$?
+        if [ "$rc" -eq 1 ] || [ "$rc" -eq 2 ]; then
+            n=$((n + 1))
+        fi
+        [ "$rc" -eq 2 ] && f=$((f + 1))
+    done
+    supervisor_log "INFO tick: transitions=$n failed=$f"
+    return 0
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -2089,7 +2225,8 @@ runtime_lib_selfcheck() {
               task_cli_resolve_id task_cli_status_id runtime_scan_stale \
               lifecycle_startup_registry lifecycle_startup_recover \
               tpr_action_app_validate tpr_action_app_start health_check \
-              tpr_health_process_check tpr_health_port_check; do
+              tpr_health_process_check tpr_health_port_check supervisor_step \
+              supervisor_tick supervisor_health_spec; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

@@ -1393,6 +1393,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | daemon 生命周期（P2-09：启动序列、最后有效快照回退、stale PID 恢复、stop/restart/stale lock 真实链路、单常驻循环、service 60s 看护原样） | `tests/lifecycle-prod/test.sh` |
 | L2 | App Action（P2-10：package/activity/broadcast/service 结构化 spec、全参数校验拒绝 shell 注入、固定 am 模板构建、mock am 逐 argv 断言） | `tests/app-action/test.sh` |
 | L2 | Process/Port Health（P2-11：Process Check / Port Check、统一三态 HEALTHY/UNHEALTHY/UNKNOWN + 原因 + 延迟 + 目标、真实监听验证、P2-07 健康门槛打开） | `tests/health/test.sh` |
+| L2 | Supervisor 核心（P2-12：RUNNING→HEALTHY→UNHEALTHY→RECOVERING→STARTING\|FAILED 完整生命周期、统一事件循环无每任务常驻循环、恢复策略 retry.max/interval、真实 nc 闭环） | `tests/supervisor/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

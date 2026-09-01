@@ -680,6 +680,10 @@ while true; do
             # → 终态双写（成功 → STOPPED，一次性任务不虚假 HEALTHY；失败 → FAILED）；
             # 已终态幂等跳过。非法/异常目录不中止本轮（单目录错误只置 rc）。
             state_sync_all "$TASKS_DIR" >/dev/null 2>&1
+            # ⚙️ Supervisor 统一事件循环（P2-12，RUNTIME_LOADED 门控旁路）：每轮对
+            # 每个受监督任务至多一步（RUNNING→HEALTHY→UNHEALTHY→RECOVERING→
+            # STARTING|FAILED）；无每任务常驻线程/循环（daemon 主循环唯一）。
+            supervisor_tick "$TASKS_DIR" "$DATA_DIR" >/dev/null 2>&1
         fi
 
         task_counter=0

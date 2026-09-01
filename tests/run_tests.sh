@@ -25,6 +25,7 @@
 #   L2  tests/lifecycle-prod/test.sh    P2-09 daemon 生命周期（启动序列/最后有效快照/stale PID/stop/restart/看护）
 #   L2  tests/app-action/test.sh        P2-10 App Action（package/activity/broadcast/service、全参数校验、am 安全构建）
 #   L2  tests/health/test.sh            P2-11 Process/Port Health（三态+原因+延迟+目标、真实监听验证、P2-07 门槛打开）
+#   L2  tests/supervisor/test.sh        P2-12 Supervisor 核心（完整生命周期、统一事件循环、恢复策略）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -92,6 +93,7 @@ else
         "tests/lifecycle-prod/test.sh" \
         "tests/app-action/test.sh" \
         "tests/health/test.sh" \
+        "tests/supervisor/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
