@@ -28,6 +28,8 @@
 #   L2  tests/supervisor/test.sh        P2-12 Supervisor 核心（完整生命周期、统一事件循环、恢复策略）
 #   L2  tests/recovery/test.sh          P2-13 Recovery/Retry/Cooldown（restart/start/stopstart/script、max_retry 钳制、cooldown）
 #   L2  tests/crashguard/test.sh        P2-14 Crash Loop 与资源保护（guard 降级/节流/优雅重置、日志/目录/快照上限、健康间隔、超时护栏、fake daemon 崩溃序列）
+#   L2  tests/p2-integration/test.sh    P2-15 综合回归（daemon kill/task kill/脚本 hang/应用崩溃/重启 端到端集成）
+#   L2  tests/p2-install/test.sh        P2-15 发布评审（KernelSU/Magisk/APatch 安装结构 + 发布契约）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -98,6 +100,8 @@ else
         "tests/supervisor/test.sh" \
         "tests/recovery/test.sh" \
         "tests/crashguard/test.sh" \
+        "tests/p2-integration/test.sh" \
+        "tests/p2-install/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
