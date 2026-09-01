@@ -35,6 +35,12 @@
 #   L2  tests/scheduler-prod/test.sh    P3-03 Registry 正式调度接管（双模式 legacy/managed、
 #       TriggerProvider→ActionProvider、同周期去重、配置变更不重复执行、损坏 KEPT、
 #       task.v2 快照移除监督兜底、旧 CLI 查询/终止、单任务错误隔离、审计日志、接线）
+#   L2  tests/ipc/test.sh               P3-04 本地 IPC 控制面（请求/响应文件通道、固定格式、
+#       base64 值、12 op 白名单、错误码可区分、写操作仅 managed、START/STOP/RESTART 经
+#       action_run、重复请求不重复启动、原子响应、接线）
+#   L2  tests/ipc/security.sh           P3-04 IPC 安全边界（fuzz/注入零副作用、Shell 元字符
+#       不进入执行路径、同 req_id 幂等、已运行不重复 START、单轮有界不阻塞、0700 权限、
+#       未授权写 permission_denied、daemon 停止 daemon_unavailable、超时 operation_timeout）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -109,6 +115,8 @@ else
         "tests/p2-install/test.sh" \
         "tests/config-v2/test.sh" \
         "tests/scheduler-prod/test.sh" \
+        "tests/ipc/test.sh" \
+        "tests/ipc/security.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

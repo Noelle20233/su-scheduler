@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.14.0"
+RUNTIME_LIB_VERSION="1.15.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -3097,6 +3097,482 @@ scheduler_boot() {   # <base> <config> <tasks_dir> → 0
     sched_audit "$base" "op=boot|mode=$(sched_source_mode "$base")|exec=$n"
     return 0
 }
+# ═══════════════════════════════════════════════════════════════════════════
+# §21 Local IPC Control Plane（P3-04）：WebUI ↔ daemon 受控通信边界
+# ═══════════════════════════════════════════════════════════════════════════
+# 目标：WebUI（浏览器侧）→ validated IPC → su-schedulerd → validated Task
+# operation → Root action。**禁止** WebUI JavaScript 直接执行 shell。
+# 传输：`$base/ipc/`（chmod 700，root-only）下的**请求文件 + 响应文件**通道。
+#   （不用 FIFO：POSIX sh 无便携非阻塞 FIFO 读取；文件通道满足「如果使用 FIFO
+#   必须」的全部等价属性——daemon 创建、0700 权限、固定请求格式、请求长度受限、
+#   命令白名单、每请求唯一 ID、响应文件原子写入；选择依据见 docs/P3-04.md。）
+#   布局：
+#     ipc/                chmod 700（仅 root 可写）
+#     ipc/requests/       <req_id>.req   客户端落盘（单行请求，tmp+mv 原子）
+#     ipc/responses/      <req_id>.resp  服务端原子写回（tmp+mv）
+#     ipc/daemon.pid      daemon 存活标记（客户端判 daemon_unavailable）
+# 请求行（≤4096 字节）：REQ_ID|OP|k1=b64&k2=b64
+#   - REQ_ID：^[A-Za-z0-9._-]{1,64}$（客户端生成，唯一）
+#   - OP：白名单（12 个，见 IPC_WHITELIST）
+#   - 参数：`&` 分隔 `key=base64value`；值一律 base64 ⇒ **请求行不含任何 Shell
+#     元字符**，服务端只解码为数据、绝不 eval。
+# 响应文件：首行 `REQ_ID|OP|RC|ERROR`，随后为载荷行。
+# RC/ERROR（可区分错误码）：
+#   0 ok | 1 invalid_request | 2 permission_denied | 3 task_not_found
+#   | 4 configuration_invalid | 5 operation_timeout | 6 daemon_unavailable
+# 安全保证：
+#   - 服务端从不把请求内容交给 shell 解释/执行（固定格式解析 + 白名单校验 +
+#     base64 解码为数据）；
+#   - START/STOP/RESTART 只接受任务 ID，命令取自**已校验任务文件**（Registry
+#     快照），WebUI 无法经请求注入任意命令；
+#   - 写操作（CREATE/UPDATE/DELETE/ENABLE/DISABLE）仅 **Managed 模式**（P3-02
+#     task-config 权威存储）；Legacy 返回 configuration_invalid（config.txt 不
+#     被 WebUI 触碰）；
+#   - 非法/超长/未知 OP/坏参数 ⇒ invalid_request 且**零副作用**（不启动、不写
+#     任务、不触发 Root action）；
+#   - 重复请求：同 req_id 响应已存在 ⇒ 幂等丢弃；START_TASK 任务已运行 ⇒ 不重复
+#     启动；
+#   - 客户端超时 ⇒ operation_timeout；daemon 停止 ⇒ daemon_unavailable。
+# 命名空间：内部全局一律 ipcv_ 前缀（防覆盖调用方全局，同 P3-03 教训）。
+# ═══════════════════════════════════════════════════════════════════════════
+ipc_log() { [ "${IPC_LOG:-1}" = "1" ] && echo "[ipc] $1" >&2; }
+IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK"
+IPC_REQ_MAX=4096
+IPC_POLL_MAX=64
+ipc_dir() { echo "$1/ipc"; }
+ipc_req_dir() { echo "$1/ipc/requests"; }
+ipc_resp_dir() { echo "$1/ipc/responses"; }
+ipc_pid_file() { echo "$1/ipc/daemon.pid"; }
+# 值编码：base64（字母表无 Shell 元字符）；tr -d '\n' 去除 coreutils 76 列换行
+ipc_b64enc() { printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'; }
+ipc_b64dec() { printf '%s' "$1" | base64 -d 2>/dev/null; }
+# 判定解码值含真实换行（防 task 文件被多行污染——task 命令须单行存储）
+ipc_has_newline() { printf '%s' "$1" | awk 'NR>1 { exit 0 } END { exit 1 }' 2>/dev/null; }
+# 服务端初始化：建 0700 目录 + daemon.pid 存活标记
+ipc_server_init() {   # <base> → 0
+    ipcv_base=$1
+    mkdir -p "$(ipc_req_dir "$ipcv_base")" "$(ipc_resp_dir "$ipcv_base")" 2>/dev/null || return 1
+    chmod 700 "$(ipc_dir "$ipcv_base")" "$(ipc_req_dir "$ipcv_base")" "$(ipc_resp_dir "$ipcv_base")" 2>/dev/null
+    echo "$$" > "$(ipc_pid_file "$ipcv_base")" 2>/dev/null
+    return 0
+}
+# 请求行校验：REQ_ID|OP|k=b64&k=b64
+ipc_parse() {   # <line> → 0=ok（ipcv_req_id/ipcv_op/ipcv_params 就绪）1=invalid
+    ipcv_line=$1
+    [ -n "$ipcv_line" ] || return 1
+    ipcv_req_id=${ipcv_line%%|*}
+    ipcv_rest=${ipcv_line#*|}
+    ipcv_op=${ipcv_rest%%|*}
+    ipcv_params=${ipcv_rest#*|}
+    case "$ipcv_req_id" in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    [ "${#ipcv_req_id}" -le 64 ] || return 1
+    case " $IPC_WHITELIST " in
+        *" $ipcv_op "*) ;;
+        *) return 1 ;;
+    esac
+    ipc_params_valid "$ipcv_params" || return 1
+    return 0
+}
+# 参数格式校验：每项 k=base64（k 白名单字符、v 仅 base64 字母表）
+# 注：必须用当前 shell 的 for 循环（IFS='&' 分词），不可用管道 while——
+# 管道内 return 只在子 shell 生效，无法把校验失败传回调用方。
+ipc_params_valid() {   # <params> → 0=valid
+    [ -z "$1" ] && return 0
+    ipcv_params=$1
+    ipcv_oldifs=$IFS
+    IFS='&'
+    for ipcv_tok in $ipcv_params; do
+        case "$ipcv_tok" in
+            *"="*) ;;
+            *) IFS=$ipcv_oldifs; return 1 ;;
+        esac
+        ipcv_k=${ipcv_tok%%=*}
+        ipcv_v=${ipcv_tok#*=}
+        case "$ipcv_k" in ""|*[!A-Za-z0-9._-]*) IFS=$ipcv_oldifs; return 1 ;; esac
+        case "$ipcv_v" in ""|*[!A-Za-z0-9+/=]*) IFS=$ipcv_oldifs; return 1 ;; esac
+    done
+    IFS=$ipcv_oldifs
+    return 0
+}
+# 取参数（base64 解码）：<params> <key> → 值（无则空）
+ipc_param() {   # 用 sed 抽取而非管道 while（子 shell return 不可靠）
+    ipcv_v=$(printf '%s' "$1" | tr '&' '\n' | sed -n "s/^$2=//p" | head -1)
+    [ -n "$ipcv_v" ] && ipc_b64dec "$ipcv_v"
+}
+# 原子响应写回：<base> <req_id> <op> <rc> <error> [payload]
+ipc_respond() {   # 载荷为空则不写载荷行；tmp+mv 原子
+    ipcv_base=$1; ipcv_rid=$2; ipcv_op=$3; ipcv_rc=$4; ipcv_err=$5; ipcv_payload=${6:-}
+    ipcv_rdir=$(ipc_resp_dir "$ipcv_base")
+    mkdir -p "$ipcv_rdir" 2>/dev/null
+    ipcv_t="$ipcv_rdir/$ipcv_rid.resp.tmp"
+    {
+        printf '%s|%s|%s|%s\n' "$ipcv_rid" "$ipcv_op" "$ipcv_rc" "$ipcv_err"
+        [ -n "$ipcv_payload" ] && printf '%s\n' "$ipcv_payload"
+    } > "$ipcv_t" 2>/dev/null
+    mv "$ipcv_t" "$ipcv_rdir/$ipcv_rid.resp" 2>/dev/null
+    rm -f "$ipcv_t" 2>/dev/null
+    return 0
+}
+# 任务运行态（state.txt 优先，旧 status.txt 兜底）
+ipc_task_state() {   # <tasks_dir> <id>
+    ipcv_tasks=$1; ipcv_id=$2
+    if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/state.txt" ]; then
+        cat "$ipcv_tasks/$ipcv_id/state.txt" 2>/dev/null
+        return 0
+    fi
+    if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/status.txt" ]; then
+        cat "$ipcv_tasks/$ipcv_id/status.txt" 2>/dev/null
+        return 0
+    fi
+    echo "UNKNOWN"
+}
+# ── 操作处理器 ───────────────────────────────────────────────────────────────
+ipc_op_get_tasks() {   # <base> <tasks> <req_id>
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3
+    ipcv_payload=""
+    ipcv_nl='
+'
+    for ipcv_id in $(registry_task_ids); do
+        ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null) || continue
+        ipcv_name=$(sched_task_field "$ipcv_f" name)
+        ipcv_trig=$(sched_task_field "$ipcv_f" trigger)
+        ipcv_en=$(sched_task_field "$ipcv_f" enabled)
+        ipcv_st=$(ipc_task_state "$ipcv_tasks" "$ipcv_id")
+        ipcv_payload="${ipcv_payload}${ipcv_id}|${ipcv_name}|${ipcv_trig}|${ipcv_en}|${ipcv_st}${ipcv_nl}"
+    done
+    ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASKS 0 ok "$ipcv_payload"
+    return 0
+}
+ipc_op_get_status() {   # <base> <tasks> <req_id> <id>
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_STATUS 1 invalid_request "missing id"; return 0; }
+    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
+    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_STATUS 3 task_not_found "$ipcv_id"; return 0; }
+    ipcv_st=$(ipc_task_state "$ipcv_tasks" "$ipcv_id")
+    ipcv_payload="id=$ipcv_id
+name=$(sched_task_field "$ipcv_f" name)
+trigger=$(sched_task_field "$ipcv_f" trigger)
+enabled=$(sched_task_field "$ipcv_f" enabled)
+command=$(sched_task_field "$ipcv_f" action.command)
+state=$ipcv_st"
+    ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_STATUS 0 ok "$ipcv_payload"
+    return 0
+}
+ipc_op_get_log() {   # <base> <tasks> <req_id> <id> [lines]
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_lines=${5:-50}
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 1 invalid_request "missing id"; return 0; }
+    case "$ipcv_lines" in ''|*[!0-9]*) ipcv_lines=50 ;; esac
+    [ "$ipcv_lines" -gt 500 ] && ipcv_lines=500
+    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
+    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 3 task_not_found "$ipcv_id"; return 0; }
+    if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/output.log" ]; then
+        ipcv_payload=$(tail -n "$ipcv_lines" "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null)
+    else
+        ipcv_payload="(no output yet)"
+    fi
+    ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 0 ok "$ipcv_payload"
+    return 0
+}
+# VALIDATE_TASK：临时文件校验（不持久化）
+ipc_op_validate() {   # <base> <req_id> <params>
+    ipcv_base=$1; ipcv_rid=$2; ipcv_params=$3
+    ipcv_trig=$(ipc_param "$ipcv_params" trigger)
+    ipcv_cmd=$(ipc_param "$ipcv_params" command)
+    [ -n "$ipcv_trig" ] && [ -n "$ipcv_cmd" ] || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "trigger+command required"; return 0; }
+    if ipc_has_newline "$ipcv_cmd"; then
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "command must be single-line"; return 0; fi
+    ipcv_sandbox="$ipcv_base/ipc/.validate.$$"
+    mkdir -p "$ipcv_sandbox" 2>/dev/null
+    ipcv_vid="validate_$$"
+    {
+        echo "schema_version=2"
+        echo "id=$ipcv_vid"
+        echo "name=$(ipc_param "$ipcv_params" name)"
+        echo "enabled=$(ipc_param "$ipcv_params" enabled)"
+        echo "trigger=$ipcv_trig"
+        echo "action.type=command"
+        echo "action.command=$ipcv_cmd"
+    } > "$ipcv_sandbox/$ipcv_vid.task" 2>/dev/null
+    if tcfg_validate_task "$ipcv_sandbox/$ipcv_vid.task"; then
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 0 ok "valid"
+    else
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "task invalid"
+    fi
+    rm -rf "$ipcv_sandbox" 2>/dev/null
+    return 0
+}
+# CREATE_TASK：Managed 模式写入 task-config + 原子 reload
+ipc_op_create() {   # <base> <config> <req_id> <params>
+    ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_params=$4
+    tcfg_is_managed || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+    ipcv_trig=$(ipc_param "$ipcv_params" trigger)
+    ipcv_cmd=$(ipc_param "$ipcv_params" command)
+    [ -n "$ipcv_trig" ] && [ -n "$ipcv_cmd" ] || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "trigger+command required"; return 0; }
+    if ipc_has_newline "$ipcv_cmd"; then
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "command must be single-line"; return 0; fi
+    ipcv_id=$(ipc_param "$ipcv_params" id)
+    [ -n "$ipcv_id" ] || ipcv_id=$(tcfg_new_id "$ipcv_trig")
+    ipcv_sandbox="$ipcv_base/ipc/.create.$$"
+    mkdir -p "$ipcv_sandbox" 2>/dev/null
+    {
+        echo "schema_version=2"
+        echo "id=$ipcv_id"
+        echo "name=$(ipc_param "$ipcv_params" name)"
+        echo "enabled=$(ipc_param "$ipcv_params" enabled)"
+        echo "trigger=$ipcv_trig"
+        echo "action.type=command"
+        echo "action.command=$ipcv_cmd"
+        echo "action.termux=$(ipc_param "$ipcv_params" termux)"
+        echo "action.interactive=$(ipc_param "$ipcv_params" interactive)"
+        echo "action.notify_start=$(ipc_param "$ipcv_params" notify_start)"
+        echo "action.notify_end=$(ipc_param "$ipcv_params" notify_end)"
+        echo "action.msg=$(ipc_param "$ipcv_params" msg)"
+        echo "health.type=none"
+        echo "recovery.type=none"
+        echo "retry.max=0"
+        echo "retry.interval=60"
+    } > "$ipcv_sandbox/$ipcv_id.task" 2>/dev/null
+    if ! tcfg_validate_task "$ipcv_sandbox/$ipcv_id.task"; then
+        rm -rf "$ipcv_sandbox" 2>/dev/null
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "task invalid"
+        return 0
+    fi
+    ipcv_target=$(tcfg_task_file "$ipcv_id")
+    if cp "$ipcv_sandbox/$ipcv_id.task" "$ipcv_target.tmp.$$" 2>/dev/null \
+        && mv "$ipcv_target.tmp.$$" "$ipcv_target" 2>/dev/null; then
+        sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
+        rm -rf "$ipcv_sandbox" 2>/dev/null
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 0 ok "created $ipcv_id"
+    else
+        rm -f "$ipcv_target.tmp.$$" 2>/dev/null
+        rm -rf "$ipcv_sandbox" 2>/dev/null
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "write failed"
+    fi
+    return 0
+}
+# UPDATE_TASK：Managed 模式按给定字段更新 + 校验 + reload
+ipc_op_update() {   # <base> <config> <req_id> <params>
+    ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_params=$4
+    tcfg_is_managed || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+    ipcv_id=$(ipc_param "$ipcv_params" id)
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 1 invalid_request "missing id"; return 0; }
+    [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 3 task_not_found "$ipcv_id"; return 0; }
+    for ipcv_fld in name enabled trigger command termux interactive notify_start notify_end msg; do
+        ipcv_v=$(ipc_param "$ipcv_params" "$ipcv_fld")
+        [ -n "$ipcv_v" ] || continue
+        if [ "$ipcv_fld" = "command" ] && ipc_has_newline "$ipcv_v"; then
+            ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 configuration_invalid "command must be single-line"; return 0; fi
+        case "$ipcv_fld" in
+            command) ipcv_key=action.command ;;
+            termux) ipcv_key=action.termux ;;
+            interactive) ipcv_key=action.interactive ;;
+            notify_start) ipcv_key=action.notify_start ;;
+            notify_end) ipcv_key=action.notify_end ;;
+            msg) ipcv_key=action.msg ;;
+            *) ipcv_key=$ipcv_fld ;;
+        esac
+        tcfg_set_field "$ipcv_id" "$ipcv_key" "$ipcv_v" >/dev/null 2>&1
+    done
+    if tcfg_validate_task "$(tcfg_task_file "$ipcv_id")"; then
+        sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
+        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 0 ok "updated $ipcv_id"
+    else
+        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 configuration_invalid "invalid after update"
+    fi
+    return 0
+}
+ipc_op_delete() {   # <base> <config> <req_id> <id>
+    ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_id=$4
+    tcfg_is_managed || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 1 invalid_request "missing id"; return 0; }
+    [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 3 task_not_found "$ipcv_id"; return 0; }
+    tcfg_remove_task "$ipcv_id" >/dev/null 2>&1
+    sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
+    ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 0 ok "deleted $ipcv_id"
+    return 0
+}
+ipc_op_set_enabled() {   # <base> <config> <req_id> <id> <val> <opname>
+    ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_val=$5; ipcv_opname=$6
+    tcfg_is_managed || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
+    [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
+    tcfg_set_field "$ipcv_id" enabled "$ipcv_val" >/dev/null 2>&1
+    sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
+    ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "enabled=$ipcv_val $ipcv_id"
+    return 0
+}
+# 启动（经 action_run，命令取自已校验任务文件——请求不可注入）；已运行不重复启动
+ipc_op_start() {   # <base> <tasks> <req_id> <id> <opname> [force]
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_opname=$5; ipcv_force=${6:-0}
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
+    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
+    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
+    if [ "$ipcv_force" -ne 1 ]; then
+        ipcv_st=$(ipc_task_state "$ipcv_tasks" "$ipcv_id")
+        case "$ipcv_st" in
+            RUNNING|STARTING) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "already $ipcv_st"; return 0 ;;
+        esac
+    fi
+    ipcv_cmd=$(sched_task_field "$ipcv_f" action.command)
+    [ -n "$ipcv_cmd" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "no command"; return 0; }
+    ipcv_tmx=$(sched_task_field "$ipcv_f" action.termux); [ -z "$ipcv_tmx" ] && ipcv_tmx=0
+    ipcv_itr=$(sched_task_field "$ipcv_f" action.interactive); [ -z "$ipcv_itr" ] && ipcv_itr=0
+    ipcv_ns=$(sched_task_field "$ipcv_f" action.notify_start); [ -z "$ipcv_ns" ] && ipcv_ns=0
+    ipcv_ne=$(sched_task_field "$ipcv_f" action.notify_end); [ -z "$ipcv_ne" ] && ipcv_ne=0
+    ipcv_msg=$(sched_task_field "$ipcv_f" action.msg)
+    action_run "$ipcv_id" "$ipcv_cmd" "$ipcv_tmx" "$ipcv_itr" "$ipcv_ns" "$ipcv_ne" "$ipcv_msg" >/dev/null 2>&1
+    ipcv_arc=$?
+    if [ "$ipcv_arc" -eq 0 ]; then
+        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "started $ipcv_id"
+    else
+        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "start failed rc=$ipcv_arc"
+    fi
+    return 0
+}
+ipc_op_stop() {   # <base> <tasks> <req_id> <id> <opname>
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_opname=$5
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
+    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
+    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
+    if [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_id" ]; then
+        supervisor_stop_task "$ipcv_tasks/$ipcv_id" 1 >/dev/null 2>&1
+        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "stopped $ipcv_id"
+    else
+        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "not running $ipcv_id"
+    fi
+    return 0
+}
+ipc_op_restart() {   # <base> <tasks> <req_id> <id> <opname>
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_opname=$5
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
+    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
+    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
+    if [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_id" ]; then
+        supervisor_stop_task "$ipcv_tasks/$ipcv_id" 1 >/dev/null 2>&1
+    fi
+    ipc_op_start "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$ipcv_id" "$ipcv_opname" 1
+    return 0
+}
+# 分发：<base> <config> <tasks> <req_id> <op> <params>
+# 每 op 的**参数键白名单**（固定格式 → 未知键即 invalid_request，绝不透传）：
+ipc_allowed_keys() {   # <op> → 允许的参数键（空格分隔）
+    case "$1" in
+        GET_TASKS) echo "" ;;
+        GET_TASK_STATUS|GET_TASK_LOG) echo "id lines" ;;
+        VALIDATE_TASK) echo "name trigger command enabled termux interactive notify_start notify_end msg" ;;
+        CREATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
+        UPDATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
+        DELETE_TASK|ENABLE_TASK|DISABLE_TASK) echo "id" ;;
+        START_TASK|STOP_TASK|RESTART_TASK) echo "id" ;;
+        *) echo "" ;;
+    esac
+}
+ipc_dispatch() {
+    ipcv_base=$1; ipcv_config=$2; ipcv_tasks=$3; ipcv_rid=$4; ipcv_op=$5; ipcv_params=$6
+    # 参数键白名单校验（未知键 → invalid_request；例：START_TASK 带 command → 拒绝）
+    ipcv_allow=$(ipc_allowed_keys "$ipcv_op")
+    [ -z "$ipcv_params" ] || {
+        ipcv_oldifs=$IFS; IFS='&'
+        for ipcv_tok in $ipcv_params; do
+            ipcv_k=${ipcv_tok%%=*}
+            case " $ipcv_allow " in
+                *" $ipcv_k "*) ;;
+                *) IFS=$ipcv_oldifs
+                   ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 1 invalid_request "unknown param key: $ipcv_k"
+                   return 0 ;;
+            esac
+        done
+        IFS=$ipcv_oldifs
+    }
+    case "$ipcv_op" in
+        GET_TASKS) ipc_op_get_tasks "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" ;;
+        GET_TASK_STATUS) ipc_op_get_status "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
+        GET_TASK_LOG) ipc_op_get_log "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" "$(ipc_param "$ipcv_params" lines)" ;;
+        VALIDATE_TASK) ipc_op_validate "$ipcv_base" "$ipcv_rid" "$ipcv_params" ;;
+        CREATE_TASK) ipc_op_create "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
+        UPDATE_TASK) ipc_op_update "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
+        DELETE_TASK) ipc_op_delete "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
+        ENABLE_TASK) ipc_op_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" 1 ENABLE_TASK ;;
+        DISABLE_TASK) ipc_op_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" 0 DISABLE_TASK ;;
+        START_TASK) ipc_op_start "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" START_TASK ;;
+        STOP_TASK) ipc_op_stop "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" STOP_TASK ;;
+        RESTART_TASK) ipc_op_restart "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" RESTART_TASK ;;
+    esac
+    return 0
+}
+# 服务端轮询（daemon 主循环调用；单轮 ≤ IPC_POLL_MAX 个请求，绝不阻塞）：
+# 扫描 requests/*.req → 读取/限长/解析/分发 → 原子响应 → 删除请求文件。
+ipc_server_poll() {   # <base> <config> <tasks_dir> → 0
+    ipcv_base=$1; ipcv_config=$2; ipcv_tasks=$3
+    ipcv_rdir=$(ipc_req_dir "$ipcv_base")
+    [ -d "$ipcv_rdir" ] || return 0
+    ipcv_n=0
+    for ipcv_rf in "$ipcv_rdir"/*.req; do
+        [ -f "$ipcv_rf" ] || continue
+        ipcv_n=$((ipcv_n + 1))
+        [ "$ipcv_n" -gt "$IPC_POLL_MAX" ] && break
+        ipcv_rid=$(basename "$ipcv_rf" .req)
+        if [ -f "$(ipc_resp_dir "$ipcv_base")/$ipcv_rid.resp" ]; then
+            rm -f "$ipcv_rf" 2>/dev/null    # 幂等：响应已存在 → 丢弃重复请求
+            continue
+        fi
+        ipcv_sz=$(wc -c < "$ipcv_rf" 2>/dev/null || echo 0)
+        if [ "$ipcv_sz" -gt "$IPC_REQ_MAX" ]; then
+            ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 invalid_request "request too large"
+            rm -f "$ipcv_rf" 2>/dev/null
+            continue
+        fi
+        ipcv_line=$(cat "$ipcv_rf" 2>/dev/null | tr -d '\r')
+        rm -f "$ipcv_rf" 2>/dev/null       # 先取走再处理（防重放）
+        if ipc_parse "$ipcv_line"; then
+            ipc_dispatch "$ipcv_base" "$ipcv_config" "$ipcv_tasks" "$ipcv_rid" "$ipcv_op" "$ipcv_params"
+        else
+            ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 invalid_request "malformed request"
+        fi
+    done
+    return 0
+}
+# 客户端（CLI/WebUI 后端调用）：构建请求 → 原子落盘 → 轮询响应（超时）→ 打印 + rc
+ipc_client_send() {   # <base> <op> <params> [timeout] → rc；stdout 响应文件内容
+    ipcv_base=$1; ipcv_op=$2; ipcv_params=$3; ipcv_timeout=${4:-5}
+    ipcv_pid=$(cat "$(ipc_pid_file "$ipcv_base")" 2>/dev/null)
+    if [ -z "$ipcv_pid" ] || [ ! -d "/proc/$ipcv_pid" ]; then
+        echo "0|$ipcv_op|6|daemon_unavailable"
+        return 6
+    fi
+    ipcv_rdir=$(ipc_req_dir "$ipcv_base")
+    [ -d "$ipcv_rdir" ] || { echo "0|$ipcv_op|6|daemon_unavailable"; return 6; }
+    [ -w "$ipcv_rdir" ] || { echo "0|$ipcv_op|2|permission_denied"; return 2; }
+    ipcv_rid="r$(date +%s)-$$-$(od -An -N2 -tu2 /dev/urandom 2>/dev/null | tr -d ' ')"
+    ipcv_line="$ipcv_rid|$ipcv_op|$ipcv_params"
+    [ "${#ipcv_line}" -le "$IPC_REQ_MAX" ] || { echo "0|$ipcv_op|1|invalid_request"; return 1; }
+    printf '%s\n' "$ipcv_line" > "$ipcv_rdir/$ipcv_rid.req.tmp" 2>/dev/null \
+        && mv "$ipcv_rdir/$ipcv_rid.req.tmp" "$ipcv_rdir/$ipcv_rid.req" 2>/dev/null \
+        || { echo "0|$ipcv_op|2|permission_denied"; return 2; }
+    ipcv_respdir=$(ipc_resp_dir "$ipcv_base")
+    ipcv_i=0
+    while [ "$ipcv_i" -lt "$ipcv_timeout" ]; do
+        if [ -f "$ipcv_respdir/$ipcv_rid.resp" ]; then
+            cat "$ipcv_respdir/$ipcv_rid.resp" 2>/dev/null
+            ipcv_rc=$(head -1 "$ipcv_respdir/$ipcv_rid.resp" 2>/dev/null | cut -d'|' -f3)
+            rm -f "$ipcv_respdir/$ipcv_rid.resp" 2>/dev/null
+            case "$ipcv_rc" in ''|*[!0-9]*) ipcv_rc=0 ;; esac
+            return "$ipcv_rc"
+        fi
+        sleep 1
+        ipcv_i=$((ipcv_i + 1))
+    done
+    echo "0|$ipcv_op|5|operation_timeout"
+    return 5
+}
 # ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
@@ -3118,7 +3594,12 @@ runtime_lib_selfcheck() {
               tcfg_new_id tcfg_atomic_write sched_reload sched_snapshot_managed \
               scheduler_tick scheduler_boot sched_execute_one sched_cycle_mark \
               sched_cycle_seen sched_source_mode sched_remove_task sched_prune_ron \
-              sched_task_field sched_audit; do
+              sched_task_field sched_audit ipc_server_init ipc_server_poll \
+              ipc_parse ipc_params_valid ipc_param ipc_respond ipc_dispatch \
+              ipc_allowed_keys ipc_op_get_tasks ipc_op_get_status ipc_op_get_log ipc_op_validate \
+              ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \
+              ipc_op_start ipc_op_stop ipc_op_restart ipc_client_send \
+              ipc_b64enc ipc_b64dec ipc_task_state ipc_has_newline; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

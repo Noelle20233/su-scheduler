@@ -104,6 +104,18 @@ cmp -s "$RZ/stale_a/status.txt" "$T/stale_a.status.before" && ok "P2-09 recover:
 [ -f "$RZ/done_d/state.txt" ] && bad "P2-09 recover: completed dir touched" || ok "P2-09 recover: completed dir untouched"
 
 # ── 4) 真实链路：fake daemon 启动/stop/restart/stale lock ──────────────────
+# 等待 fake daemon 写出锁文件（有界轮询：registry 引导耗时随宿主而定，避免固定
+# sleep 造成时序抖动；断言的是"锁存活"真实属性而非等待时长）。
+WAIT_LOCK_MAX=30
+wait_lock() {          # $1=锁文件；轮询至多 WAIT_LOCK_MAX 秒直至该文件可读
+    wi=0
+    while [ "$wi" -lt "$WAIT_LOCK_MAX" ]; do
+        [ -s "$1" ] && return 0
+        sleep 0.25
+        wi=$((wi + 1))
+    done
+    return 1
+}
 FAKE="$T/fake-daemon.sh"
 cat > "$FAKE" <<'EOF'
 #!/usr/bin/env bash
@@ -131,8 +143,8 @@ cp tests/fixtures/legacy/config.txt "$FDCFG"
 mkdir -p "$FDTASKS/prev_run"
 echo "RUNNING" > "$FDTASKS/prev_run/status.txt"
 LIFECYCLE_LOG=0 bash "$FAKE" "$PWD" "$RTLIB" "$FDBASE" "$FDCFG" "$FDTASKS" "$LKF" >"$T/fake.log" 2>&1 &
-sleep 2
-[ -f "$LKF" ] && [ -d "/proc/$(cat "$LKF" 2>/dev/null)" ] && ok "P2-09 chain: fake daemon started → lock alive (pid=$(cat "$LKF" 2>/dev/null))" || bad "P2-09 chain: lock not alive"
+wait_lock "$LKF"
+[ -s "$LKF" ] && [ -d "/proc/$(cat "$LKF" 2>/dev/null)" ] && ok "P2-09 chain: fake daemon started → lock alive (pid=$(cat "$LKF" 2>/dev/null))" || bad "P2-09 chain: lock not alive"
 [ -f "$FDBASE/current" ] && ok "P2-09 chain: registry snapshot built at startup" || bad "P2-09 chain: no snapshot"
 [ "$(cat "$FDTASKS/prev_run/state.txt" 2>/dev/null)" = "FAILED" ] && ok "P2-09 chain: recovery ran in startup sequence (prev_run → FAILED)" || bad "P2-09 chain: recovery not executed"
 OLDPID=$(cat "$LKF" 2>/dev/null)
@@ -142,8 +154,9 @@ while [ "$i" -lt 10 ] && [ -d "/proc/$OLDPID" ]; do sleep 0.5; i=$((i + 1)); don
 [ ! -d "/proc/$OLDPID" ] && ok "P2-09 chain: lifecycle_stop killed daemon" || bad "P2-09 chain: daemon still alive"
 [ ! -f "$LKF" ] && ok "P2-09 chain: lock released after stop" || bad "P2-09 chain: lock not released"
 LIFECYCLE_LOG=0 lifecycle_restart "$LKF" "$FDBASE" "$FDCFG" "bash $FAKE $PWD $RTLIB $FDBASE $FDCFG $FDTASKS $LKF" >/dev/null 2>&1
-sleep 2
-[ -f "$LKF" ] && [ -d "/proc/$(cat "$LKF" 2>/dev/null)" ] && ok "P2-09 chain: lifecycle_restart relaunched daemon (new pid=$(cat "$LKF" 2>/dev/null))" || bad "P2-09 chain: restart failed"
+rm -f "$LKF"
+wait_lock "$LKF"
+[ -s "$LKF" ] && [ -d "/proc/$(cat "$LKF" 2>/dev/null)" ] && ok "P2-09 chain: lifecycle_restart relaunched daemon (new pid=$(cat "$LKF" 2>/dev/null))" || bad "P2-09 chain: restart failed"
 [ "$(cat "$LKF" 2>/dev/null)" != "$OLDPID" ] && ok "P2-09 chain: new daemon re-locked with fresh pid" || bad "P2-09 chain: same pid after restart"
 kill "$(cat "$LKF" 2>/dev/null)" 2>/dev/null
 rm -f "$LKF"

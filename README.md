@@ -1400,6 +1400,8 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | P2 发布评审（P2-15：KernelSU/Magisk/APatch 安装结构 + 发布契约、systemless 覆盖、数据独立模块目录、manager-agnostic 安装） | `tests/p2-install/test.sh` |
 | L2 | Canonical Task Config Store（P3-02：双模式 legacy/managed 权威、导入幂等、失败原子性、回滚、导出、新建 ID `task_` 命名空间、损坏回退、接线） | `tests/config-v2/test.sh` |
 | L2 | Registry 正式调度接管（P3-03：Registry 从 Shadow 提升为正式调度源、双模式 legacy/managed、TriggerProvider→ActionProvider、同周期去重、配置变更不重复执行、损坏 KEPT、task.v2 快照移除监督兜底、旧 CLI 查询/终止、单任务错误隔离、审计日志、接线） | `tests/scheduler-prod/test.sh` |
+| L2 | 本地 IPC 控制面（P3-04：请求/响应文件通道、固定格式、base64 值、12 op 白名单、可区分错误码、写操作仅 managed、START/STOP/RESTART 经 action_run、重复请求不重复启动、原子响应、接线） | `tests/ipc/test.sh` |
+| L2 | IPC 安全边界（P3-04：fuzz/注入零副作用、Shell 元字符不进入执行路径、同 req_id 幂等、已运行不重复 START、单轮有界不阻塞、0700 权限、未授权写 permission_denied、daemon 停止 daemon_unavailable、超时 operation_timeout） | `tests/ipc/security.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

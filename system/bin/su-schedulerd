@@ -96,6 +96,8 @@ if [ "$RUNTIME_LOADED" -eq 1 ]; then
     for tid in $(registry_task_ids); do
         trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "${TRIGGER_BOOT_CONTEXT:-0}" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
     done
+    # ⚙️ 本地 IPC 控制面（P3-04）：建 0700 请求/响应目录 + daemon.pid 存活标记
+    ipc_server_init "$DATA_DIR" >/dev/null 2>&1
 fi
 
 # 📝 Function to log events with pretty timestamps and colors
@@ -823,7 +825,16 @@ while true; do
         fi
     fi
 
-    # 💤 Nap until the start of the next minute
-    # This keeps us perfectly synced with the system clock!
-    sleep $((60 - $(date +%S)))
+    # 💤 Nap until the start of the next minute, polling the IPC control
+    # channel each second (P3-04). 外层单常驻循环仍恰 1 处；调度周期仍以分钟
+    # 为单位推进（本子循环只负责逐秒逼近下一分钟边界 + 非阻塞 IPC 轮询）。
+    ipc_nap=$((60 - $(date +%S)))
+    [ "$ipc_nap" -lt 1 ] && ipc_nap=1
+    while [ "$ipc_nap" -gt 0 ]; do
+        if [ "$RUNTIME_LOADED" -eq 1 ]; then
+            ipc_server_poll "$DATA_DIR" "$CONFIG_FILE" "$TASKS_DIR" >/dev/null 2>&1
+        fi
+        sleep 1
+        ipc_nap=$((ipc_nap - 1))
+    done
 done

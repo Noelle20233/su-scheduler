@@ -113,6 +113,8 @@ print_help() {
     echo -e "  ${GREEN}tasks${RESET}                    List only running tasks 📋"
     echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id>}${RESET}   Registry-backed Task CLI (P2-08) 🗂️"
     echo -e "  ${GREEN}task-config${RESET} ${CYAN}{status|import|export|rollback|list|show|set|new|rm}${RESET}   Task v2 配置存储与迁移 (P3-02) 🗄️"
+    echo -e "  ${GREEN}ipc${RESET} ${CYAN}<OP> [k=v ...]${RESET}         本地 IPC 控制面客户端 (P3-04) 🔌"
+    echo -e "      ${YELLOW}OP:${RESET} GET_TASKS|GET_TASK_STATUS|GET_TASK_LOG|VALIDATE_TASK|CREATE_TASK|UPDATE_TASK|DELETE_TASK|ENABLE_TASK|DISABLE_TASK|START_TASK|STOP_TASK|RESTART_TASK"
     echo -e "  ${GREEN}audit${RESET} ${YELLOW}[-f|-n NUM|clear]${RESET}    The Mission Auditor feed 🕵️"
     echo -e "  ${GREEN}history | all-tasks${RESET}      List all tasks (running & finished) 📜"
     echo -e "  ${GREEN}task-info${RESET} ${CYAN}<task_id>${RESET}       Get detailed task info 🔍"
@@ -1234,6 +1236,33 @@ cmd_task_config() {
     esac
 }
 
+# 🔌 Local IPC Control Plane client（P3-04，RUNTIME_LOADED 门控）
+# 经 $DATA_DIR/ipc/ 请求/响应文件通道与 daemon 通信；**本 CLI 不直接执行任何
+# 任务命令**——控制指令只落到已校验任务操作（START 等仅按 id 运行 Registry 中
+# 已存储的命令）。OP 白名单见 lib §21 IPC_WHITELIST。用法：
+#   su-scheduler ipc <OP> [key=value ...]
+cmd_ipc() {
+    if [ "$RUNTIME_LOADED" -ne 1 ]; then
+        echo "ERROR: ipc subcommand requires production runtime library (${RUNTIME_LIB} not loaded)" >&2
+        return 1
+    fi
+    local op="${1:-}"
+    [ -n "$op" ] || { echo "ERROR: usage: su-scheduler ipc <OP> [key=value ...]" >&2; return 1; }
+    shift
+    local params="" kv="" k="" v=""
+    for kv in "$@"; do
+        k="${kv%%=*}"
+        v="${kv#*=}"
+        [ -n "$k" ] || { echo "ERROR: bad param (expected key=value): $kv" >&2; return 1; }
+        local enc
+        enc="$(ipc_b64enc "$v")"
+        [ -n "$params" ] && params="${params}&"
+        params="${params}${k}=${enc}"
+    done
+    local timeout="${SU_SCHEDULER_IPC_TIMEOUT:-5}"
+    ipc_client_send "$DATA_DIR" "$op" "$params" "$timeout"
+}
+
 # 🚦 Main Dispatcher - Routes your command to the right function
 case "$1" in
     add) shift; cmd_add "$@" ;;
@@ -1245,6 +1274,7 @@ case "$1" in
     tasks) cmd_tasks ;;
     task) shift; cmd_task "$@" ;;
     task-config) shift; cmd_task_config "$@" ;;
+    ipc) shift; cmd_ipc "$@" ;;
     audit) shift; cmd_audit "$@" ;;
     history|all-tasks) cmd_tasks_history ;;
     task-info) shift; cmd_task_info "$@" ;;
