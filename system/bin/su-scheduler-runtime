@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.13.0"
+RUNTIME_LIB_VERSION="1.14.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2145,8 +2145,22 @@ supervisor_task_file() {   # <base> <tasks_dir> <id> → 注册表任务文件�
     f=$(registry_task_file "$qid" 2>/dev/null) && { echo "$f"; return 0; }
     runtime_map_refresh "$base" "$tasks" >/dev/null 2>&1
     canon=$(runtime_map_run_task "$base" "$qid")
-    [ -n "$canon" ] || return 1
-    f=$(registry_task_file "$canon" 2>/dev/null) || return 1
+    [ -n "$canon" ] || {
+        # P3-03 要求 9：任务已从新快照移除但仍在运行 → 用运行目录 stash 的
+        # task.v2 继续监督（快照移除的旧任务不中止监督/收尾；无 stash → 兜底失败）
+        if [ -f "$tasks/$qid/task.v2" ]; then
+            echo "$tasks/$qid/task.v2"
+            return 0
+        fi
+        return 1
+    }
+    f=$(registry_task_file "$canon" 2>/dev/null) || {
+        if [ -f "$tasks/$qid/task.v2" ]; then
+            echo "$tasks/$qid/task.v2"
+            return 0
+        fi
+        return 1
+    }
     echo "$f"
     return 0
 }
@@ -2616,15 +2630,17 @@ tcfg_get() {   # <file> <key> → 值（无则空）
 
 # 校验单个任务文件：schema_version=2 + id==文件名 + trigger 非空
 tcfg_validate_task() {   # <file> → 0 合法 / 1 非法（绝不清空、绝不退出）
-    f=$1
-    [ -f "$f" ] || return 1
-    sv=$(tcfg_get "$f" schema_version)
-    [ "$sv" = "2" ] || return 1
-    id=$(tcfg_get "$f" id)
-    base=$(basename "$f" .task)
-    [ -n "$id" ] && [ "$id" = "$base" ] || return 1
-    tr=$(tcfg_get "$f" trigger)
-    [ -n "$tr" ] || return 1
+    # 命名空间：内部变量一律 tcfgv_ 前缀，**不覆盖调用方全局变量**
+    #（POSIX sh 无局部变量——防 `base`/`id`/`tr` 等被 clobber，P3-03 审计发现）。
+    tcfgv_f=$1
+    [ -f "$tcfgv_f" ] || return 1
+    tcfgv_sv=$(tcfg_get "$tcfgv_f" schema_version)
+    [ "$tcfgv_sv" = "2" ] || return 1
+    tcfgv_id=$(tcfg_get "$tcfgv_f" id)
+    tcfgv_base=$(basename "$tcfgv_f" .task)
+    [ -n "$tcfgv_id" ] && [ "$tcfgv_id" = "$tcfgv_base" ] || return 1
+    tcfgv_tr=$(tcfg_get "$tcfgv_f" trigger)
+    [ -n "$tcfgv_tr" ] || return 1
     return 0
 }
 
@@ -2836,6 +2852,252 @@ tcfg_remove_task() {   # <id>
     return 0
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §20 Scheduler-Prod（P3-03）：Registry 正式调度源
+# ───────────────────────────────────────────────────────────────────────────
+# 把 Registry 从 Shadow Mode 提升为**正式调度数据源**，结束「Registry 旁路、
+# legacy 实际执行」的双轨状态。调用方（daemon 主循环 RUNTIME_LOADED=1 分支）
+# 只经 `scheduler_tick` 获取任务：
+#   Registry Task ──trigger_decide(TriggerProvider)──▶ 到期？
+#       └─due=Y─▶ action_run(ActionProvider) ──▶ Runtime State ──▶ Supervisor
+# 双模式：
+#   - managed（task-config/MANAGED 存在，P3-02）：registry 快照从 task-config/
+#     重建（**不再重新扫描 config.txt**）；
+#   - legacy（无 MANAGED，config.txt 权威）：registry_reload(config.txt)（KEPT
+#     回退最后有效快照）；RUNTIME_LOADED=0 时 daemon 走既有 config.txt 扫描
+#     （C2 fallback 原样）。
+# 语义保证：
+#   - 原子切换：reload 只写新快照 + 原子 flip current 指针；损坏/无效 → KEPT；
+#   - 每周期去重：同任务在一个调度周期（分钟）至多执行一次（cycle 标记文件）；
+#   - 配置变更不产生重复执行：reload 以源指纹（md5）判定，仅变化才重建；
+#   - 单任务错误隔离：任何 Task 失败只记 audit、不中止整个 tick；
+#   - 后置语义保留：--run-once-now（执行后置 0/修剪源行）、--delete（执行后
+#     移除）；heredoc/Termux/Interactive/notify/msg 经 action_run 原样透传；
+#   - 旧运行目录/旧运行 ID：执行落 `tasks/<id>`（canonical），idmap（§9）双向
+#     映射保留，旧 CLI 查询/终止不变；
+#   - 快照移除的运行任务仍被监督：执行时把任务文件 stash 到运行目录
+#     `task.v2`，supervisor_task_file 兜底读取（P3-03 要求 9）。
+# 审计：调度来源与每次决策/执行/重载落盘 `<base>/scheduler/audit.log`。
+# ═══════════════════════════════════════════════════════════════════════════
+sched_log() { [ "${SCHED_LOG:-1}" = "1" ] && echo "[scheduler] $1" >&2; }
+sched_audit_file() { echo "$1/scheduler/audit.log"; }
+sched_audit() {   # <base> <line> — 调度来源审计日志（追加一行）
+    base=$1; line=$2
+    f=$(sched_audit_file "$base")
+    mkdir -p "$(dirname "$f")" 2>/dev/null
+    echo "$(date '+%Y-%m-%d %H:%M:%S')|$line" >> "$f" 2>/dev/null
+    return 0
+}
+sched_source_mode() {   # <base> → managed|legacy
+    if tcfg_is_managed; then echo managed; else echo legacy; fi
+}
+sched_ensure_base() {   # <base> → 确保 TR_BASE 就绪（registry 快照定位）
+    base=$1
+    if [ -z "${TR_BASE:-}" ]; then
+        registry_attach "$base" >/dev/null 2>&1
+    fi
+    [ -n "${TR_BASE:-}" ]
+}
+# 源指纹：managed=task-config 内容；legacy=config.txt 内容（用于判定是否需要 reload）
+sched_source_fingerprint() {   # <base> <config>
+    if tcfg_is_managed; then
+        ( cat "$(tcfg_managed_marker)" 2>/dev/null; ls -l "$(tcfg_dir)"/*.task 2>/dev/null ) | md5sum | cut -d' ' -f1
+    else
+        [ -f "$2" ] && md5sum "$2" | cut -d' ' -f1
+    fi
+}
+# managed：从 task-config/ 重建 registry 快照（复制 + 校验 + 原子 flip current；KEPT）
+sched_snapshot_managed() {   # <base> → 0=ok 1=无有效任务(KEPT) 2=硬错误
+    base=$1
+    src=$(tcfg_dir)
+    [ -d "$src" ] || return 2
+    mkdir -p "$base/snapshots" 2>/dev/null || return 2
+    sid=$(registry_snapshot_next)
+    sdir="$base/snapshots/$sid"
+    mkdir -p "$sdir" 2>/dev/null || return 2
+    n=0
+    for f in "$src"/*.task; do
+        [ -f "$f" ] || continue
+        if tcfg_validate_task "$f"; then
+            id=$(basename "$f" .task)
+            cp "$f" "$sdir/$id.task" 2>/dev/null && n=$((n + 1))
+        fi
+    done
+    if [ "$n" -eq 0 ]; then
+        rm -rf "$sdir" 2>/dev/null
+        return 1
+    fi
+    { echo "snapshot=$sid"; echo "config=task-config"; echo "task_count=$n"; } > "$sdir/manifest.tmp" 2>/dev/null \
+        && mv "$sdir/manifest.tmp" "$sdir/manifest" 2>/dev/null
+    echo "$sid" > "$base/current.tmp" 2>/dev/null && mv "$base/current.tmp" "$base/current" 2>/dev/null
+    TASK_REGISTRY_SNAPSHOT=$sid
+    return 0
+}
+# 原子重载：源变化才重建；managed→task-config；legacy→registry_reload（KEPT）
+sched_reload() {   # <base> <config> → 0=未变/ok 1=kept 2=硬错误
+    base=$1; config=$2
+    sched_ensure_base "$base" || return 2
+    mkdir -p "$base/scheduler" 2>/dev/null
+    fp=$(sched_source_fingerprint "$base" "$config")
+    old=$(cat "$base/scheduler/source.md5" 2>/dev/null)
+    if [ -n "$old" ] && [ "$old" = "$fp" ]; then
+        return 0
+    fi
+    if tcfg_is_managed; then
+        sched_snapshot_managed "$base"
+        rc=$?
+    else
+        [ -f "$config" ] || { sched_audit "$base" "op=reload|mode=$(sched_source_mode "$base")|rc=2|reason=no-config"; return 2; }
+        registry_reload "$config" >/dev/null 2>&1
+        rc=$?
+    fi
+    printf '%s\n' "$fp" > "$base/scheduler/source.md5" 2>/dev/null
+    sched_audit "$base" "op=reload|mode=$(sched_source_mode "$base")|rc=$rc"
+    return "$rc"
+}
+# 周期去重（分钟级）：<base> <token>；seen=0 已执行
+sched_cycle_file() { echo "$1/scheduler/cycle-$2"; }
+sched_cycle_token() { date +%Y%m%d%H%M; }
+sched_cycle_mark() {   # <base> <id> <token>
+    f=$(sched_cycle_file "$1" "$3")
+    mkdir -p "$(dirname "$f")" 2>/dev/null
+    printf '%s\n' "$2" >> "$f" 2>/dev/null
+}
+sched_cycle_seen() {   # <base> <id> <token> → 0=已执行
+    f=$(sched_cycle_file "$1" "$3")
+    [ -f "$f" ] && grep -qx "$2" "$f" 2>/dev/null
+}
+sched_task_field() {   # <task_file> <key> → 值
+    grep "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2-
+}
+# 原子更新任务文件字段（tmp+mv）
+sched_set_task_field() {   # <file> <key> <value>
+    f=$1; key=$2; val=$3
+    t="$f.tmp.$$"
+    if grep -q "^$key=" "$f" 2>/dev/null; then
+        awk -v k="$key" -v v="$val" '{ if (index($0, k"=")==1) print k"="v; else print }' "$f" > "$t" 2>/dev/null
+    else
+        cp "$f" "$t" 2>/dev/null
+        printf '%s=%s\n' "$key" "$val" >> "$t" 2>/dev/null
+    fi
+    mv "$t" "$f" 2>/dev/null || rm -f "$t" 2>/dev/null
+    return 0
+}
+# 后置：--delete 执行后移除（managed→task-config + 快照；legacy→config.txt 行 + 快照）
+sched_remove_task() {   # <base> <config> <id> → 0/1/2
+    base=$1; config=$2; id=$3
+    tf=$(registry_task_file "$id" 2>/dev/null) || return 1
+    if tcfg_is_managed; then
+        tcfg_remove_task "$id" >/dev/null 2>&1
+    else
+        # legacy：按 source.line 删除 config.txt 对应行（line 或 a-b 范围；Q13 尽力而为）
+        [ -f "$config" ] || return 0
+        sl=$(sched_task_field "$tf" source.line)
+        case "$sl" in
+            *-*)
+                a=${sl%%-*}; b=${sl#*-}
+                sed "${a},${b}d" "$config" > "$config.tmp" 2>/dev/null && mv "$config.tmp" "$config" 2>/dev/null ;;
+            *[0-9]*)
+                sed "${sl}d" "$config" > "$config.tmp" 2>/dev/null && mv "$config.tmp" "$config" 2>/dev/null ;;
+        esac
+    fi
+    rm -f "$tf" 2>/dev/null
+    sched_audit "$base" "op=delete|task=$id|mode=$(sched_source_mode "$base")"
+    return 0
+}
+# 后置：--run-once-now 执行后置 0 并修剪源（managed→task-config；legacy→config.txt 行）
+sched_prune_ron() {   # <base> <config> <id>
+    base=$1; config=$2; id=$3
+    tf=$(registry_task_file "$id" 2>/dev/null) || return 1
+    sched_set_task_field "$tf" action.run_once_now 0 >/dev/null 2>&1
+    if tcfg_is_managed; then
+        tcfg_set_field "$id" action.run_once_now 0 >/dev/null 2>&1
+    else
+        [ -f "$config" ] || return 0
+        sl=$(sched_task_field "$tf" source.line)
+        case "$sl" in
+            *[0-9]*)
+                # 仅单行任务修剪（块任务 ron 罕见，保留 config 原样）
+                awk -v n="${sl%%-*}" '{ if (NR==n) { gsub("--run-once-now",""); gsub(/  */," "); gsub(/ :[ \t]*$/,""); gsub(/[ \t]+$/,""); print } else print }' "$config" > "$config.tmp" 2>/dev/null \
+                    && mv "$config.tmp" "$config" 2>/dev/null ;;
+        esac
+    fi
+    sched_audit "$base" "op=prune-ron|task=$id|mode=$(sched_source_mode "$base")"
+    return 0
+}
+# 单任务执行：trigger_decide（TriggerProvider）→ action_run（ActionProvider）→ 后置
+# 返回：0=已执行 1=未到期 2=错误（调用方循环隔离，不中止 tick）
+sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
+    base=$1; config=$2; tasks=$3; id=$4
+    now=${5:-$(date +%H%M)}; boot=${6:-0}
+    tf=$(registry_task_file "$id" 2>/dev/null) || { sched_log "WARN execute: no task file $id"; return 2; }
+    trig=$(sched_task_field "$tf" trigger)
+    out=$(trigger_decide "$base" "$id" "$now" "$boot" "$base/schedule_state.txt")
+    case "$out" in
+        *due=Y*) ;;
+        *) return 1 ;;
+    esac
+    cmd=$(sched_task_field "$tf" action.command)
+    tmx=$(sched_task_field "$tf" action.termux);  [ -z "$tmx" ] && tmx=0
+    itr=$(sched_task_field "$tf" action.interactive); [ -z "$itr" ] && itr=0
+    ns=$(sched_task_field "$tf" action.notify_start); [ -z "$ns" ] && ns=0
+    ne=$(sched_task_field "$tf" action.notify_end);   [ -z "$ne" ] && ne=0
+    msg=$(sched_task_field "$tf" action.msg)
+    action_run "$id" "$cmd" "$tmx" "$itr" "$ns" "$ne" "$msg" >/dev/null 2>&1
+    arc=$?
+    # stash 任务文件到运行目录（快照移除后 supervisor 仍可监督——P3-03 要求 9）
+    if [ -d "$tasks/$id" ]; then
+        cp "$tf" "$tasks/$id/task.v2" 2>/dev/null
+    fi
+    ron=$(sched_task_field "$tf" action.run_once_now)
+    del=$(sched_task_field "$tf" action.delete)
+    if [ "$del" = "1" ]; then
+        sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
+    elif [ "$ron" = "1" ]; then
+        sched_prune_ron "$base" "$config" "$id" >/dev/null 2>&1
+    fi
+    sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del"
+    return "$arc"
+}
+# Registry 正式调度 tick（daemon 主循环 RUNTIME_LOADED=1 调用）：源重载 + 逐任务决策执行
+scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
+    base=$1; config=$2; tasks=$3
+    now=${4:-$(date +%H%M)}
+    mkdir -p "$base/scheduler" 2>/dev/null
+    sched_reload "$base" "$config" >/dev/null 2>&1
+    token=$(sched_cycle_token)
+    due=0; execn=0; errn=0
+    for id in $(registry_task_ids); do
+        if sched_cycle_seen "$base" "$id" "$token"; then
+            continue
+        fi
+        sched_execute_one "$base" "$config" "$tasks" "$id" "$now" 0
+        rc=$?
+        if [ "$rc" -eq 1 ]; then
+            continue   # 未到期：不标记（配置变更后可到期执行一次）
+        fi
+        sched_cycle_mark "$base" "$id" "$token"
+        [ "$rc" -eq 0 ] && execn=$((execn + 1)) || errn=$((errn + 1))
+    done
+    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn"
+    return 0
+}
+# 启动 boot：registry 中 trigger=boot 的任务（RUNTIME_LOADED=1 启动段调用）
+scheduler_boot() {   # <base> <config> <tasks_dir> → 0
+    base=$1; config=$2; tasks=$3
+    mkdir -p "$base/scheduler" 2>/dev/null
+    sched_reload "$base" "$config" >/dev/null 2>&1
+    n=0
+    for id in $(registry_task_ids); do
+        tf=$(registry_task_file "$id" 2>/dev/null) || continue
+        trig=$(sched_task_field "$tf" trigger)
+        [ "$trig" = "boot" ] || continue
+        TRIGGER_BOOT_CONTEXT=1 sched_execute_one "$base" "$config" "$tasks" "$id" "$(date +%H%M)" 1 >/dev/null 2>&1 \
+            && n=$((n + 1))
+    done
+    sched_audit "$base" "op=boot|mode=$(sched_source_mode "$base")|exec=$n"
+    return 0
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -2853,7 +3115,10 @@ runtime_lib_selfcheck() {
               supervisor_runtime_exceeded tcfg_is_managed tcfg_mode \
               tcfg_task_ids tcfg_validate_task tcfg_import tcfg_export \
               tcfg_rollback tcfg_set_field tcfg_new_task tcfg_remove_task \
-              tcfg_new_id tcfg_atomic_write; do
+              tcfg_new_id tcfg_atomic_write sched_reload sched_snapshot_managed \
+              scheduler_tick scheduler_boot sched_execute_one sched_cycle_mark \
+              sched_cycle_seen sched_source_mode sched_remove_task sched_prune_ron \
+              sched_task_field sched_audit; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

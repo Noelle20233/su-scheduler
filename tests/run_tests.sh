@@ -32,6 +32,9 @@
 #   L2  tests/p2-install/test.sh        P2-15 发布评审（KernelSU/Magisk/APatch 安装结构 + 发布契约）
 #   L2  tests/config-v2/test.sh         P3-02 Canonical Task Config Store（双模式 legacy/managed、
 #       导入幂等/失败原子性/回滚/导出/新建 ID 命名空间/损坏回退/接线/POSIX）
+#   L2  tests/scheduler-prod/test.sh    P3-03 Registry 正式调度接管（双模式 legacy/managed、
+#       TriggerProvider→ActionProvider、同周期去重、配置变更不重复执行、损坏 KEPT、
+#       task.v2 快照移除监督兜底、旧 CLI 查询/终止、单任务错误隔离、审计日志、接线）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -105,6 +108,7 @@ else
         "tests/p2-integration/test.sh" \
         "tests/p2-install/test.sh" \
         "tests/config-v2/test.sh" \
+        "tests/scheduler-prod/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

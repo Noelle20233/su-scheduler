@@ -80,14 +80,19 @@ if [ "$RUNTIME_LOADED" -eq 1 ]; then
     trap 'crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
 fi
 
-# ⚙️ Registry Shadow Mode 启动旁路（P2-03）：建首快照 + 基线比对记录
+# ⚙️ 调度来源启动（P3-03）：Managed 模式 → sched_reload（task-config 权威快照，不再重扫
+#   config.txt）；Legacy 模式 → shadow_init + 生命周期 Registry 引导（P2-09，KEPT 回退）。
 # 🗺️ Canonical↔Legacy Run ID 映射（P2-04）：建映射供新 ID 查询；**不碰旧运行目录**
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
-    shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
+    if tcfg_is_managed; then
+        sched_reload "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
+    else
+        shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
+        # ⚙️ 生命周期 Registry 引导（P2-09）：shadow_init 之后补**最后有效快照**回退
+        #   （config 缺失 → registry_attach 只读挂载历史快照；KEPT 语义，不重扫配置）
+        lifecycle_startup_registry "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
+    fi
     runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
-    # ⚙️ 生命周期 Registry 引导（P2-09）：shadow_init 之后补**最后有效快照**回退
-    #   （config 缺失 → registry_attach 只读挂载历史快照；KEPT 语义，不重扫配置）
-    lifecycle_startup_registry "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
     for tid in $(registry_task_ids); do
         trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "${TRIGGER_BOOT_CONTEXT:-0}" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
     done
@@ -98,7 +103,7 @@ log_msg() {
     local level="$1"
     local message="$2"
     local timestamp="$(date "+%Y-%m-%d %H:%M:%S")"
-    
+
     case "$level" in
         INFO)    color="${C_BLUE}" ;;
         SUCCESS) color="${C_GREEN}" ;;
@@ -107,7 +112,7 @@ log_msg() {
         TASK)    color="${C_MAGENTA}" ;;
         *)       color="${C_CYAN}" ;;
     esac
-    
+
     # Log to file with colors (for cat/tail viewing)
     echo -e "${color}${C_BOLD}[$timestamp]${C_RESET} ${color}[$level]${C_RESET} $message" >> "$LOG_FILE"
 }
@@ -117,7 +122,7 @@ log_audit() {
     local type="$1"
     local message="$2"
     local timestamp="$(date "+%Y-%m-%d %H:%M:%S")"
-    
+
     case "$type" in
         CHANGE)  color="${C_CYAN}"   ; icon="📝" ;;
         GAP)     color="${C_RED}"    ; icon="⚠️"  ;;
@@ -125,7 +130,7 @@ log_audit() {
         WARNING) color="${C_YELLOW}" ; icon="❗" ;;
         *)       color="${C_WHITE}"  ; icon="🔍" ;;
     esac
-    
+
     echo -e "${C_BOLD}${color}[$timestamp]${C_RESET} ${color}$icon [$type] $message${C_RESET}" >> "$AUDIT_LOG"
 }
 
@@ -135,26 +140,26 @@ should_run_advanced_schedule() {
     local current_time="$2"
     local command_full="$3"
     local state_file="$DATA_DIR/schedule_state.txt"
-    
+
     # Create state file if it doesn't exist
     [ ! -f "$state_file" ] && touch "$state_file"
-    
+
     # Get current date components
     local current_day=$(date "+%d")        # Day of month (01-31)
     local current_month=$(date "+%m")      # Month (01-12)
     local current_year=$(date "+%Y")       # Year
     local current_dow=$(date "+%u")        # Day of week (1=Monday, 7=Sunday)
     local current_week=$(date "+%V")       # Week number (01-53)
-    
+
     # 🧬 Generate a unique task key based on the command content (MD5)
     # This ensures that different tasks scheduled at the same time don't conflict
     local cmd_hash=$(echo "$command_full" | md5sum | cut -d' ' -f1)
-    
+
     # 📅 Weekly schedule: weekly:DAY:HHMM (e.g., weekly:1:0800 = Monday at 8am)
     if echo "$trigger" | grep -q "^weekly:"; then
         local target_dow=$(echo "$trigger" | cut -d: -f2)
         local target_time=$(echo "$trigger" | cut -d: -f3)
-        
+
         if [ "$current_dow" = "$target_dow" ] && [ "$current_time" -ge "$target_time" ]; then
             local state_key="weekly_${target_dow}_${target_time}_${cmd_hash}_${current_year}${current_month}${current_day}"
             if ! grep -q "^$state_key$" "$state_file"; then
@@ -164,17 +169,17 @@ should_run_advanced_schedule() {
         fi
         return 1
     fi
-    
+
     # 📅 N-Weekly schedule: nweekly:N:DAY:HHMM (e.g., nweekly:2:1:0800 = Every 2 weeks on Monday at 8am)
     if echo "$trigger" | grep -q "^nweekly:"; then
         local n_weeks=$(echo "$trigger" | cut -d: -f2)
         local target_dow=$(echo "$trigger" | cut -d: -f3)
         local target_time=$(echo "$trigger" | cut -d: -f4)
-        
+
         if [ "$current_dow" = "$target_dow" ] && [ "$current_time" -ge "$target_time" ]; then
             local state_key="nweekly_${n_weeks}_${target_dow}_${target_time}_${cmd_hash}"
             local last_run=$(grep "^${state_key}=" "$state_file" | cut -d= -f2)
-            
+
             if [ -z "$last_run" ]; then
                 # First time run
                 echo "${state_key}=${current_week}" >> "$state_file"
@@ -189,12 +194,12 @@ should_run_advanced_schedule() {
         fi
         return 1
     fi
-    
+
     # 📅 Monthly schedule: monthly:DAY:HHMM (e.g., monthly:1:0800 = 1st of every month at 8am)
     if echo "$trigger" | grep -q "^monthly:"; then
         local target_day=$(echo "$trigger" | cut -d: -f2)
         local target_time=$(echo "$trigger" | cut -d: -f3)
-        
+
         if [ "$current_day" = "$target_day" ] && [ "$current_time" -ge "$target_time" ]; then
             local state_key="monthly_${target_day}_${target_time}_${cmd_hash}_${current_year}${current_month}"
             if ! grep -q "^$state_key$" "$state_file"; then
@@ -204,17 +209,17 @@ should_run_advanced_schedule() {
         fi
         return 1
     fi
-    
+
     # 📅 N-Monthly schedule: nmonthly:N:DAY:HHMM
     if echo "$trigger" | grep -q "^nmonthly:"; then
         local n_months=$(echo "$trigger" | cut -d: -f2)
         local target_day=$(echo "$trigger" | cut -d: -f3)
         local target_time=$(echo "$trigger" | cut -d: -f4)
-        
+
         if [ "$current_day" = "$target_day" ] && [ "$current_time" -ge "$target_time" ]; then
             local state_key="nmonthly_${n_months}_${target_day}_${target_time}_${cmd_hash}"
             local last_run_month=$(grep "^${state_key}=" "$state_file" | cut -d= -f2)
-            
+
             if [ -z "$last_run_month" ]; then
                 echo "${state_key}=${current_month}" >> "$state_file"
                 return 0
@@ -223,7 +228,7 @@ should_run_advanced_schedule() {
                 local last_total=$(( (current_year * 12) + last_run_month ))
                 # Adjustment for year rollover
                 if [ $total_months -lt $last_total ]; then last_total=$(( ( (current_year-1) * 12 ) + last_run_month )); fi
-                
+
                 local months_diff=$(( total_months - last_total ))
                 if [ $months_diff -ge "$n_months" ]; then
                     sed -i "s/^${state_key}=.*/${state_key}=${current_month}/" "$state_file"
@@ -233,13 +238,13 @@ should_run_advanced_schedule() {
         fi
         return 1
     fi
-    
+
     # 📅 Yearly schedule: yearly:MMDD:HHMM (e.g., yearly:1225:0800 = Dec 25th at 8am)
     if echo "$trigger" | grep -q "^yearly:"; then
         local target_date=$(echo "$trigger" | cut -d: -f2)
         local target_time=$(echo "$trigger" | cut -d: -f3)
         local current_mmdd="${current_month}${current_day}"
-        
+
         if [ "$current_mmdd" = "$target_date" ] && [ "$current_time" -ge "$target_time" ]; then
             local state_key="yearly_${target_date}_${target_time}_${cmd_hash}_${current_year}"
             if ! grep -q "^$state_key$" "$state_file"; then
@@ -249,7 +254,7 @@ should_run_advanced_schedule() {
         fi
         return 1
     fi
-    
+
     # Not an advanced schedule
     return 1
 }
@@ -260,7 +265,7 @@ send_notification() {
     local message="$2"
     local tag="${3:-su_scheduler_alert}"
     local priority="${4:-0}"  # 0=normal, 1=high
-    
+
     # Try multiple notification methods for compatibility
     if command -v cmd >/dev/null 2>&1; then
         # Modern Android notification service (via shell user 2000 for maximum reliability)
@@ -268,12 +273,12 @@ send_notification() {
         NOTIF_TITLE="$title" NOTIF_MSG="$message" NOTIF_TAG="$tag" \
         su -lp 2000 -c 'cmd notification post -S bigtext -t "$NOTIF_TITLE" "$NOTIF_TAG" "$NOTIF_MSG"' >/dev/null 2>&1
     fi
-    
+
     # Also try termux-notification if available (for Termux users)
     if command -v termux-notification >/dev/null 2>&1; then
         termux-notification --title "$title" --content "$message" --priority "$priority" --id "$tag" 2>/dev/null
     fi
-    
+
     # Log that we sent a notification
     log_msg "INFO" "📢 Notification sent [$tag]: $title - $message"
 }
@@ -281,36 +286,36 @@ send_notification() {
 # 📝 Track Configuration Changes
 track_config_changes() {
     [ ! -f "$CONFIG_FILE" ] && return
-    
+
     # If no snapshot exists, create one and return
     if [ ! -f "$CONFIG_SNAPSHOT" ]; then
         cp "$CONFIG_FILE" "$CONFIG_SNAPSHOT"
         return
     fi
-    
+
     # Check for additions/modifications (lines in config not in snapshot)
     cat "$CONFIG_FILE" | while read -r line; do
         # Ignore comments and empty lines
         clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
         [ -z "$clean_line" ] || echo "$clean_line" | grep -q "^#" && continue
-        
+
         if ! grep -qF "$line" "$CONFIG_SNAPSHOT"; then
              trigger=$(echo "$clean_line" | awk '{print $1}')
              log_audit "CHANGE" "New mission assignment detected: $trigger"
         fi
     done
-    
+
     # Check for removals
     cat "$CONFIG_SNAPSHOT" | while read -r line; do
         clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
         [ -z "$clean_line" ] || echo "$clean_line" | grep -q "^#" && continue
-        
+
         if ! grep -qF "$line" "$CONFIG_FILE" && ! echo "$line" | grep -q "\-\-run-once-now"; then
              trigger=$(echo "$clean_line" | awk '{print $1}')
              log_audit "CHANGE" "Mission terminated/removed: $trigger"
         fi
     done
-    
+
     # Sync snapshot
     cp "$CONFIG_FILE" "$CONFIG_SNAPSHOT"
 }
@@ -318,18 +323,18 @@ track_config_changes() {
 # ⚠️ Audit Execution Gaps (Downtime Detection)
 audit_check_gaps() {
     local now_ts=$(date +%s)
-    
+
     if [ -f "$LAST_PULSE_FILE" ]; then
         local last_pulse=$(cat "$LAST_PULSE_FILE")
         local diff=$((now_ts - last_pulse))
-        
+
         # If the gap is longer than 70 seconds (1 min buffer), something happened
         if [ $diff -gt 75 ]; then
             local gap_min=$((diff / 60))
             log_audit "GAP" "Station offline for ~$gap_min minutes. Some missions may have been skipped."
         fi
     fi
-    
+
     echo "$now_ts" > "$LAST_PULSE_FILE"
 }
 
@@ -342,7 +347,7 @@ execute_task() {
     local custom_msg="$5"
     local interactive="$6"
     local use_termux="$7"
-    
+
     # 🕵️ Collision Detection: Check if an identical command is already in progress
     if [ -d "$TASKS_DIR" ]; then
         for active_task in "$TASKS_DIR"/*; do
@@ -361,20 +366,20 @@ execute_task() {
             fi
         done
     fi
-    
+
     # Create a unique task directory for this execution
     local task_dir="$TASKS_DIR/$task_id"
     mkdir -p "$task_dir"
-    
+
     # Create lockfile for this specific task
     local task_lock="$task_dir/task.lock"
     echo $$ > "$task_lock"
-    
+
     # Task metadata
     echo "$cmd_to_run" > "$task_dir/command.txt"
     date "+%Y-%m-%d %H:%M:%S" > "$task_dir/start_time.txt"
     echo "RUNNING" > "$task_dir/status.txt"
-    
+
     # Log execution mode
     if [ "$use_termux" = "1" ]; then
         log_msg "TASK" "🐧 Task [$task_id] starting in TERMUX environment: $cmd_to_run"
@@ -383,28 +388,28 @@ execute_task() {
         log_msg "TASK" "🚀 Task [$task_id] starting: $cmd_to_run"
         echo "SYSTEM" > "$task_dir/exec_mode.txt"
     fi
-    
+
     # Send start notification if requested
     if [ "$notify_start" = "1" ]; then
         local start_msg="${custom_msg:-Task started}"
         send_notification "Su Scheduler - Task Started" "$start_msg: $cmd_to_run" "su_scheduler_$task_id"
     fi
-    
+
     # Execute the command based on mode
     if [ "$interactive" = "1" ]; then
         # 🎮 Interactive mode - Create a named pipe for real-time interaction
         local shell_fifo="$SHELLS_DIR/${task_id}.fifo"
         local shell_out="$SHELLS_DIR/${task_id}.out"
         local shell_in="$SHELLS_DIR/${task_id}.in"
-        
+
         # Create FIFOs for bidirectional communication
         mkfifo "$shell_in" 2>/dev/null || true
         mkfifo "$shell_fifo" 2>/dev/null || true
-        
+
         log_msg "INFO" "🎮 Interactive shell session created: $task_id"
         log_msg "INFO" "   Input:  $shell_in"
         log_msg "INFO" "   Output: $shell_out"
-        
+
         # Determine shell to use
         local shell_cmd="sh"
         if [ "$use_termux" = "1" ]; then
@@ -413,16 +418,16 @@ execute_task() {
                 shell_cmd="/system/bin/su-scheduler-termux exec sh"
             fi
         fi
-        
+
         # Run in interactive shell with I/O redirection
         (
             $shell_cmd -i < "$shell_in" > "$shell_out" 2>&1 &
             shell_pid=$!
             echo "$shell_pid" > "$task_dir/pid.txt"
-            
+
             # Send the command to the shell
             echo "$cmd_to_run" > "$shell_in"
-            
+
             wait $shell_pid
             exit_code=$?
             echo "$exit_code" > "$task_dir/exit_code.txt"
@@ -432,28 +437,28 @@ execute_task() {
         (
             # 🔒 CRITICAL: Ensure subshell runs from root directory
             cd / || exit 1
-            
+
             # 🧹 Clean environment to avoid shell interference (keep essential vars)
             export PATH="/system/bin:/system/xbin:/vendor/bin"
             export HOME="/data/local/tmp"
             unset TERMUX_VERSION TERMUX_APP_PID TERMUX_PREFIX PREFIX
-            
+
             # Redirect all errors to log file for debugging
             exec 2>> "$LOG_FILE"
-            
+
             # Debug: Mark subshell entry
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Subshell started for task $task_id" >> "$LOG_FILE"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Command: $cmd_to_run" >> "$LOG_FILE"
-            
+
             # 🐧 Check if Termux execution is requested
             if [ "$use_termux" = "1" ]; then
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 🐧 Executing in Termux environment..." >> "$LOG_FILE"
-                
+
                 # Check if Termux helper is available
                 if [ -x "/system/bin/su-scheduler-termux" ]; then
                     # Validate Termux installation
                     termux_status=$(/system/bin/su-scheduler-termux status)
-                    
+
                     if [ "$termux_status" = "READY" ]; then
                         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] ✅ Termux environment validated" >> "$LOG_FILE"
                         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Final Command (Termux): /system/bin/su-scheduler-termux exec \"$cmd_to_run\"" >> "$LOG_FILE"
@@ -476,25 +481,25 @@ execute_task() {
             else
                 # 🧠 Smart execution logic
                 first_arg=$(echo "$cmd_to_run" | awk '{print $1}')
-                
+
                 if [ -f "$first_arg" ]; then
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 📜 Detected script file: $first_arg" >> "$LOG_FILE"
-                    
+
                     if [ ! -x "$first_arg" ]; then
                         chmod +x "$first_arg" 2>/dev/null
                     fi
-                    
+
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Final Command (Script): sh -c \"$cmd_to_run\"" >> "$LOG_FILE"
                     sh -c "$cmd_to_run" > "$task_dir/output.log" 2>&1
                     exit_code=$?
-                    
+
                     if [ $exit_code -ne 0 ] && ([ $exit_code -eq 126 ] || [ $exit_code -eq 127 ]); then
                         if command -v bash >/dev/null 2>&1; then
                             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Final Command (Bash Fallback): bash \"$first_arg\" ..." >> "$LOG_FILE"
                             bash "$first_arg" $(echo "$cmd_to_run" | cut -d' ' -f2-) > "$task_dir/output.log" 2>&1
                             exit_code=$?
                         fi
-                        
+
                         if [ $exit_code -ne 0 ]; then
                             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Final Command (Sh Fallback): sh \"$first_arg\" ..." >> "$LOG_FILE"
                             sh "$first_arg" $(echo "$cmd_to_run" | cut -d' ' -f2-) > "$task_dir/output.log" 2>&1
@@ -509,14 +514,14 @@ execute_task() {
                     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Command exit code: $exit_code" >> "$LOG_FILE"
                 fi
             fi
-            
+
             echo "$exit_code" > "$task_dir/exit_code.txt"
             date "+%Y-%m-%d %H:%M:%S" > "$task_dir/end_time.txt"
-            
+
             if [ $exit_code -eq 0 ]; then
                 echo "SUCCESS" > "$task_dir/status.txt"
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [SUCCESS] ✅ Task [$task_id] completed successfully (exit: $exit_code)" >> "$LOG_FILE"
-                
+
                 if [ "$notify_end" = "1" ]; then
                     send_notification "Su Scheduler - Task Complete" "✅ $cmd_to_run" "su_scheduler_$task_id"
                 fi
@@ -525,12 +530,12 @@ execute_task() {
                 echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] ❌ Task [$task_id] failed (exit: $exit_code)" >> "$LOG_FILE"
                 send_notification "Su Scheduler - Task Failed" "❌ $cmd_to_run (exit: $exit_code)" "su_scheduler_$task_id"
             fi
-            
+
             rm -f "$task_lock"
             echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DEBUG] Subshell completed for task $task_id" >> "$LOG_FILE"
         ) &
     fi
-    
+
     # Store the background process PID
     echo $! > "$task_dir/pid.txt"
 }
@@ -539,7 +544,7 @@ execute_task() {
 # 🔍 Parse task modifiers from config line
 parse_modifiers() {
     local line="$1"
-    
+
     # Initialize flags
     notify_start=0
     notify_end=0
@@ -548,10 +553,10 @@ parse_modifiers() {
     use_termux=0
     run_once_now=0
     custom_msg=""
-    
+
     # Extract the modifier part (everything after the last ' : ')
     local mods=$(echo "$line" | sed -n 's/.* : //p')
-    
+
     if [ -n "$mods" ]; then
         # Check for --run-once-now
         echo "$mods" | grep -q "\-\-run-once-now" && run_once_now=1
@@ -570,7 +575,7 @@ parse_modifiers() {
         echo "$mods" | grep -q "\-\-interactive" && interactive=1
         # Check for --termux
         echo "$mods" | grep -q "\-\-termux" && use_termux=1
-        
+
         # Extract custom message if present: --msg="Your message"
         if echo "$mods" | grep -q "\-\-msg="; then
             custom_msg=$(echo "$mods" | sed -n 's/.*--msg="\([^"]*\)".*/\1/p')
@@ -584,7 +589,7 @@ extract_command() {
     # Logic: Preserve everything after the first space (trigger) 
     # but strip everything starting from the modifier separator ( : --)
     local raw_cmd=$(echo "$line" | cut -d' ' -f2-)
-    
+
     # Robustly strip modifiers: handles " : --", \"; : --\", etc.
     # We look for a space followed by an optional semicolon, then a colon, then a space and --
     echo "$raw_cmd" | sed 's/[ \t]*;*[ \t]*:[ \t]*--.*//'
@@ -640,30 +645,36 @@ log_msg "INFO" "🎬 Su Scheduler Daemon v$VERSION initialized (PID: $$)"
 log_msg "INFO" "🏁 Startup phase: Executing initialization tasks..."
 
 # 🎯 Check for BOOT tasks
-if [ -f "$CONFIG_FILE" ]; then
-    exec 3< "$CONFIG_FILE"
-    while IFS= read -r line <&3 || [ -n "$line" ]; do
-        clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
-        case "$clean_line" in
-            \#*) continue ;;
-            "") continue ;;
-        esac
-        
-        trigger=$(echo "$clean_line" | awk '{print $1}')
-        if [ "$trigger" = "boot" ]; then
-            parse_modifiers "$clean_line"
-            cmd_to_run=$(extract_command "$clean_line")
-            task_counter=$((task_counter + 1))
-            task_id="startup_${task_counter}_$(date +%s)"
-            # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
-            if [ "$RUNTIME_LOADED" -eq 1 ]; then
-                action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
-            else
-                execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+# P3-03：Registry 正式调度启动 boot（scheduler_boot → TriggerProvider→ActionProvider）；
+#        RUNTIME_LOADED=0 时保持 legacy 原样扫描（C2 fallback，含 P2-06 统一入口门控）
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    scheduler_boot "$DATA_DIR" "$CONFIG_FILE" "$TASKS_DIR" >> "$DATA_DIR/scheduler/audit.log" 2>/dev/null
+else
+    if [ -f "$CONFIG_FILE" ]; then
+        exec 3< "$CONFIG_FILE"
+        while IFS= read -r line <&3 || [ -n "$line" ]; do
+            clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
+            case "$clean_line" in
+                \#*) continue ;;
+                "") continue ;;
+            esac
+
+            trigger=$(echo "$clean_line" | awk '{print $1}')
+            if [ "$trigger" = "boot" ]; then
+                parse_modifiers "$clean_line"
+                cmd_to_run=$(extract_command "$clean_line")
+                task_counter=$((task_counter + 1))
+                task_id="startup_${task_counter}_$(date +%s)"
+                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                else
+                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                fi
             fi
-        fi
-    done
-    exec 3<&-
+        done
+        exec 3<&-
+    fi
 fi
 
 log_msg "INFO" "💓 Daemon pulse detected. Entering main loop. I'm watching you... in a good way!"
@@ -673,140 +684,145 @@ LAST_MTIME=0
 # 🔄 Main Event Loop
 while true; do
     current_time=$(date "+%H%M")
-    
-    if [ -f "$CONFIG_FILE" ]; then
-        # Hot reload: Check if config file was modified
-        CURRENT_MTIME=$(ls -l "$CONFIG_FILE" | awk '{print $6$7$8}')
-        if [ "$CURRENT_MTIME" != "$LAST_MTIME" ]; then
-            log_msg "INFO" "🔥 New configuration detected! Hot reloading presets..."
-            LAST_MTIME=$CURRENT_MTIME
-        fi
 
-        # ⚙️ Registry Shadow Mode tick（P2-03，旁路比对；不改 legacy 执行路径）
+    if [ "$RUNTIME_LOADED" -eq 1 ]; then
+        # ⚙️ Registry 正式调度（P3-03）：TriggerProvider→ActionProvider→Supervisor
+        scheduler_tick "$DATA_DIR" "$CONFIG_FILE" "$TASKS_DIR" "$current_time" >/dev/null 2>&1
         # 🗺️ ID 映射随快照刷新（P2-04，幂等；不重命名旧运行目录）
-        if [ "$RUNTIME_LOADED" -eq 1 ]; then
+        runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+        # ⚙️ legacy 模式（无 MANAGED）保留 shadow 旁路比对（P2-03/P2-04）
+        if ! tcfg_is_managed; then
             shadow_tick "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
-            runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
             for tid in $(registry_task_ids); do
                 trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "0" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
             done
-            # ⚙️ 统一状态对账（P2-07，RUNTIME_LOADED 门控旁路）：exit_code.txt 出现
-            # → 终态双写（成功 → STOPPED，一次性任务不虚假 HEALTHY；失败 → FAILED）；
-            # 已终态幂等跳过。非法/异常目录不中止本轮（单目录错误只置 rc）。
-            state_sync_all "$TASKS_DIR" >/dev/null 2>&1
-            # ⚙️ Supervisor 统一事件循环（P2-12，RUNTIME_LOADED 门控旁路）：每轮对
-            # 每个受监督任务至多一步（RUNNING→HEALTHY→UNHEALTHY→RECOVERING→
-            # STARTING|FAILED）；无每任务常驻线程/循环（daemon 主循环唯一）。
-            supervisor_tick "$TASKS_DIR" "$DATA_DIR" >/dev/null 2>&1
-            # ⚙️ 资源保护（P2-14，每 tick）：日志截断（LOG_MAX_BYTES）+ 快照/
-            #   任务目录上限修剪（SNAP_MAX_KEEP / TASK_DIRS_MAX；活跃运行目录保留）
-            runtime_protect "$DATA_DIR" >/dev/null 2>&1
-            runtime_protect_tasks "$TASKS_DIR" >/dev/null 2>&1
         fi
+        # ⚙️ 统一状态对账（P2-07，RUNTIME_LOADED 门控旁路）：exit_code.txt 出现
+        # → 终态双写（成功 → STOPPED，一次性任务不虚假 HEALTHY；失败 → FAILED）；
+        # 已终态幂等跳过。非法/异常目录不中止本轮（单目录错误只置 rc）。
+        state_sync_all "$TASKS_DIR" >/dev/null 2>&1
+        # ⚙️ Supervisor 统一事件循环（P2-12，RUNTIME_LOADED 门控旁路）：每轮对
+        # 每个受监督任务至多一步（RUNNING→HEALTHY→UNHEALTHY→RECOVERING→
+        # STARTING|FAILED）；无每任务常驻线程/循环（daemon 主循环唯一）。
+        supervisor_tick "$TASKS_DIR" "$DATA_DIR" >/dev/null 2>&1
+        # ⚙️ 资源保护（P2-14，每 tick）：日志截断（LOG_MAX_BYTES）+ 快照/
+        #   任务目录上限修剪（SNAP_MAX_KEEP / TASK_DIRS_MAX；活跃运行目录保留）
+        runtime_protect "$DATA_DIR" >/dev/null 2>&1
+        runtime_protect_tasks "$TASKS_DIR" >/dev/null 2>&1
+    else
+        # ⚠️ RUNTIME_LOADED=0：legacy config.txt 原样扫描执行（C2 fallback）
+        if [ -f "$CONFIG_FILE" ]; then
+            # Hot reload: Check if config file was modified
+            CURRENT_MTIME=$(ls -l "$CONFIG_FILE" | awk '{print $6$7$8}')
+            if [ "$CURRENT_MTIME" != "$LAST_MTIME" ]; then
+                log_msg "INFO" "🔥 New configuration detected! Hot reloading presets..."
+                LAST_MTIME=$CURRENT_MTIME
+            fi
 
-        task_counter=0
-        
-        # 🕵️ Scan the schedule using FD 3
-        exec 3< "$CONFIG_FILE"
-        while IFS= read -r line <&3 || [ -n "$line" ]; do
-             clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
-             
-             case "$clean_line" in
-                \#*) continue ;;
-                "") continue ;;
-            esac
-            
-            # 📜 Heredoc parsing
-            if echo "$clean_line" | grep -q '<<EOF'; then
-                trigger=$(echo "$clean_line" | awk '{print $1}')
-                cmd_start=$(echo "$clean_line" | sed 's/^[^ ]* //' | sed 's/ *<<EOF.*//')
-                
-                multiline_cmd=""
-                while IFS= read -r block_line <&3; do
-                    if echo "$block_line" | grep -q '^EOF'; then
-                        break
-                    fi
-                    multiline_cmd="${multiline_cmd}${block_line}
+            task_counter=0
+
+            # 🕵️ Scan the schedule using FD 3
+            exec 3< "$CONFIG_FILE"
+            while IFS= read -r line <&3 || [ -n "$line" ]; do
+                 clean_line=$(echo "$line" | sed 's/^[ \t]*//;s/[ \t]*$//')
+
+                 case "$clean_line" in
+                    \#*) continue ;;
+                    "") continue ;;
+                esac
+
+                # 📜 Heredoc parsing
+                if echo "$clean_line" | grep -q '<<EOF'; then
+                    trigger=$(echo "$clean_line" | awk '{print $1}')
+                    cmd_start=$(echo "$clean_line" | sed 's/^[^ ]* //' | sed 's/ *<<EOF.*//')
+
+                    multiline_cmd=""
+                    while IFS= read -r block_line <&3; do
+                        if echo "$block_line" | grep -q '^EOF'; then
+                            break
+                        fi
+                        multiline_cmd="${multiline_cmd}${block_line}
 "
-                done
-                
-                clean_line="$trigger $cmd_start '$multiline_cmd'; : $(echo "$clean_line" | sed -n 's/.*\(: --[^;]*\).*/\1/p')"
-            fi
-            
-            # Normalize trigger
-            trigger=$(echo "$clean_line" | awk '{print $1}')
-            trigger_norm=$(echo "$trigger" | sed 's/://g')
-            
-            # 🚀 Check for immediate execution request
-            parse_modifiers "$clean_line"
-            if [ "$run_once_now" = "1" ]; then
-                log_msg "INFO" "⚡ Immediate execution triggered: $trigger"
-                cmd_to_run=$(extract_command "$clean_line")
-                task_counter=$((task_counter + 1))
-                task_id="immediate_${task_counter}_$(date +%s)"
-                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
-                if [ "$RUNTIME_LOADED" -eq 1 ]; then
-                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
-                else
-                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
-                fi
-                
-                # Prune the --run-once-now modifier from the file
-                log_msg "INFO" "✂️ Pruning --run-once-now from config"
-                # We use a unique marker to avoid double-processing during sed
-                new_line=$(echo "$line" | sed "s/--run-once-now//; s/  */ /g; s/ :[ 	]*$//; s/[ 	]*$//")
-                awk -v old="$line" -v new="$new_line" '{if ($0 == old) print new; else print $0}' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
-                continue
-            fi
+                    done
 
-            # 🎯 Check advanced schedules
-            if should_run_advanced_schedule "$trigger" "$current_time" "$clean_line"; then
-                log_msg "INFO" "📅 Advanced schedule matched: $trigger"
+                    clean_line="$trigger $cmd_start '$multiline_cmd'; : $(echo "$clean_line" | sed -n 's/.*\(: --[^;]*\).*/\1/p')"
+                fi
+
+                # Normalize trigger
+                trigger=$(echo "$clean_line" | awk '{print $1}')
+                trigger_norm=$(echo "$trigger" | sed 's/://g')
+
+                # 🚀 Check for immediate execution request
                 parse_modifiers "$clean_line"
-                cmd_to_run=$(extract_command "$clean_line")
-                task_counter=$((task_counter + 1))
-                task_id="advanced_${task_counter}_$(date +%s)"
-                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
-                if [ "$RUNTIME_LOADED" -eq 1 ]; then
-                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
-                else
-                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                if [ "$run_once_now" = "1" ]; then
+                    log_msg "INFO" "⚡ Immediate execution triggered: $trigger"
+                    cmd_to_run=$(extract_command "$clean_line")
+                    task_counter=$((task_counter + 1))
+                    task_id="immediate_${task_counter}_$(date +%s)"
+                    # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                    if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                        action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                    else
+                        execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                    fi
+
+                    # Prune the --run-once-now modifier from the file
+                    log_msg "INFO" "✂️ Pruning --run-once-now from config"
+                    # We use a unique marker to avoid double-processing during sed
+                    new_line=$(echo "$line" | sed "s/--run-once-now//; s/  */ /g; s/ :[ 	]*$//; s/[ 	]*$//")
+                    awk -v old="$line" -v new="$new_line" '{if ($0 == old) print new; else print $0}' "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+                    continue
                 fi
-                
-                if [ $delete_after -eq 1 ]; then
-                     log_msg "INFO" "💥 Boom. Task deleted."
-                     # Q13 修复（P2-01，设备冒烟实证）：`grep -v -F` 在配置只剩
-                     # 该删除行时输出为空且退出码 1 → `&&` 短路、行未被移除（tmp
-                     # 残留 0 字节）。改为分号连接：mv 始终执行（尽力而为删除）。
-                     grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
-                     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+
+                # 🎯 Check advanced schedules
+                if should_run_advanced_schedule "$trigger" "$current_time" "$clean_line"; then
+                    log_msg "INFO" "📅 Advanced schedule matched: $trigger"
+                    parse_modifiers "$clean_line"
+                    cmd_to_run=$(extract_command "$clean_line")
+                    task_counter=$((task_counter + 1))
+                    task_id="advanced_${task_counter}_$(date +%s)"
+                    # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                    if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                        action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                    else
+                        execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                    fi
+
+                    if [ $delete_after -eq 1 ]; then
+                         log_msg "INFO" "💥 Boom. Task deleted."
+                         # Q13 修复（P2-01，设备冒烟实证）：`grep -v -F` 在配置只剩
+                         # 该删除行时输出为空且退出码 1 → `&&` 短路、行未被移除（tmp
+                         # 残留 0 字节）。改为分号连接：mv 始终执行（尽力而为删除）。
+                         grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+                         mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                    fi
+                # 🎯 Check standard time
+                elif [ "$trigger_norm" = "$current_time" ]; then
+                    parse_modifiers "$clean_line"
+                    cmd_to_run=$(extract_command "$clean_line")
+                    task_counter=$((task_counter + 1))
+                    task_id="time_${current_time}_${task_counter}_$(date +%s)"
+                    # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
+                    if [ "$RUNTIME_LOADED" -eq 1 ]; then
+                        action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
+                    else
+                        execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
+                    fi
+
+                    if [ $delete_after -eq 1 ]; then
+                         log_msg "INFO" "💥 Boom. Task deleted."
+                         # Q13 修复（P2-01，设备冒烟实证）：`grep -v -F` 在配置只剩
+                         # 该删除行时输出为空且退出码 1 → `&&` 短路、行未被移除（tmp
+                         # 残留 0 字节）。改为分号连接：mv 始终执行（尽力而为删除）。
+                         grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
+                         mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                    fi
                 fi
-            # 🎯 Check standard time
-            elif [ "$trigger_norm" = "$current_time" ]; then
-                parse_modifiers "$clean_line"
-                cmd_to_run=$(extract_command "$clean_line")
-                task_counter=$((task_counter + 1))
-                task_id="time_${current_time}_${task_counter}_$(date +%s)"
-                # P2-06：经统一 Action 入口运行（RUNTIME_LOADED 门控；legacy 原样 fallback）
-                if [ "$RUNTIME_LOADED" -eq 1 ]; then
-                    action_run "$task_id" "$cmd_to_run" "$use_termux" "$interactive" "$notify_start" "$notify_end" "$custom_msg" >/dev/null 2>&1
-                else
-                    execute_task "$task_id" "$cmd_to_run" "$notify_start" "$notify_end" "$custom_msg" "$interactive" "$use_termux" < /dev/null
-                fi
-                
-                if [ $delete_after -eq 1 ]; then
-                     log_msg "INFO" "💥 Boom. Task deleted."
-                     # Q13 修复（P2-01，设备冒烟实证）：`grep -v -F` 在配置只剩
-                     # 该删除行时输出为空且退出码 1 → `&&` 短路、行未被移除（tmp
-                     # 残留 0 字节）。改为分号连接：mv 始终执行（尽力而为删除）。
-                     grep -v -F "$line" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp"
-                     mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
-                fi
-            fi
-        done
-        exec 3<&-
+            done
+            exec 3<&-
+        fi
     fi
-    
+
     # 💤 Nap until the start of the next minute
     # This keeps us perfectly synced with the system clock!
     sleep $((60 - $(date +%S)))
