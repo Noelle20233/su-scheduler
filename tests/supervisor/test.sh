@@ -35,6 +35,8 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
 . ./$RTLIB
+# P2-14：健康探针最小间隔节流对本套件关闭（行为保持逐 tick 探活）
+export HEALTH_MIN_INTERVAL=0
 
 # ── 工具：找空闲端口 + 造 registry 快照 + 造运行目录 ───────────────────────
 pick_free_port() {

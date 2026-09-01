@@ -66,6 +66,20 @@ else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Runtime library unavailable ($RUNTIME_LIB); legacy mode active" >> "$LOG_FILE" 2>/dev/null
 fi
 
+# ⚙️ Crash Loop 保护（P2-14）：进入任何启动工作前先登记本次启动 / 评估前次异常
+#   退出。降级（rc 2）或节流（rc 3）→ 记 WARNING 后快速退出（不写锁、不建
+#   registry、不跑 boot 任务）；优雅退出经 trap 记 last_clean=1（CLI stop/restart
+#   不受影响）。参数默认值：CRASH_WINDOW=60 CRASH_THRESHOLD=3 CRASH_MIN_UPTIME=30
+#   CRASH_COOLDOWN=300 CRASH_MIN_START_INTERVAL=10。
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    crash_guard_enter "$DATA_DIR" >/dev/null 2>&1
+    if [ "$?" -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Crash-guard throttle/degraded; fast-exit" >> "$LOG_FILE" 2>/dev/null
+        exit 0
+    fi
+    trap 'crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
+fi
+
 # ⚙️ Registry Shadow Mode 启动旁路（P2-03）：建首快照 + 基线比对记录
 # 🗺️ Canonical↔Legacy Run ID 映射（P2-04）：建映射供新 ID 查询；**不碰旧运行目录**
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
@@ -684,6 +698,10 @@ while true; do
             # 每个受监督任务至多一步（RUNNING→HEALTHY→UNHEALTHY→RECOVERING→
             # STARTING|FAILED）；无每任务常驻线程/循环（daemon 主循环唯一）。
             supervisor_tick "$TASKS_DIR" "$DATA_DIR" >/dev/null 2>&1
+            # ⚙️ 资源保护（P2-14，每 tick）：日志截断（LOG_MAX_BYTES）+ 快照/
+            #   任务目录上限修剪（SNAP_MAX_KEEP / TASK_DIRS_MAX；活跃运行目录保留）
+            runtime_protect "$DATA_DIR" >/dev/null 2>&1
+            runtime_protect_tasks "$TASKS_DIR" >/dev/null 2>&1
         fi
 
         task_counter=0

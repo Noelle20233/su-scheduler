@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.11.0"
+RUNTIME_LIB_VERSION="1.12.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2220,15 +2220,37 @@ supervisor_step() {
     target=${spec#*:}
     case "$cur" in
         RUNNING)
+            # P2-14：运行时钟起点（supervisor.since 首次监督该 RUNNING 时落桩）
+            if [ ! -e "$rd/supervisor.since" ]; then
+                date +%s > "$rd/supervisor.since" 2>/dev/null
+            fi
+            # P2-14：运行超时护栏（TASK_RUNTIME_MAX>0 且超时 → FAILED 终止）
+            if supervisor_runtime_exceeded "$rd"; then
+                supervisor_stop_task "$rd" 1
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "runtime-limit exceeded" >/dev/null 2>&1 && return 1
+            fi
+            # P2-14：健康探针最小间隔（HEALTH_MIN_INTERVAL>0 时按 health.last 节流）
             # 首检通过 → HEALTHY（TSM: RUNNING>HEALTHY）；失败/UNKNOWN → 保持 RUNNING
-            if health_check "$kind" "$target" >/dev/null 2>&1; then
-                state_log_event "$rd" "$id" supervisor HEALTHY "" "" "probe ok" >/dev/null 2>&1 && return 1
+            if supervisor_health_due "$rd"; then
+                supervisor_health_mark "$rd"
+                if health_check "$kind" "$target" >/dev/null 2>&1; then
+                    state_log_event "$rd" "$id" supervisor HEALTHY "" "" "probe ok" >/dev/null 2>&1 && return 1
+                fi
             fi
             return 0 ;;
         HEALTHY)
-            st=$(health_check "$kind" "$target" 2>/dev/null | cut -d'|' -f1)
-            if [ "$st" = "UNHEALTHY" ]; then
-                state_log_event "$rd" "$id" supervisor UNHEALTHY "" "" "probe unhealthy" >/dev/null 2>&1 && return 1
+            # P2-14：运行超时护栏（超时 → FAILED 终止）
+            if supervisor_runtime_exceeded "$rd"; then
+                supervisor_stop_task "$rd" 1
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "runtime-limit exceeded" >/dev/null 2>&1 && return 1
+            fi
+            # P2-14：健康探针最小间隔（HEALTH_MIN_INTERVAL 内不重复探）
+            if supervisor_health_due "$rd"; then
+                supervisor_health_mark "$rd"
+                st=$(health_check "$kind" "$target" 2>/dev/null | cut -d'|' -f1)
+                if [ "$st" = "UNHEALTHY" ]; then
+                    state_log_event "$rd" "$id" supervisor UNHEALTHY "" "" "probe unhealthy" >/dev/null 2>&1 && return 1
+                fi
             fi
             return 0 ;;
         UNHEALTHY)
@@ -2267,7 +2289,7 @@ supervisor_step() {
             if supervisor_recover "$rd" "$tf" >/dev/null 2>&1; then
                 state_log_event "$rd" "$id" supervisor STARTING "" "" "recovery attempt $cnt ok ($(grep '^recovery.type=' "$tf" | head -1 | cut -d= -f2-))" >/dev/null 2>&1
                 state_log_event "$rd" "$id" supervisor RUNNING "" "" "recovered" >/dev/null 2>&1
-                rm -f "$rd/recovery.count" "$rd/recovery.next" "$rd/recovery.cooldown_until" 2>/dev/null
+                rm -f "$rd/recovery.count" "$rd/recovery.next" "$rd/recovery.cooldown_until" "$rd/supervisor.since" 2>/dev/null
                 return 1
             fi
             return 0 ;;
@@ -2295,6 +2317,247 @@ supervisor_tick() {
     return 0
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §18 Crash Loop 保护与资源保护（P2-14）
+# ───────────────────────────────────────────────────────────────────────────
+# 目标：daemon 异常退出（SIGKILL / 启动即崩）不得无限重启风暴；
+#       运行日志 / 快照 / 任务目录不得无限膨胀。
+# 判定模型：
+#   - 崩溃证据 = **前一次运行**异常死亡（无 exit 记录 / 退出早于启动 /
+#     存活 ≤ CRASH_MIN_UPTIME 且非优雅退出）；SIGKILL 不留退出记录 → 下次进入计 1 次。
+#   - 时间窗内（CRASH_WINDOW）连续异常 ≥ CRASH_THRESHOLD → 降级窗口
+#     （CRASH_COOLDOWN 内 crash_guard_enter 快速退出 rc 2，不做任何启动工作）。
+#   - 异常退出后立即重启 → 节流（CRASH_MIN_START_INTERVAL 内 rc 3）。
+#   - 优雅退出（TERM/INT/HUP trap → crash_record_exit，last_clean=1）→ 计数清零。
+#   - 全部参数可经环境覆盖（daemon 端默认值见 su-schedulerd 加载段）。
+# 约束：新增函数不使用 while/for/后台派生（§17 supervisor_step 结构断言不受影响）。
+CRASH_WINDOW=${CRASH_WINDOW:-60}
+CRASH_THRESHOLD=${CRASH_THRESHOLD:-3}
+CRASH_MIN_UPTIME=${CRASH_MIN_UPTIME:-30}
+CRASH_COOLDOWN=${CRASH_COOLDOWN:-300}
+CRASH_MIN_START_INTERVAL=${CRASH_MIN_START_INTERVAL:-10}
+HEALTH_MIN_INTERVAL=${HEALTH_MIN_INTERVAL:-30}
+TASK_RUNTIME_MAX=${TASK_RUNTIME_MAX:-86400}
+LOG_MAX_BYTES=${LOG_MAX_BYTES:-262144}
+SNAP_MAX_KEEP=${SNAP_MAX_KEEP:-30}
+TASK_DIRS_MAX=${TASK_DIRS_MAX:-200}
+
+crash_guard_file() {   # <base> → 守护文件绝对路径
+    echo "$1/runtime/daemon.guard"
+}
+crash_read() {   # <guard_file> <key>
+    grep "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2-
+}
+crash_write() {   # <guard_file> <key> <value>（临时文件 + mv 原子写）
+    f=$1; k=$2; v=$3
+    mkdir -p "$(dirname "$f")" 2>/dev/null
+    t="$f.tmp.$$"
+    if [ -f "$f" ]; then
+        grep -v "^$k=" "$f" > "$t" 2>/dev/null
+    else
+        : > "$t"
+    fi
+    printf '%s=%s\n' "$k" "$v" >> "$t" 2>/dev/null
+    mv "$t" "$f" 2>/dev/null
+}
+
+# 进入启动序列（daemon 加载段调用）：<base> → 0=放行并记录本次启动
+#                                   2=降级窗口内快速退出  3=节流快速退出
+crash_guard_enter() {
+    base=$1
+    gf=$(crash_guard_file "$base")
+    now=$(date +%s)
+    starts=$(crash_read "$gf" starts);      [ -n "$starts" ] || starts=0
+    exits=$(crash_read "$gf" exits);        [ -n "$exits" ] || exits=0
+    last_start=$(crash_read "$gf" last_start)
+    last_exit=$(crash_read "$gf" last_exit)
+    last_clean=$(crash_read "$gf" last_clean);  [ -n "$last_clean" ] || last_clean=0
+    eval_start=$(crash_read "$gf" eval_start);  [ -n "$eval_start" ] || eval_start=0
+    crash_seq=$(crash_read "$gf" crash_seq);    [ -n "$crash_seq" ] || crash_seq=0
+    degraded_until=$(crash_read "$gf" degraded_until)
+
+    # ① 降级窗口：COOLDOWN 未到 → 快速退出（不写锁、不建 registry、不跑 boot 任务）
+    if [ -n "$degraded_until" ] && [ "$now" -lt "$degraded_until" ]; then
+        return 2
+    fi
+
+    # ② 前次运行健康评估（幂等：eval_start 记已评估的 starts 计数值，每新启动
+    #    至多评估一次——用单调 starts 而非秒级 last_start 时间戳，避免同秒内
+    #    两次启动时间戳相同导致评估被跳过）
+    if [ -n "$last_start" ] && [ "$eval_start" -lt "$starts" ]; then
+        abnormal=0
+        if [ "$last_clean" != "1" ]; then
+            # 无退出记录（SIGKILL）或退出早于启动，或存活 ≤ CRASH_MIN_UPTIME → 异常
+            if [ -z "$last_exit" ] || [ "$last_exit" -lt "$last_start" ] || \
+               [ $((last_exit - last_start)) -le "$CRASH_MIN_UPTIME" ]; then
+                abnormal=1
+            fi
+        fi
+        if [ "$abnormal" -eq 1 ]; then
+            # 距上次启动超出时间窗 → 计数重置为 1；否则窗口内连续计数
+            if [ $((now - last_start)) -gt "$CRASH_WINDOW" ]; then
+                crash_seq=1
+            else
+                crash_seq=$((crash_seq + 1))
+            fi
+        else
+            crash_seq=0
+        fi
+        crash_write "$gf" crash_seq "$crash_seq"
+        if [ "$crash_seq" -ge "$CRASH_THRESHOLD" ]; then
+            degraded_until=$((now + CRASH_COOLDOWN))
+            crash_write "$gf" degraded_until "$degraded_until"
+        fi
+        crash_write "$gf" eval_start "$starts"
+    fi
+
+    # ②b 评估后再次检查降级窗口（阈值命中即刻快速退出，不重复计数）
+    if [ -n "$degraded_until" ] && [ "$now" -lt "$degraded_until" ]; then
+        return 2
+    fi
+
+    # ③ 节流：前次异常退出且距上次启动 < CRASH_MIN_START_INTERVAL → 快速退出
+    if [ "$last_clean" != "1" ] && [ -n "$last_start" ] && [ "$now" -lt $((last_start + CRASH_MIN_START_INTERVAL)) ]; then
+        return 3
+    fi
+
+    # ④ 记录本次启动（starts++；前次无退出记录 → exits++ 一并补记）
+    starts=$((starts + 1))
+    if [ -n "$last_start" ] && { [ -z "$last_exit" ] || [ "$last_exit" -lt "$last_start" ]; }; then
+        exits=$((exits + 1))
+    fi
+    crash_write "$gf" starts "$starts"
+    crash_write "$gf" exits "$exits"
+    crash_write "$gf" last_start "$now"
+    crash_write "$gf" last_clean 0
+    return 0
+}
+
+# 优雅退出记录（daemon trap 处理器）：<base> <rc> → last_clean=1（下次进入不视为崩溃）
+crash_record_exit() {
+    base=$1; rc=${2:-0}
+    gf=$(crash_guard_file "$base")
+    now=$(date +%s)
+    exits=$(crash_read "$gf" exits);  [ -n "$exits" ] || exits=0
+    exits=$((exits + 1))
+    crash_write "$gf" exits "$exits"
+    crash_write "$gf" last_exit "$now"
+    crash_write "$gf" last_exit_rc "$rc"
+    crash_write "$gf" last_clean 1
+    return 0
+}
+
+# 日志截断：<file> <max_bytes> → 超限则保留尾部 max/2 字节（临时文件 + mv 原子）
+runtime_limit_log() {
+    f=$1; max=$2
+    [ -f "$f" ] || return 0
+    sz=$(wc -c < "$f" 2>/dev/null)
+    [ -n "$sz" ] && [ "$sz" -gt "$max" ] || return 0
+    keep=$((max / 2))
+    t="$f.tmp.$$"
+    tail -c "$keep" "$f" > "$t" 2>/dev/null && mv "$t" "$f" 2>/dev/null
+    return 0
+}
+
+# 运行目录是否活跃：pid.txt 进程存活 或 状态机处于运行态
+runtime_dir_active() {
+    rd=$1
+    pid=$(cat "$rd/pid.txt" 2>/dev/null)
+    if [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null; then
+        return 0
+    fi
+    st=$(cat "$rd/status.txt" 2>/dev/null)
+    case "$st" in
+        STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|STOPPING) return 0 ;;
+    esac
+    return 1
+}
+
+# 任务目录上限修剪：<tasks_dir> <max> → 最新（ls -t）优先，超限且非活跃的删除
+runtime_prune_tasks() {
+    td=$1; max=$2
+    [ -d "$td" ] || return 0
+    n=0
+    for rd in $(ls -dt "$td"/* 2>/dev/null); do
+        [ -d "$rd" ] || continue
+        n=$((n + 1))
+        [ "$n" -le "$max" ] && continue
+        if runtime_dir_active "$rd"; then
+            continue
+        fi
+        rm -rf "$rd" 2>/dev/null
+    done
+    return 0
+}
+
+# 快照上限修剪：<base> <max> → 保留 current 指针所指快照 + 其余最新 max 个
+runtime_prune_snapshots() {
+    base=$1; max=$2
+    sd="$base/snapshots"
+    [ -d "$sd" ] || return 0
+    cur=$(cat "$base/current" 2>/dev/null)
+    keep_cur=""
+    [ -n "$cur" ] && [ -d "$sd/$cur" ] && keep_cur="$sd/$cur"
+    [ "$max" -lt 1 ] && max=1
+    n=0
+    for sp in $(ls -dt "$sd"/snap_* 2>/dev/null); do
+        [ -d "$sp" ] || continue
+        if [ -n "$keep_cur" ] && [ "$sp" = "$keep_cur" ]; then
+            continue
+        fi
+        n=$((n + 1))
+        [ "$n" -le "$max" ] && continue
+        rm -rf "$sp" 2>/dev/null
+    done
+    return 0
+}
+
+# 总资源保护（daemon 每 tick）：<base> → 日志截断 + 快照修剪
+runtime_protect() {
+    base=$1
+    runtime_limit_log "$base/su-scheduler.log" "$LOG_MAX_BYTES"
+    runtime_limit_log "$base/audit/audit.log" "$LOG_MAX_BYTES"
+    runtime_limit_log "$base/shadow/shadow.log" "$LOG_MAX_BYTES"
+    runtime_prune_snapshots "$base" "$SNAP_MAX_KEEP"
+    return 0
+}
+
+# 任务目录资源保护（daemon 每 tick）：<tasks_dir> → 目录数上限修剪
+runtime_protect_tasks() {
+    td=$1
+    runtime_prune_tasks "$td" "$TASK_DIRS_MAX"
+    return 0
+}
+
+# 健康探针到期判定：<run_dir> → 0=应探活 1=未到期（HEALTH_MIN_INTERVAL ≤0 → 恒到期）
+supervisor_health_due() {
+    rd=$1
+    [ "$HEALTH_MIN_INTERVAL" -le 0 ] 2>/dev/null && return 0
+    last=$(cat "$rd/health.last" 2>/dev/null)
+    [ -n "$last" ] || return 0
+    now=$(date +%s)
+    if [ $((now - last)) -ge "$HEALTH_MIN_INTERVAL" ]; then
+        return 0
+    fi
+    return 1
+}
+supervisor_health_mark() {   # <run_dir>
+    date +%s > "$1/health.last" 2>/dev/null
+    return 0
+}
+
+# 运行超时判定：<run_dir> → 0=超时 1=未超时（TASK_RUNTIME_MAX ≤0 → 恒不超时）
+supervisor_runtime_exceeded() {
+    rd=$1
+    [ "$TASK_RUNTIME_MAX" -le 0 ] 2>/dev/null && return 1
+    since=$(cat "$rd/supervisor.since" 2>/dev/null)
+    [ -n "$since" ] || return 1
+    now=$(date +%s)
+    if [ $((now - since)) -ge "$TASK_RUNTIME_MAX" ]; then
+        return 0
+    fi
+    return 1
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -2307,7 +2570,9 @@ runtime_lib_selfcheck() {
               tpr_action_app_validate tpr_action_app_start health_check \
               tpr_health_process_check tpr_health_port_check supervisor_step \
               supervisor_tick supervisor_health_spec supervisor_recover \
-              supervisor_stop_task; do
+              supervisor_stop_task crash_guard_enter crash_record_exit \
+              runtime_protect runtime_protect_tasks supervisor_health_due \
+              supervisor_runtime_exceeded; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

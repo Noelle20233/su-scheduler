@@ -33,6 +33,8 @@ T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
 . ./$RTLIB
+# P2-14：健康探针最小间隔节流对恢复闭环逐 tick 探活不产生扰动
+export HEALTH_MIN_INTERVAL=0
 
 pick_free_port() {
     p=38000

@@ -1395,6 +1395,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | Process/Port Health（P2-11：Process Check / Port Check、统一三态 HEALTHY/UNHEALTHY/UNKNOWN + 原因 + 延迟 + 目标、真实监听验证、P2-07 健康门槛打开） | `tests/health/test.sh` |
 | L2 | Supervisor 核心（P2-12：RUNNING→HEALTHY→UNHEALTHY→RECOVERING→STARTING\|FAILED 完整生命周期、统一事件循环无每任务常驻循环、恢复策略 retry.max/interval、真实 nc 闭环） | `tests/supervisor/test.sh` |
 | L2 | Recovery/Retry/Cooldown（P2-13：Restart/Start/Stop+Start/Execute Script 恢复动作、max_retry 钳制禁止无限重启、retry.interval 节奏、基础 cooldown） | `tests/recovery/test.sh` |
+| L2 | Crash Loop 与资源保护（P2-14：guard 降级窗口/节流/优雅重置、SIGKILL 崩溃序列抑制、日志/任务目录/快照上限、健康探针最小间隔、运行超时护栏、fake daemon 真实链路） | `tests/crashguard/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |
