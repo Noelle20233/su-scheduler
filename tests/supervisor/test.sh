@@ -159,7 +159,8 @@ mk_snapshot "$BASE_F" \
 registry_attach "$BASE_F" >/dev/null 2>&1
 mk_run "$TASKS_F" RECOVERING
 TPR_ACTION_DIR="$TASKS_F" supervisor_step "$TASKS_F/t50_8080" "$BASE_F/snapshots/snap_1/t50_8080.task" >/dev/null 2>&1
-[ "$(cat "$TASKS_F/t50_8080/state.txt" 2>/dev/null)" = "FAILED" ] && ok "P2-12 policy: retry.max=1 + relaunch rejection → FAILED (recovery-relaunch-failed)" || bad "P2-12 policy: relaunch-fail state=$(cat "$TASKS_F/t50_8080/state.txt" 2>/dev/null)"
+TPR_ACTION_DIR="$TASKS_F" supervisor_step "$TASKS_F/t50_8080" "$BASE_F/snapshots/snap_1/t50_8080.task" >/dev/null 2>&1
+[ "$(cat "$TASKS_F/t50_8080/state.txt" 2>/dev/null)" = "FAILED" ] && ok "P2-12 policy: retry.max=1 + relaunch rejection → FAILED after attempts exhausted (P2-13 retry semantics)" || bad "P2-12 policy: relaunch-fail state=$(cat "$TASKS_F/t50_8080/state.txt" 2>/dev/null)"
 # retry.interval 节奏：recovery.next 在未来 → 不重试（count 不变）
 BASE_R="$T/pace/base"
 TASKS_R="$T/pace/tasks"

@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.10.0"
+RUNTIME_LIB_VERSION="1.11.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2079,25 +2079,32 @@ health_check() {
     provider_dispatch health "$kind" check "$spec"
 }
 # ───────────────────────────────────────────────────────────────────────────
-# §17 Supervisor Core（P2-12）
+# §17 Supervisor Core（P2-12）+ Recovery/Retry/Cooldown（P2-13）
 # ═══════════════════════════════════════════════════════════════════════════
 # 驱动受监督任务的完整生命周期（TSM 允许边 + §16 健康检查）：
 #   RUNNING → HEALTHY（首检通过）
 #   HEALTHY → UNHEALTHY（探针失败）
 #   UNHEALTHY → RECOVERING（进入恢复）
-#   RECOVERING → STARTING（恢复=重跑任务 action 成功）→ spawn → RUNNING（循环）
+#   RECOVERING → STARTING（恢复动作成功）→ spawn → RUNNING（循环）
 #   RECOVERING → FAILED（重试超过策略 retry.max）
 # **统一事件循环**：`supervisor_tick <tasks_dir> <base>` 为唯一入口——每 tick
-# 对每个受监督任务**至多一步**（一次健康检查 + 一次状态迁移）；**不创建任何
-# 每任务常驻线程/循环**（无 while、无后台 `&` 派生；与 shadow_tick/state_sync_all
-# 同构，由 daemon 唯一主循环每轮调用）。
-# 任务健康配置（task v2 字段，缺省不监督）：health.type ∈ process|port、
-# health.target（P2-11 spec 目标）、retry.max（恢复重试次数，0=不重试直接
-# FAILED）、retry.interval（秒，重试节奏）。运行目录内监督工件：
-# recovery.count / recovery.next（epoch 秒，原子 tmp+mv 语义的幂等文件）。
-# 事件：state_log_event event=supervisor（∈ RT_EVENTS/TSM_CAUSES）驱动迁移；
-# 探针结果 UNKNOWN → 不迁移（保持现态）。恢复重跑经 action_run（统一 Action
-# 入口，含 app 分支）——重跑成功 → STARTING（spawn 锚点随即 → RUNNING）。
+# 对每个受监督任务**至多一步**；**不创建任何每任务常驻线程/循环**（无 while、
+# 无后台 `&` 派生；与 shadow_tick/state_sync_all 同构，daemon 唯一主循环调用）。
+# ── P2-13 恢复动作（recovery.type ∈ task v2 字段；缺省 none=重跑 action）──
+#   restart   Restart Action：停既有进程（TERM→超时 KILL）→ 重跑 action；
+#   stopstart Stop + Start：优雅停（TERM）→ 重跑 action；
+#   start     Start Action：直接重跑 action（默认/无类型）；
+#   script    Execute Script：运行 recovery.script（绝对路径、存在可读）——
+#             脚本负责恢复（如重启 Node/Python/Rust 服务）；rc 0=成功。
+# ── 策略（禁止无限重启）──
+#   retry.max（=max_retry）：每恢复 episode 重试次数上限；**非负整数钳制 +
+#     硬上限 100**（非法/负值 → 0，>100 → 100）——重启次数必然有限；
+#   retry.interval（=retry_interval）：尝试节奏（秒，recovery.next）；
+#   retry.cooldown：基础 cooldown——episode 耗尽（FAILED）后写
+#     recovery.cooldown_until（epoch 秒），到期前 supervisor 跳过该任务
+#     （禁止失败风暴热循环；FAILED 为终态，须人工 rearm 或到期后新 episode）。
+# 运行目录监督工件：recovery.count / recovery.next / recovery.cooldown_until。
+# 事件：state_log_event event=supervisor 驱动迁移；UNKNOWN → 不迁移。
 # ═══════════════════════════════════════════════════════════════════════════
 supervisor_log() {
     [ "${SUPERVISOR_LOG:-1}" = "1" ] && echo "[supervisor] $1" >&2
@@ -2114,12 +2121,23 @@ supervisor_health_spec() {   # <task_file> → echo health spec（process:<t>/po
     esac
 }
 
-supervisor_policy() {   # <task_file> → 置 retry_max / retry_interval（缺省 0 / 60）
+# P2-13：置 retry_max / retry_interval / retry_cooldown（全部非负整数钳制；
+# retry.max 硬上限 100——禁止无限重启；非法/负值 → 缺省 0/60/0）。
+supervisor_policy() {   # <task_file>
     tf=$1
     retry_max=$(grep '^retry.max=' "$tf" | head -1 | cut -d= -f2-)
     retry_interval=$(grep '^retry.interval=' "$tf" | head -1 | cut -d= -f2-)
-    [ -n "$retry_max" ] || retry_max=0
-    [ -n "$retry_interval" ] || retry_interval=60
+    retry_cooldown=$(grep '^retry.cooldown=' "$tf" | head -1 | cut -d= -f2-)
+    case "$retry_max" in
+        ''|*[!0-9]*) retry_max=0 ;;
+    esac
+    [ "$retry_max" -gt 100 ] && retry_max=100   # 硬上限：重启次数必然有限
+    case "$retry_interval" in
+        ''|*[!0-9]*) retry_interval=60 ;;
+    esac
+    case "$retry_cooldown" in
+        ''|*[!0-9]*) retry_cooldown=0 ;;
+    esac
 }
 
 supervisor_task_file() {   # <base> <tasks_dir> <id> → 注册表任务文件（旧运行 ID 经 idmap 解析）
@@ -2133,11 +2151,67 @@ supervisor_task_file() {   # <base> <tasks_dir> <id> → 注册表任务文件�
     return 0
 }
 
+# P2-13：停既有任务进程（pid.txt；TERM → 有界等待 → force=1 时 KILL）。有界
+# 等待循环（非常驻；单次恢复内至多 ~3s）。无 pid/已死 → 0。
+supervisor_stop_task() {   # <run_dir> [force]
+    rd=$1; force=${2:-0}
+    pid=$(cat "$rd/pid.txt" 2>/dev/null)
+    [ -n "$pid" ] && [ -d "/proc/$pid" ] 2>/dev/null || return 0
+    kill "$pid" 2>/dev/null
+    i=0
+    while [ "$i" -lt 5 ] && [ -d "/proc/$pid" ] 2>/dev/null; do
+        sleep 0.3
+        i=$((i + 1))
+    done
+    if [ "$force" -eq 1 ] && [ -d "/proc/$pid" ] 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+    fi
+    return 0
+}
+
+# P2-13：执行恢复动作（recovery.type）→ 0=成功（已重跑/脚本 rc0） 1=失败
+supervisor_recover() {   # <run_dir> <task_file>
+    rd=$1; tf=$2
+    rtype=$(grep '^recovery.type=' "$tf" | head -1 | cut -d= -f2-)
+    act=$(grep '^action.command=' "$tf" | head -1 | cut -d= -f2-)
+    id=$(basename "$rd")
+    case "$rtype" in
+        restart)
+            # Restart Action：停既有（TERM→KILL）→ 重跑 action
+            supervisor_stop_task "$rd" 1
+            [ -n "$act" ] || return 1
+            action_run "$id" "$act" >/dev/null 2>&1 ;;
+        stopstart)
+            # Stop + Start：优雅停（TERM）→ 重跑 action
+            supervisor_stop_task "$rd" 0
+            [ -n "$act" ] || return 1
+            action_run "$id" "$act" >/dev/null 2>&1 ;;
+        start|""|none)
+            # Start Action（默认/无类型）：直接重跑 action
+            [ -n "$act" ] || return 1
+            action_run "$id" "$act" >/dev/null 2>&1 ;;
+        script)
+            # Execute Script：recovery.script 绝对路径 + 存在可读；rc 0=成功
+            spath=$(grep '^recovery.script=' "$tf" | head -1 | cut -d= -f2-)
+            case "$spath" in
+                /*) [ -f "$spath" ] && [ -r "$spath" ] || return 1 ;;
+                *) return 1 ;;
+            esac
+            sh "$spath" >/dev/null 2>&1 ;;
+        *) return 1 ;;
+    esac
+}
+
 # 单任务单步（每 tick 至多一步；无循环、无后台派生）：
 # <run_dir> <task_file> → 0=无动作/保持 1=发生迁移 2=FAILED（策略超限）3=无健康配置/目录缺失
 supervisor_step() {
     rd=$1; tf=$2
     [ -d "$rd" ] || return 3
+    # 基础 cooldown：cooldown_until 未到 → 不监督（失败风暴热循环禁止）
+    cdu=$(cat "$rd/recovery.cooldown_until" 2>/dev/null)
+    if [ -n "$cdu" ] && [ "$(date +%s)" -lt "$cdu" ]; then
+        return 0
+    fi
     spec=$(supervisor_health_spec "$tf")
     [ -n "$spec" ] || return 3
     id=$(basename "$rd")
@@ -2171,26 +2245,32 @@ supervisor_step() {
             cnt=$(cat "$rd/recovery.count" 2>/dev/null)
             [ -n "$cnt" ] || cnt=0
             if [ "$cnt" -ge "$retry_max" ]; then
-                state_log_event "$rd" "$id" supervisor FAILED "" "" "retry-exhausted (max=$retry_max)" >/dev/null 2>&1 && return 2
+                # 策略超限 → FAILED + 基础 cooldown（禁止无限重启/失败风暴热循环）
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "retry-exhausted (max=$retry_max)" >/dev/null 2>&1
+                echo $((now + retry_cooldown)) > "$rd/recovery.cooldown_until"
+                return 2
             fi
             act=$(grep '^action.command=' "$tf" | head -1 | cut -d= -f2-)
-            if [ -z "$act" ]; then
-                state_log_event "$rd" "$id" supervisor FAILED "" "" "no-action-for-recovery" >/dev/null 2>&1 && return 2
+            if [ -z "$act" ] && [ "$(grep '^recovery.type=' "$tf" | head -1 | cut -d= -f2-)" != "script" ]; then
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "no-action-for-recovery" >/dev/null 2>&1
+                echo $((now + retry_cooldown)) > "$rd/recovery.cooldown_until"
+                return 2
             fi
             cnt=$((cnt + 1))
             echo "$cnt" > "$rd/recovery.count"
             echo $((now + retry_interval)) > "$rd/recovery.next"
             rm -f "$rd/exit_code.txt" 2>/dev/null
-            # 恢复=重跑任务 action：**先** RECOVERING→STARTING（唯一合法边），再由
-            # action_run 的 spawn 锚点 STARTING→RUNNING；重跑失败 → STARTING>FAILED
-            # （不能回 RECOVERING——TSM 无此边）。
-            if state_log_event "$rd" "$id" supervisor STARTING "" "" "recovery relaunching (attempt $cnt)" >/dev/null 2>&1 \
-               && action_run "$id" "$act" >/dev/null 2>&1; then
-                rm -f "$rd/recovery.count" "$rd/recovery.next" 2>/dev/null
+            # 恢复尝试（state 仍为 RECOVERING——action_run spawn 锚点从 RECOVERING
+            # 写 RUNNING 会被 TSM 拒绝，属预期、零副作用）。尝试成功 → 显式两段
+            # 合法迁移 RECOVERING→STARTING→RUNNING；**尝试失败 → 保持 RECOVERING**
+            # （按 retry.max 重试，节奏 recovery.next；次数耗尽在 tick 起始判）。
+            if supervisor_recover "$rd" "$tf" >/dev/null 2>&1; then
+                state_log_event "$rd" "$id" supervisor STARTING "" "" "recovery attempt $cnt ok ($(grep '^recovery.type=' "$tf" | head -1 | cut -d= -f2-))" >/dev/null 2>&1
+                state_log_event "$rd" "$id" supervisor RUNNING "" "" "recovered" >/dev/null 2>&1
+                rm -f "$rd/recovery.count" "$rd/recovery.next" "$rd/recovery.cooldown_until" 2>/dev/null
                 return 1
             fi
-            state_log_event "$rd" "$id" supervisor FAILED "" "" "recovery-relaunch-failed" >/dev/null 2>&1
-            return 2 ;;
+            return 0 ;;
     esac
     return 0
 }
@@ -2226,7 +2306,8 @@ runtime_lib_selfcheck() {
               lifecycle_startup_registry lifecycle_startup_recover \
               tpr_action_app_validate tpr_action_app_start health_check \
               tpr_health_process_check tpr_health_port_check supervisor_step \
-              supervisor_tick supervisor_health_spec; do
+              supervisor_tick supervisor_health_spec supervisor_recover \
+              supervisor_stop_task; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
