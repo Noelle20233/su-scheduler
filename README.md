@@ -1412,7 +1412,8 @@ CRLF 检出下的构建执行（`[SKIP]` 明示，CI/LF 为构建闸）。**结�
 
 `.github/workflows/test.yml`：`main` push（生产/测试/文档变更路径）与 PR 上运行
 `bash tests/run_tests.sh`（`ubuntu-latest` 标准 runner 自带工具，C3 合规；
-无 adb → L3 不参与）。失败时上传 trace 日志工件（14 天保留）。
+无 adb → L3 不参与）。**成功与失败均上传 trace 日志工件（30 天保留，
+P3-01）**——成功回归 trace 亦作为发布门禁证据存档。
 
 ### 兼容性说明
 
