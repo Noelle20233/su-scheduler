@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.12.0"
+RUNTIME_LIB_VERSION="1.13.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2558,6 +2558,284 @@ supervisor_runtime_exceeded() {
     return 1
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §19 Canonical Task Config Store & Migration（P3-02）
+# ───────────────────────────────────────────────────────────────────────────
+# 双模式配置权威：
+#   - Legacy（默认，无 MANAGED 标记）：config.txt 是**唯一配置源**，daemon/CLI
+#     行为不变（C2/C4 零改动）；
+#   - Managed（显式导入后）：task-config/ 是**权威配置源**，config.txt 保留为
+#     备份与兼容导出。迁移可回滚、不静默覆盖用户配置、重复导入幂等。
+# 存储：<TCFG_DIR|/data/adb/su-scheduler/task-config>/（独立于运行目录 tasks/）
+#   MANAGED                   标记文件（存在 = managed；**最后写**，中断不产生
+#                             半管理态——没有标记则一切按 legacy）
+#   manifest                 元数据（mode/source/imported_at/count/…）
+#   backup/config.txt.<ts>   导入前逐字节备份（回滚源；导入过程**永不改写**
+#                             config.txt 本身）
+#   <id>.task                每任务一个 POSIX key=value Task v2 文件
+# 幂等/安全：
+#   - 导入：备份 → 解析到 staging → 逐文件校验 → 幂等提升（已存在 id 跳过，
+#     不覆盖既有条目）→ 写 manifest + MANAGED（最后）；
+#   - 全部写经 tmp+mv 原子；任意失败不留半成品（staging 清理 + 已提升文件完整）；
+#   - 导入失败时 config.txt 逐字节不变（导入从不写 config.txt）；
+#   - 新建任务 ID 用 task_<trigger_norm>_<n>，避免与 legacy t<line>_<trigger>
+#     命名空间冲突（ID 兼容规则见 docs/architecture/config-authority.md）。
+# ═══════════════════════════════════════════════════════════════════════════
+tcfg_dir() { echo "${TCFG_DIR:-/data/adb/su-scheduler/task-config}"; }
+tcfg_managed_marker() { echo "$(tcfg_dir)/MANAGED"; }
+tcfg_manifest_file() { echo "$(tcfg_dir)/manifest"; }
+tcfg_backup_dir() { echo "$(tcfg_dir)/backup"; }
+
+tcfg_is_managed() { [ -f "$(tcfg_managed_marker)" ] && return 0 || return 1; }
+tcfg_mode() { tcfg_is_managed && echo managed || echo legacy; }
+
+tcfg_task_file() { echo "$(tcfg_dir)/$1.task"; }
+tcfg_task_ids() {
+    d=$(tcfg_dir)
+    [ -d "$d" ] || return 0
+    for f in "$d"/*.task; do
+        [ -f "$f" ] || continue
+        basename "$f" .task
+    done | sort
+}
+tcfg_task_count() { tcfg_task_ids | sed '/^$/d' | wc -l; }
+
+# 原子写：<target>（内容从 stdin 读取）→ tmp + mv；失败清理 tmp
+tcfg_atomic_write() {
+    t=$1
+    td=$(dirname "$t")
+    mkdir -p "$td" 2>/dev/null || return 2
+    tmp="$t.tmp.$$"
+    cat > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 2; }
+    mv "$tmp" "$t" 2>/dev/null || { rm -f "$tmp"; return 2; }
+    return 0
+}
+
+tcfg_get() {   # <file> <key> → 值（无则空）
+    grep "^$2=" "$1" 2>/dev/null | head -1 | cut -d= -f2-
+}
+
+# 校验单个任务文件：schema_version=2 + id==文件名 + trigger 非空
+tcfg_validate_task() {   # <file> → 0 合法 / 1 非法（绝不清空、绝不退出）
+    f=$1
+    [ -f "$f" ] || return 1
+    sv=$(tcfg_get "$f" schema_version)
+    [ "$sv" = "2" ] || return 1
+    id=$(tcfg_get "$f" id)
+    base=$(basename "$f" .task)
+    [ -n "$id" ] && [ "$id" = "$base" ] || return 1
+    tr=$(tcfg_get "$f" trigger)
+    [ -n "$tr" ] || return 1
+    return 0
+}
+
+# 写入一个任务文件（内容 stdin；managed 语义下由调用方保证权威性）
+tcfg_write_task() {   # <id>
+    id=$1
+    f=$(tcfg_task_file "$id")
+    tcfg_atomic_write "$f" || return 2
+    return 0
+}
+
+# 新建任务 ID：<trigger> → task_<trigger_norm>_<n>（避免与 legacy t<line>_ 冲突）
+tcfg_new_id() {   # <trigger>
+    trig=$1
+    norm=$(echo "$trig" | sed 's/://g')
+    n=1
+    while [ -f "$(tcfg_task_file "task_${norm}_${n}")" ]; do
+        n=$((n + 1))
+    done
+    echo "task_${norm}_${n}"
+}
+
+# 导入：config.txt → task-config/（备份 + staging 解析 + 校验 + 幂等提升 + 标记）
+# 返回：0=成功（含全部跳过） 1=无有效任务/配置无效（config 逐字节不变）
+#       2=硬错误（目录不可建/备份失败等）
+tcfg_import() {   # <config>
+    cfg=$1
+    d=$(tcfg_dir)
+    mkdir -p "$d" 2>/dev/null || { echo "[task-config] ERROR: cannot mkdir $d" >&2; return 2; }
+    [ -f "$cfg" ] || { echo "[task-config] ERROR: config not found: $cfg" >&2; return 2; }
+
+    # ① 逐字节备份（导入过程永不改写 config.txt 本身）
+    ts=$(date +%Y%m%d-%H%M%S)
+    bk="$(tcfg_backup_dir)/config.txt.$ts"
+    mkdir -p "$(tcfg_backup_dir)" 2>/dev/null || { echo "[task-config] ERROR: cannot mkdir backup" >&2; return 2; }
+    cp "$cfg" "$bk" 2>/dev/null || { echo "[task-config] ERROR: backup failed" >&2; return 2; }
+
+    # ② 解析到 staging（不直接写 task-config/，失败不污染正式目录）
+    stage="$d/.staging.$$"
+    rm -rf "$stage" 2>/dev/null
+    mkdir -p "$stage" 2>/dev/null || { rm -rf "$stage"; return 2; }
+    legacy_adapter_parse "$cfg" "$stage" >/dev/null 2>&1
+    arc=$?
+
+    # ③ 统计并校验 staging 内任务
+    n=0; invalid=0
+    for f in "$stage"/*.task; do
+        [ -f "$f" ] || continue
+        n=$((n + 1))
+        if ! tcfg_validate_task "$f"; then
+            invalid=$((invalid + 1))
+        fi
+    done
+
+    if [ "$n" -eq 0 ] || [ "$invalid" -ne 0 ]; then
+        rm -rf "$stage" 2>/dev/null
+        echo "[task-config] WARNING: no valid tasks parsed (rc=$arc n=$n invalid=$invalid); config unchanged" >&2
+        return 1
+    fi
+
+    # ④ 幂等提升：已存在 id 跳过（重复导入不产生重复 Task、不覆盖既有条目）
+    promoted=0; skipped=0
+    for f in "$stage"/*.task; do
+        [ -f "$f" ] || continue
+        id=$(basename "$f" .task)
+        target="$(tcfg_task_file "$id")"
+        if [ -f "$target" ]; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        tmp="$target.tmp.$$"
+        if cp "$f" "$tmp" 2>/dev/null && mv "$tmp" "$target" 2>/dev/null; then
+            promoted=$((promoted + 1))
+        else
+            rm -f "$tmp" 2>/dev/null
+        fi
+    done
+    rm -rf "$stage" 2>/dev/null
+
+    # ⑤ manifest + MANAGED 标记（**最后写** → 中断不产生半管理态）
+    {
+        echo "mode=managed"
+        echo "source=$cfg"
+        echo "imported_at=$ts"
+        echo "count=$n"
+        echo "promoted=$promoted"
+        echo "skipped=$skipped"
+        echo "backup=$bk"
+    } | tcfg_atomic_write "$(tcfg_manifest_file)" >/dev/null 2>&1
+    echo "managed" | tcfg_atomic_write "$(tcfg_managed_marker)" >/dev/null 2>&1
+
+    echo "[task-config] import ok: n=$n promoted=$promoted skipped=$skipped"
+    return 0
+}
+
+# 导出：task-config/ → 兼容 legacy config.txt（schema §8.4 反向；块任务输出
+# 重构行，兼容导出非逐字节还原）
+tcfg_export() {   # <out_config> → 0 成功（跳过非法任务）
+    out=$1
+    d=$(tcfg_dir)
+    tmp="$out.tmp.$$"
+    : > "$tmp" 2>/dev/null || return 2
+    ok=0
+    for f in "$d"/*.task; do
+        [ -f "$f" ] || continue
+        tcfg_validate_task "$f" || continue
+        trig=$(tcfg_get "$f" trigger)
+        cmd=$(tcfg_get "$f" action.command)
+        flags=""
+        ns=$(tcfg_get "$f" action.notify_start);  [ "$ns" = "1" ] && flags="$flags --notify-start"
+        ne=$(tcfg_get "$f" action.notify_end);    [ "$ne" = "1" ] && flags="$flags --notify-end"
+        del=$(tcfg_get "$f" action.delete);       [ "$del" = "1" ] && flags="$flags --delete"
+        tx=$(tcfg_get "$f" action.termux);        [ "$tx" = "1" ] && flags="$flags --termux"
+        ix=$(tcfg_get "$f" action.interactive);   [ "$ix" = "1" ] && flags="$flags --interactive"
+        rn=$(tcfg_get "$f" action.run_once_now);  [ "$rn" = "1" ] && flags="$flags --run-once-now"
+        bt=$(tcfg_get "$f" action.boot);          [ "$bt" = "1" ] && flags="$flags --boot"
+        msg=$(tcfg_get "$f" action.msg);          [ -n "$msg" ] && flags="$flags --msg=\"$msg\""
+        if [ -n "$flags" ]; then
+            printf '%s %s; :%s\n' "$trig" "$cmd" "$flags" >> "$tmp"
+        else
+            printf '%s %s\n' "$trig" "$cmd" >> "$tmp"
+        fi
+        ok=$((ok + 1))
+    done
+    mv "$tmp" "$out" 2>/dev/null || { rm -f "$tmp"; return 2; }
+    echo "[task-config] export ok: $ok tasks -> $out"
+    return 0
+}
+
+# 回滚：恢复 config.txt 备份 + 移除 MANAGED 标记（回到 legacy；文件保留为惰性）
+tcfg_rollback() {   # <config> → 0 成功（含 no-op） 2 硬错误
+    cfg=$1
+    if ! tcfg_is_managed; then
+        echo "[task-config] rollback: not managed (no-op)"
+        return 0
+    fi
+    bk=$(ls -1t "$(tcfg_backup_dir)"/config.txt.* 2>/dev/null | head -1)
+    if [ -n "$bk" ] && [ -f "$bk" ]; then
+        cp "$bk" "$cfg" 2>/dev/null || { echo "[task-config] ERROR: restore failed" >&2; return 2; }
+        echo "[task-config] rollback: restored config from $bk"
+    else
+        echo "[task-config] WARNING: no backup found; removing marker only" >&2
+    fi
+    rm -f "$(tcfg_managed_marker)" 2>/dev/null
+    echo "[task-config] rollback: managed mode disabled"
+    return 0
+}
+
+# 字段更新（managed 才允许；tmp+mv 原子）——WebUI/CLI 编辑的持久化底座
+tcfg_set_field() {   # <id> <key> <value> → 0/1/2
+    id=$1; key=$2; value=$3
+    tcfg_is_managed || { echo "[task-config] ERROR: not managed (import first)" >&2; return 1; }
+    f=$(tcfg_task_file "$id")
+    [ -f "$f" ] || { echo "[task-config] ERROR: task not found: $id" >&2; return 1; }
+    tmp="$f.tmp.$$"
+    if grep -q "^$key=" "$f"; then
+        grep -v "^$key=" "$f" > "$tmp" 2>/dev/null
+    else
+        cp "$f" "$tmp" 2>/dev/null
+    fi
+    printf '%s=%s\n' "$key" "$value" >> "$tmp" 2>/dev/null
+    mv "$tmp" "$f" 2>/dev/null || { rm -f "$tmp"; return 2; }
+    return 0
+}
+
+# 新建 Task（managed；最小 Task v2 文件；ID 走 tcfg_new_id 或用户给定）
+tcfg_new_task() {   # <id> <trigger> <command> → 0/1/2
+    id=$1; trig=$2; cmd=$3
+    tcfg_is_managed || { echo "[task-config] ERROR: not managed (import first)" >&2; return 1; }
+    case "$id" in
+        *[!A-Za-z0-9_.-]*) echo "[task-config] ERROR: invalid id '$id'" >&2; return 1 ;;
+    esac
+    f=$(tcfg_task_file "$id")
+    [ -f "$f" ] && { echo "[task-config] ERROR: task exists: $id" >&2; return 1; }
+    name=$(echo "$cmd" | awk '{print $1}' | cut -c1-40)
+    [ -n "$name" ] || name=task
+    {
+        echo "schema_version=2"
+        echo "id=$id"
+        echo "name=$name"
+        echo "enabled=1"
+        echo "trigger=$trig"
+        echo "action.type=command"
+        echo "action.command=$cmd"
+        echo "action.notify_start=0"
+        echo "action.notify_end=0"
+        echo "action.delete=0"
+        echo "action.termux=0"
+        echo "action.interactive=0"
+        echo "action.run_once_now=0"
+        echo "action.boot=0"
+        echo "action.msg="
+        echo "health.type=none"
+        echo "health.target="
+        echo "recovery.type=none"
+        echo "retry.max=0"
+        echo "retry.interval=60"
+    } | tcfg_atomic_write "$f" || return 2
+    return 0
+}
+
+# 删除 Task（managed）：<id> → 0/1/2（文件级删除；不触碰运行目录）
+tcfg_remove_task() {   # <id>
+    id=$1
+    tcfg_is_managed || { echo "[task-config] ERROR: not managed (import first)" >&2; return 1; }
+    f=$(tcfg_task_file "$id")
+    [ -f "$f" ] || { echo "[task-config] ERROR: task not found: $id" >&2; return 1; }
+    rm -f "$f" 2>/dev/null || return 2
+    return 0
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -2572,7 +2850,10 @@ runtime_lib_selfcheck() {
               supervisor_tick supervisor_health_spec supervisor_recover \
               supervisor_stop_task crash_guard_enter crash_record_exit \
               runtime_protect runtime_protect_tasks supervisor_health_due \
-              supervisor_runtime_exceeded; do
+              supervisor_runtime_exceeded tcfg_is_managed tcfg_mode \
+              tcfg_task_ids tcfg_validate_task tcfg_import tcfg_export \
+              tcfg_rollback tcfg_set_field tcfg_new_task tcfg_remove_task \
+              tcfg_new_id tcfg_atomic_write; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

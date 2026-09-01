@@ -30,6 +30,8 @@
 #   L2  tests/crashguard/test.sh        P2-14 Crash Loop 与资源保护（guard 降级/节流/优雅重置、日志/目录/快照上限、健康间隔、超时护栏、fake daemon 崩溃序列）
 #   L2  tests/p2-integration/test.sh    P2-15 综合回归（daemon kill/task kill/脚本 hang/应用崩溃/重启 端到端集成）
 #   L2  tests/p2-install/test.sh        P2-15 发布评审（KernelSU/Magisk/APatch 安装结构 + 发布契约）
+#   L2  tests/config-v2/test.sh         P3-02 Canonical Task Config Store（双模式 legacy/managed、
+#       导入幂等/失败原子性/回滚/导出/新建 ID 命名空间/损坏回退/接线/POSIX）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -102,6 +104,7 @@ else
         "tests/crashguard/test.sh" \
         "tests/p2-integration/test.sh" \
         "tests/p2-install/test.sh" \
+        "tests/config-v2/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

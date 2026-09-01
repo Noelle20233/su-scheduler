@@ -112,6 +112,7 @@ print_help() {
     echo -e "  ${GREEN}log${RESET} ${YELLOW}[-f|-n NUM]${RESET}          View logs (-f=follow, -n=lines) 🕵️"
     echo -e "  ${GREEN}tasks${RESET}                    List only running tasks 📋"
     echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id>}${RESET}   Registry-backed Task CLI (P2-08) 🗂️"
+    echo -e "  ${GREEN}task-config${RESET} ${CYAN}{status|import|export|rollback|list|show|set|new|rm}${RESET}   Task v2 配置存储与迁移 (P3-02) 🗄️"
     echo -e "  ${GREEN}audit${RESET} ${YELLOW}[-f|-n NUM|clear]${RESET}    The Mission Auditor feed 🕵️"
     echo -e "  ${GREEN}history | all-tasks${RESET}      List all tasks (running & finished) 📜"
     echo -e "  ${GREEN}task-info${RESET} ${CYAN}<task_id>${RESET}       Get detailed task info 🔍"
@@ -1158,6 +1159,81 @@ cmd_task_status() {
     task_cli_status_id "$DATA_DIR" "$TASKS_DIR" "/dev/.su_scheduler.lock" "$id"
 }
 
+# 🗄️ Canonical Task Config Store（P3-02，RUNTIME_LOADED 门控）
+# 双模式配置权威：Legacy（默认，config.txt 权威）/ Managed（显式导入后
+# task-config/ 权威，config.txt 为备份与兼容导出）。迁移可回滚、不静默覆盖、
+# 重复导入幂等。存储目录独立于运行目录 tasks/（/data/adb/su-scheduler/
+# task-config/，可经 TCFG_DIR 覆盖）。
+cmd_task_config() {
+    if [ "$RUNTIME_LOADED" -ne 1 ]; then
+        echo "ERROR: task-config subcommand requires production runtime library (${RUNTIME_LIB} not loaded)" >&2
+        return 1
+    fi
+    sub="${1:-}"
+    case "$sub" in
+        status)
+            echo "mode=$(tcfg_mode)"
+            echo "dir=$(tcfg_dir)"
+            echo "tasks=$(tcfg_task_count)"
+            if [ -f "$(tcfg_manifest_file)" ]; then
+                sed -n 's/^mode=//p' "$(tcfg_manifest_file)" | sed 's/^/manifest.mode=/'
+                sed -n 's/^source=//p' "$(tcfg_manifest_file)" | sed 's/^/manifest.source=/'
+                sed -n 's/^imported_at=//p' "$(tcfg_manifest_file)" | sed 's/^/manifest.imported_at=/'
+            fi
+            ;;
+        import)
+            shift
+            tcfg_import "${1:-$CONFIG_FILE}"
+            ;;
+        export)
+            shift
+            tcfg_export "${1:-${CONFIG_FILE}.export}"
+            ;;
+        rollback)
+            shift
+            tcfg_rollback "${1:-$CONFIG_FILE}"
+            ;;
+        list)
+            tcfg_task_ids
+            ;;
+        show)
+            shift
+            local id="${1:-}"
+            [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task-config show <id>" >&2; return 1; }
+            local f="$(tcfg_task_file "$id")"
+            [ -f "$f" ] || { echo "ERROR: task not found: $id" >&2; return 1; }
+            cat "$f"
+            ;;
+        set)
+            shift
+            local id="${1:-}" key="${2:-}" val="${3:-}"
+            [ -n "$id" ] && [ -n "$key" ] || { echo "ERROR: usage: su-scheduler task-config set <id> <key> <value>" >&2; return 1; }
+            tcfg_set_field "$id" "$key" "$val"
+            ;;
+        new)
+            shift
+            local trig="${1:-}" cmd="${2:-}"
+            if [ -z "$trig" ] || [ -z "$cmd" ]; then
+                echo "ERROR: usage: su-scheduler task-config new <trigger> <command>" >&2
+                return 1
+            fi
+            local id="$(tcfg_new_id "$trig")"
+            tcfg_new_task "$id" "$trig" "$cmd" && echo "created task $id"
+            ;;
+        rm)
+            shift
+            local id="${1:-}"
+            [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task-config rm <id>" >&2; return 1; }
+            tcfg_remove_task "$id"
+            ;;
+        ""|-h|--help)
+            echo "Usage: su-scheduler task-config {status|import|export|rollback|list|show <id>|set <id> <key> <value>|new <trigger> <command>|rm <id>}" >&2
+            return 0
+            ;;
+        *) echo "ERROR: unknown task-config subcommand: $sub (see help)" >&2; return 1 ;;
+    esac
+}
+
 # 🚦 Main Dispatcher - Routes your command to the right function
 case "$1" in
     add) shift; cmd_add "$@" ;;
@@ -1168,6 +1244,7 @@ case "$1" in
     clear-log) echo -n "" > "$LOG_FILE"; echo -e "${GREEN}🧹 Log cleared.${RESET}" ;;
     tasks) cmd_tasks ;;
     task) shift; cmd_task "$@" ;;
+    task-config) shift; cmd_task_config "$@" ;;
     audit) shift; cmd_audit "$@" ;;
     history|all-tasks) cmd_tasks_history ;;
     task-info) shift; cmd_task_info "$@" ;;

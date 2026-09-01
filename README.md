@@ -1398,6 +1398,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | Crash Loop 与资源保护（P2-14：guard 降级窗口/节流/优雅重置、SIGKILL 崩溃序列抑制、日志/任务目录/快照上限、健康探针最小间隔、运行超时护栏、fake daemon 真实链路） | `tests/crashguard/test.sh` |
 | L2 | P2 综合回归（P2-15：daemon kill/task kill/脚本 hang/应用崩溃/重启 端到端集成、Supervisor+CrashGuard+Health+Recovery 故障自愈闭环、重启残留收尾） | `tests/p2-integration/test.sh` |
 | L2 | P2 发布评审（P2-15：KernelSU/Magisk/APatch 安装结构 + 发布契约、systemless 覆盖、数据独立模块目录、manager-agnostic 安装） | `tests/p2-install/test.sh` |
+| L2 | Canonical Task Config Store（P3-02：双模式 legacy/managed 权威、导入幂等、失败原子性、回滚、导出、新建 ID `task_` 命名空间、损坏回退、接线） | `tests/config-v2/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |
