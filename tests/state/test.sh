@@ -11,9 +11,9 @@
 #      status.txt/pid.txt/output.log/exit_code.txt 逐字节不变（旧 CLI 可读）。
 #   3) 一次性任务成功 → STOPPED（不虚假 HEALTHY）：exit=0 → state.txt=STOPPED
 #      + action_success 事件；直接写 HEALTHY 被拒（仅 builtin 时）。
-#   4) Health 门槛：仅 builtin → state_health_allowed=1 + HEALTHY/UNHEALTHY
-#      拒绝；注册真实 Health Provider → allowed + HEALTHY 可写（RUNNING→
-#      HEALTHY 迁移合法）。
+#   4) Health 门槛：P2-11 后生产库含真实 Provider（process/port）→ 门槛打开；
+#      门槛机制（builtin-only → 拒绝）经临时收缩注册表复现；HEALTHY 仅经合法
+#      迁移（RUNNING→HEALTHY）可写。
 #   5) 非法状态转换非致命：FAILED→STOPPED 直写被拒（state.txt/events.log 不变，
 #      返回 1 不中止）；混入 BOGUS 目录的 state_sync_all 仍完成其余目录。
 #   6) 重启残留：status.txt=RUNNING/STARTING（无新源）与 ZOMBIE_CRASHED →
@@ -69,24 +69,31 @@ done
 ev_before=$(wc -l < "$D/events.log" 2>/dev/null || echo 0)
 state_log_event "$D" run_t100_0000 action_success HEALTHY >/dev/null 2>&1
 rc=$?
-[ "$rc" -ne 0 ] && ok "P2-07 oneshot: direct HEALTHY write rejected (builtin-only health)" || bad "P2-07 oneshot: HEALTHY accepted (forbidden)"
+[ "$rc" -ne 0 ] && ok "P2-07 oneshot: direct HEALTHY write rejected (P2-10+ gate open → TSM: STOPPED→HEALTHY illegal)" || bad "P2-07 oneshot: HEALTHY accepted (forbidden)"
 [ "$(cat "$D/state.txt" 2>/dev/null)" = "STOPPED" ] && ok "P2-07 oneshot: state.txt unchanged after HEALTHY rejection" || bad "P2-07 oneshot: state polluted=$(cat "$D/state.txt" 2>/dev/null)"
 [ "$(wc -l < "$D/events.log" 2>/dev/null || echo 0)" -eq "$ev_before" ] && ok "P2-07 oneshot: events.log unchanged after HEALTHY rejection" || bad "P2-07 oneshot: events polluted"
 
-# ── 4) Health 门槛：只有真实 Health Provider 接入才允许 HEALTHY ────────────
+# ── 4) Health 门槛：真实 Health Provider 接入后放行（P2-11：process/port 已注册）──
 state_health_allowed >/dev/null 2>&1
-[ $? -ne 0 ] && ok "P2-07 health: health_allowed=1 with builtin-only (gated)" || bad "P2-07 health: allowed with builtin-only (forbidden)"
+[ $? -eq 0 ] && ok "P2-07 health: gate OPEN with production health providers (process/port, P2-11)" || bad "P2-07 health: gate closed despite real providers"
+# 门槛机制本身（builtin-only → 关闭，P2-07 原始语义）：临时收缩注册表复现
+SAVE_REG=$TPR_REGISTRY
+TPR_REGISTRY=$(printf '%s\n' "$SAVE_REG" | tr ' ' '\n' | grep '^health>builtin>' | tr '\n' ' ')
+state_health_allowed >/dev/null 2>&1
+[ $? -ne 0 ] && ok "P2-07 health: builtin-only registry → gate closed (mechanism preserved)" || bad "P2-07 health: gate open with builtin-only (forbidden)"
+state_log_event "$D" run_t100_0000 supervisor HEALTHY >/dev/null 2>&1
+[ $? -ne 0 ] && ok "P2-07 health: HEALTHY rejected while gate closed" || bad "P2-07 health: HEALTHY accepted while gated"
 state_log_event "$D" run_t100_0000 supervisor UNHEALTHY >/dev/null 2>&1
-[ $? -ne 0 ] && ok "P2-07 health: UNHEALTHY also gated (health family)" || bad "P2-07 health: UNHEALTHY accepted (forbidden)"
+[ $? -ne 0 ] && ok "P2-07 health: UNHEALTHY also gated while gate closed" || bad "P2-07 health: UNHEALTHY accepted while gated"
+TPR_REGISTRY=$SAVE_REG
 D2="$T/health/run_t101_0001"
 mkdir -p "$D2"
 echo "RUNNING" > "$D2/state.txt"
 echo "RUNNING" > "$D2/status.txt"
-provider_register health real tpr_health_real >/dev/null 2>&1
 state_health_allowed >/dev/null 2>&1
-[ $? -eq 0 ] && ok "P2-07 health: real health provider registered → allowed" || bad "P2-07 health: still gated after real registration"
+[ $? -eq 0 ] && ok "P2-07 health: allowed with production providers (process/port)" || bad "P2-07 health: not allowed"
 state_log_event "$D2" run_t101_0001 supervisor HEALTHY >/dev/null 2>&1
-[ $? -eq 0 ] && [ "$(cat "$D2/state.txt" 2>/dev/null)" = "HEALTHY" ] && ok "P2-07 health: HEALTHY writable after real provider (RUNNING→HEALTHY legal)" || bad "P2-07 health: HEALTHY write failed (state=$(cat "$D2/state.txt" 2>/dev/null))"
+[ $? -eq 0 ] && [ "$(cat "$D2/state.txt" 2>/dev/null)" = "HEALTHY" ] && ok "P2-07 health: HEALTHY writable (RUNNING→HEALTHY legal + gate open)" || bad "P2-07 health: HEALTHY write failed (state=$(cat "$D2/state.txt" 2>/dev/null))"
 
 # ── 5) 非法状态转换非致命（不破主循环）─────────────────────────────────────
 D3="$T/illegal/run_t102_0002"

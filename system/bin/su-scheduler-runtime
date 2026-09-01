@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.8.0"
+RUNTIME_LIB_VERSION="1.9.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -650,6 +650,8 @@ provider_register trigger advanced tpr_trigger_advanced
 provider_register action command   tpr_action_command
 provider_register action app       tpr_action_app
 provider_register health builtin   tpr_health_builtin
+provider_register health process   tpr_health_process
+provider_register health port      tpr_health_port
 provider_register recovery builtin tpr_recovery_builtin
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1952,6 +1954,131 @@ tpr_action_exec_app() {   # <id> <dir> <spec>（spec 已全校验；构建固定
     return "$rc"
 }
 # ───────────────────────────────────────────────────────────────────────────
+# §16 Process & Port Health Provider（P2-11）
+# ═══════════════════════════════════════════════════════════════════════════
+# 首批真实健康检查（P1-04 health 契约：validate / check）：
+#   health>process —— Process Check：spec = 进程名（pidof）或 PID（/proc/<pid>）；
+#   health>port    —— Port Check：spec = TCP 端口 1-65535（/proc/net/tcp 的
+#                     LISTEN(0A) 状态；IPv4，IPv6 为扩展点）。
+# **统一返回三态 + 原因 + 延迟 + 目标**（单行，`|` 分隔）：
+#   <HEALTHY|UNHEALTHY|UNKNOWN>|reason=<原因>|latency_ms=<毫秒>|target=<spec>
+#   返回码：0=HEALTHY / 1=UNHEALTHY / 2=UNKNOWN / 3=分发或用法错误。
+# 安全：spec 经安全字符集 + 结构校验（拒绝 shell 元字符——同 §15 原则；
+# 仅做只读检查，零执行副作用）。
+# 正式入口：`health_check <kind> <spec>`（唯一；经 provider_dispatch health）。
+# 注意：注册 process/port 后 **P2-07 state_health_allowed 打开**——HEALTHY/
+# UNHEALTHY 状态写入获准（真实 Health Provider 已接入；门槛机制本身在
+# builtin-only 注册表下仍关闭，状态套件 §4 有双侧断言）。
+# ═══════════════════════════════════════════════════════════════════════════
+tpr_health_log() {
+    [ "${TPR_LOG:-1}" = "1" ] && echo "[health] $1" >&2
+}
+
+# 毫秒时间戳：date +%s%3N（GNU/toybox）截取前 13 位 = 纪元毫秒；uutils 的
+# %3N 输出 9 位纳秒（19 位）同样截 13 位归一；不支持 %N → 秒*1000 退化。
+tpr_health_ms() {
+    ms=$(date "+%s%3N" 2>/dev/null | cut -c1-13)
+    case "$ms" in
+        *[!0-9]*) echo $(( $(date +%s) * 1000 )) ;;
+        *) echo "$ms" ;;
+    esac
+}
+
+# ── Process Check ───────────────────────────────────────────────────────────
+tpr_health_process_validate() {   # <spec> → 进程名或 PID（安全字符集 + 结构）
+    case "$1" in
+        *[!A-Za-z0-9_./:-]*) return 1 ;;
+    esac
+    case "$1" in
+        [0-9]*) echo "$1" | grep -E '^[0-9]+$' >/dev/null ;;
+        *) echo "$1" | grep -E '^[A-Za-z][A-Za-z0-9_./:-]*$' >/dev/null ;;
+    esac
+}
+
+tpr_health_process_check() {   # <spec> → 三态行 + rc 0/1/2
+    spec=$1
+    t0=$(tpr_health_ms)
+    if ! tpr_health_process_validate "$spec"; then
+        t1=$(tpr_health_ms)
+        lat=$((t1 - t0)); [ "$lat" -lt 0 ] && lat=0   # 时钟抖动防护
+        echo "UNKNOWN|reason=invalid-spec|latency_ms=$lat|target=$spec"
+        return 2
+    fi
+    found=0
+    cmd_err=0
+    if echo "$spec" | grep -qE '^[0-9]+$'; then
+        [ -d "/proc/$spec" ] && found=1
+    else
+        if command -v pidof >/dev/null 2>&1; then
+            pidof "$spec" >/dev/null 2>&1 && found=1
+        else
+            cmd_err=1
+        fi
+    fi
+    t1=$(tpr_health_ms)
+    lat=$((t1 - t0))
+    [ "$lat" -lt 0 ] && lat=0   # 时钟抖动防护（宿主 uutils date 偶发负差）
+    if [ "$found" -eq 1 ]; then
+        echo "HEALTHY|reason=process-running|latency_ms=$lat|target=$spec"
+        return 0
+    elif [ "$cmd_err" -eq 1 ]; then
+        echo "UNKNOWN|reason=pidof-unavailable|latency_ms=$lat|target=$spec"
+        return 2
+    else
+        echo "UNHEALTHY|reason=process-not-found|latency_ms=$lat|target=$spec"
+        return 1
+    fi
+}
+
+# ── Port Check（TCP LISTEN，/proc/net/tcp）──────────────────────────────────
+tpr_health_port_validate() {   # <spec> → 端口 1-65535
+    echo "$1" | grep -E '^[0-9]{1,5}$' >/dev/null || return 1
+    [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+tpr_health_port_check() {   # <spec> → 三态行 + rc 0/1/2
+    spec=$1
+    t0=$(tpr_health_ms)
+    if ! tpr_health_port_validate "$spec"; then
+        t1=$(tpr_health_ms)
+        lat=$((t1 - t0)); [ "$lat" -lt 0 ] && lat=0   # 时钟抖动防护
+        echo "UNKNOWN|reason=invalid-spec|latency_ms=$lat|target=port:$spec"
+        return 2
+    fi
+    hex=$(printf '%04X' "$spec")
+    listening=0
+    unreadable=0
+    if [ -r /proc/net/tcp ]; then
+        n=$(awk -v h="$hex" '$4 == "0A" && $2 ~ ":" h "$" { n++ } END { print n+0 }' /proc/net/tcp 2>/dev/null)
+        [ "$n" -gt 0 ] && listening=1
+    else
+        unreadable=1
+    fi
+    t1=$(tpr_health_ms)
+    lat=$((t1 - t0))
+    [ "$lat" -lt 0 ] && lat=0   # 时钟抖动防护（宿主 uutils date 偶发负差）
+    if [ "$listening" -eq 1 ]; then
+        echo "HEALTHY|reason=port-listening|latency_ms=$lat|target=port:$spec"
+        return 0
+    elif [ "$unreadable" -eq 1 ]; then
+        echo "UNKNOWN|reason=proc-unreadable|latency_ms=$lat|target=port:$spec"
+        return 2
+    else
+        echo "UNHEALTHY|reason=port-not-listening|latency_ms=$lat|target=port:$spec"
+        return 1
+    fi
+}
+
+# 正式入口（唯一）：health_check <kind> <spec> → 三态行 + rc 0/1/2/3
+health_check() {
+    kind=${1:-}; spec=${2:-}
+    [ -n "$kind" ] && [ -n "$spec" ] || {
+        tpr_health_log "ERROR check: kind/spec required"
+        return 3
+    }
+    provider_dispatch health "$kind" check "$spec"
+}
+# ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -1961,7 +2088,8 @@ runtime_lib_selfcheck() {
               state_rehydrate_residual registry_attach task_cli_attach \
               task_cli_resolve_id task_cli_status_id runtime_scan_stale \
               lifecycle_startup_registry lifecycle_startup_recover \
-              tpr_action_app_validate tpr_action_app_start; do
+              tpr_action_app_validate tpr_action_app_start health_check \
+              tpr_health_process_check tpr_health_port_check; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
