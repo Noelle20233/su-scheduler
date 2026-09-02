@@ -30,6 +30,8 @@
 #   L2  tests/crashguard/test.sh        P2-14 Crash Loop 与资源保护（guard 降级/节流/优雅重置、日志/目录/快照上限、健康间隔、超时护栏、fake daemon 崩溃序列）
 #   L2  tests/p2-integration/test.sh    P2-15 综合回归（daemon kill/task kill/脚本 hang/应用崩溃/重启 端到端集成）
 #   L2  tests/p2-install/test.sh        P2-15 发布评审（KernelSU/Magisk/APatch 安装结构 + 发布契约）
+#   L2  tests/config-v2/validation.sh  P3-06 Task v2 编辑校验矩阵（ID 路径穿越/trigger 枚举/App Action 注入/
+#       recovery script 绝对路径可读/数值范围/原子性/后端权威校验）
 #   L2  tests/config-v2/test.sh         P3-02 Canonical Task Config Store（双模式 legacy/managed、
 #       导入幂等/失败原子性/回滚/导出/新建 ID 命名空间/损坏回退/接线/POSIX）
 #   L2  tests/scheduler-prod/test.sh    P3-03 Registry 正式调度接管（双模式 legacy/managed、
@@ -120,11 +122,13 @@ else
         "tests/p2-integration/test.sh" \
         "tests/p2-install/test.sh" \
         "tests/config-v2/test.sh" \
+        "tests/config-v2/validation.sh" \
         "tests/scheduler-prod/test.sh" \
         "tests/ipc/test.sh" \
         "tests/ipc/security.sh" \
         "tests/webui/read-only.test.sh" \
         "tests/webui/security.test.sh" \
+        "tests/webui/editor.test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

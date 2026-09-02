@@ -29,11 +29,11 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.16.0"
+RUNTIME_LIB_VERSION="1.17.0"
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 11 个规范状态 / 触发原因令牌 / 允许转换（单一事实源；与
 # docs/architecture/task-state-machine-transitions.tsv 镜像）。
 TSM_STATES='DISABLED PENDING WAITING STARTING RUNNING HEALTHY UNHEALTHY RECOVERING FAILED STOPPING STOPPED'
@@ -99,9 +99,9 @@ task_state_from_legacy() {
     esac
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §2 Legacy Config Adapter（P1-05 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # config.txt → 内部 Task v2；legacy 全部语义保持（P1-01 基线）。返回码：
 #   0=全行成功 / 1=行级错误（合法行仍产出，错误行不产出）/ 2=文件级错误。
 # 内部助手以 rt_ 前缀命名（见库头命名空间说明），不覆盖 daemon/CLI 同名函数。
@@ -271,9 +271,9 @@ ${block_line}"
     return "$rc"
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §3 Provider 契约 + 静态 Provider（P1-04/07/08 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # kind: trigger | action | health | recovery；name 同 kind 内唯一；
 # prefix: 能力函数统一前缀；provider_dispatch 是引擎唯一依赖入口。
 TPR_KINDS='trigger action health recovery'
@@ -654,9 +654,9 @@ provider_register health process   tpr_health_process
 provider_register health port      tpr_health_port
 provider_register recovery builtin tpr_recovery_builtin
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §4 Runtime State & Event Log（P1-09 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 新状态源 <dir>/state.txt + 事件日志 <dir>/events.log（7 字段）；旧兼容文件
 # （status.txt/pid.txt/...）**只读不写**；日志失败不中止任务（仅返回非 0）。
 RT_EVENTS='create delete config_load time_trigger manual_exec spawn action_success action_failure timeout stop_request daemon_restart rearm enable disable supervisor probe recover'
@@ -743,9 +743,9 @@ runtime_scan_stale() {
     return 0
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §5 Canonical Task Registry（P1-06 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 完整快照 <base>/snapshots/snap_<N>/（确定性序号）+ `current` 指针原子切换；
 # 无效配置 → KEPT 保留最后有效快照；防重复注册（id==文件名且唯一）。
 # 返回码：0=已提交生效 / 1=解析失败回退（KEPT）/ 2=硬错误（无 config/无 adapter）。
@@ -900,9 +900,9 @@ registry_reload() {
     return 1
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §6 Lifecycle（P1-10 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 单实例锁 / stale 恢复 / 僵尸清理 / 启动初始化 / 停止 / 重启 / 看护单轮
 # （fail-safe：初始化失败回滚锁，不留半初始化状态）。
 lifecycle_log() {
@@ -1066,9 +1066,9 @@ lifecycle_watchdog_tick() {
     return 1
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §7 Task 只读 CLI（P1-11 验证原语 → P2-02 生产化）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 只读：task_cli_list / task_cli_status。数据源 = registry 快照（不重新解析
 # config.txt）；状态 = runtime_current_state（新 state.txt → 旧 status.txt
 # 推导 → 快照 runtime.state 回退）；错误三态 rc 1/2/3。
@@ -1164,9 +1164,9 @@ task_cli_status() {
     return 0
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §8 Registry Shadow Mode（P2-03，旁路比对）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # **不改 legacy 执行路径**（C2）：本层只镜像旧扫描、不消耗 daemon 扫描结果、
 # 不触发任何执行/修剪——仅建 Registry 快照并比对记录。
 #   - shadow_init  <base> <config> [log]  —— daemon 启动：建首快照 + 基线比对；
@@ -1412,7 +1412,7 @@ runtime_map_lookup() {      # <base> <tasks_dir> <id>：双向自动识别
     return 1
 }
 
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §10 Trigger Decision Layer（P2-05）
 # ═══════════════════════════════════════════════════════════════════════════
 # 正式入口（唯一）：trigger_decide —— 每个 registry Task 的 boot / time /
@@ -1498,7 +1498,7 @@ trigger_decide() {
             return 2 ;;
     esac
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §11 Action Execution Layer（P2-06）
 # ═══════════════════════════════════════════════════════════════════════════
 # 正式入口（唯一）：action_run —— 命令 / 脚本 / Termux / Interactive 四模式
@@ -1568,7 +1568,7 @@ action_run() {   # <id> <cmd> [termux] [interactive] [notify_start] [notify_end]
     echo "id=$id|mode=$mode|pid=$pid|dir=$run_dir"
     return 0
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §12 Unified State & Event Wiring（P2-07）
 # ═══════════════════════════════════════════════════════════════════════════
 # 生产事实源：新 `state.txt`（TSM v2 状态）+ `events.log`（7 字段事件行）成为
@@ -1704,7 +1704,7 @@ state_rehydrate_residual() {   # <tasks_dir>
     done
     return 0
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §13 Task CLI 接线（P2-08）
 # ═══════════════════════════════════════════════════════════════════════════
 # CLI `su-scheduler task list | task status <id>` 的生产数据路径：**读取
@@ -1755,7 +1755,7 @@ task_cli_status_id() {   # <base> <tasks_dir> <lock> <id> → rc 沿 §7 三态
     fi
     TASK_CLI_TASKS_DIR="$tasks" TASK_CLI_LOCK="$lock" task_cli_status "$canon"
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §14 Daemon Lifecycle Startup（P2-09）
 # ═══════════════════════════════════════════════════════════════════════════
 # daemon 启动生命周期（**单次执行，不创建第二个常驻循环**；**不重复实现锁逻辑**
@@ -1798,7 +1798,7 @@ lifecycle_startup_recover() {   # <tasks_dir> → 0=完成（幂等；单目录�
     state_rehydrate_residual "$tasks" >/dev/null 2>&1
     return 0
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §15 App Action Provider（P2-10）
 # ═══════════════════════════════════════════════════════════════════════════
 # 结构化 App Action（P1-04 契约预留；Shizuku/GKD 类应用可经结构化 Task 启动）：
@@ -1953,7 +1953,7 @@ tpr_action_exec_app() {   # <id> <dir> <spec>（spec 已全校验；构建固定
     fi
     return "$rc"
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §16 Process & Port Health Provider（P2-11）
 # ═══════════════════════════════════════════════════════════════════════════
 # 首批真实健康检查（P1-04 health 契约：validate / check）：
@@ -2078,7 +2078,7 @@ health_check() {
     }
     provider_dispatch health "$kind" check "$spec"
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §17 Supervisor Core（P2-12）+ Recovery/Retry/Cooldown（P2-13）
 # ═══════════════════════════════════════════════════════════════════════════
 # 驱动受监督任务的完整生命周期（TSM 允许边 + §16 健康检查）：
@@ -2330,9 +2330,9 @@ supervisor_tick() {
     supervisor_log "INFO tick: transitions=$n failed=$f"
     return 0
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §18 Crash Loop 保护与资源保护（P2-14）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 目标：daemon 异常退出（SIGKILL / 启动即崩）不得无限重启风暴；
 #       运行日志 / 快照 / 任务目录不得无限膨胀。
 # 判定模型：
@@ -2571,9 +2571,9 @@ supervisor_runtime_exceeded() {
     fi
     return 1
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §19 Canonical Task Config Store & Migration（P3-02）
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 双模式配置权威：
 #   - Legacy（默认，无 MANAGED 标记）：config.txt 是**唯一配置源**，daemon/CLI
 #     行为不变（C2/C4 零改动）；
@@ -2851,9 +2851,9 @@ tcfg_remove_task() {   # <id>
     rm -f "$f" 2>/dev/null || return 2
     return 0
 }
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # §20 Scheduler-Prod（P3-03）：Registry 正式调度源
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
 # 把 Registry 从 Shadow Mode 提升为**正式调度数据源**，结束「Registry 旁路、
 # legacy 实际执行」的双轨状态。调用方（daemon 主循环 RUNTIME_LOADED=1 分支）
 # 只经 `scheduler_tick` 获取任务：
@@ -3136,7 +3136,7 @@ scheduler_boot() {   # <base> <config> <tasks_dir> → 0
 # 命名空间：内部全局一律 ipcv_ 前缀（防覆盖调用方全局，同 P3-03 教训）。
 # ═══════════════════════════════════════════════════════════════════════════
 ipc_log() { [ "${IPC_LOG:-1}" = "1" ] && echo "[ipc] $1" >&2; }
-IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK GET_SUMMARY GET_TASK_DETAIL GET_TASK_EVENTS GET_DAEMON_LOG"
+IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK GET_SUMMARY GET_TASK_DETAIL GET_TASK_EVENTS GET_DAEMON_LOG GET_TASK_EDIT EDIT_TASK"
 IPC_REQ_MAX=4096
 IPC_POLL_MAX=64
 ipc_dir() { echo "$1/ipc"; }
@@ -3289,6 +3289,16 @@ $(tail -n "$ipcv_returned" "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null)"
 # VALIDATE_TASK：临时文件校验（不持久化）
 ipc_op_validate() {   # <base> <req_id> <params>
     ipcv_base=$1; ipcv_rid=$2; ipcv_params=$3
+    # P3-06：payload 参数 = 完整 Task v2 内容（编辑器预览/校验）→ 全字段校验
+    ipcv_pl=$(ipc_param "$ipcv_params" payload)
+    if [ -n "$ipcv_pl" ]; then
+        if tcfg_editor_validate_payload "$ipcv_pl"; then
+            ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 0 ok "valid"
+        else
+            ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "task invalid"
+        fi
+        return 0
+    fi
     ipcv_trig=$(ipc_param "$ipcv_params" trigger)
     ipcv_cmd=$(ipc_param "$ipcv_params" command)
     [ -n "$ipcv_trig" ] && [ -n "$ipcv_cmd" ] || {
@@ -3479,7 +3489,9 @@ ipc_allowed_keys() {   # <op> → 允许的参数键（空格分隔）
         GET_TASKS|GET_SUMMARY) echo "" ;;
         GET_TASK_STATUS|GET_TASK_LOG|GET_TASK_DETAIL|GET_TASK_EVENTS) echo "id lines" ;;
         GET_DAEMON_LOG) echo "lines" ;;
-        VALIDATE_TASK) echo "name trigger command enabled termux interactive notify_start notify_end msg" ;;
+        GET_TASK_EDIT) echo "id" ;;
+        EDIT_TASK) echo "id payload" ;;
+        VALIDATE_TASK) echo "name trigger command enabled termux interactive notify_start notify_end msg payload" ;;
         CREATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
         UPDATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
         DELETE_TASK|ENABLE_TASK|DISABLE_TASK) echo "id" ;;
@@ -3512,6 +3524,8 @@ ipc_dispatch() {
         GET_TASK_DETAIL) ipc_op_get_task_detail "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
         GET_TASK_EVENTS) ipc_op_get_task_events "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" "$(ipc_param "$ipcv_params" lines)" ;;
         GET_DAEMON_LOG) ipc_op_get_daemon_log "$ipcv_base" "$ipcv_rid" "$(ipc_param "$ipcv_params" lines)" ;;
+        GET_TASK_EDIT) ipc_op_get_task_edit "$ipcv_base" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
+        EDIT_TASK) ipc_op_edit_task "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" "$(ipc_param "$ipcv_params" payload)" ;;
         VALIDATE_TASK) ipc_op_validate "$ipcv_base" "$ipcv_rid" "$ipcv_params" ;;
         CREATE_TASK) ipc_op_create "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
         UPDATE_TASK) ipc_op_update "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
@@ -3805,10 +3819,239 @@ web_task_log_to_json() {   # <payload> → 单行 JSON
     done
     printf ']}'
 }
-# ───────────────────────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────────────────────
-# ───────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# §23 Task Editor Store（P3-06）：Task v2 表单 schema 的权威后端
+# ═══════════════════════════════════════════════════════════════════════════
+# 目标：WebUI Task Editor 的后端底座——「前后端双重校验」的后端半边（前端
+# 校验不是安全边界，最终以本层为准）。所有保存操作**原子化**（tmp+mv）、
+# **ID 防路径穿越**、**App Action 复用 P2-10 结构化校验**、**recovery script
+# 绝对路径且可读**、**全部数值范围钳制**；保存失败时旧配置逐字节不变。
+#
+# 输入：完整 Task v2 文件内容（POSIX key=value 多行；即 GET_TASK_EDIT 回显的
+#   原文，用户在编辑器上改字段后原样提交）。本层不引入新配置格式——
+#   task-config 存储规范（docs/architecture/task-config-store.md）不变。
+# 字段（表单 schema，P3-06）：
+#   Basic    schema_version / id / name / enabled / description
+#   Trigger  trigger（boot | HH:MM | HHMM | weekly: | nweekly: | monthly: |
+#            nmonthly: | yearly:；boot_completed / delay / interval / cron /
+#            oneshot 未实现 → 拒绝，编辑器必须禁用或隐藏）
+#   Action   action.type（command | script | app）
+#            - command：action.command 非空单行命令
+#            - script：action.command = 绝对路径脚本（存在可读）
+#            - app：action.command = app:op:target[:extras]（P2-10 全校验）
+#            action.notify_start/notify_end/delete/termux/interactive/
+#            run_once_now/boot（0|1）＋ action.msg
+#   Health   health.type（none|process|port）＋ health.target
+#   Recovery recovery.type（none|restart|start|stopstart|script）
+#            script → recovery.script 绝对路径且可读
+#   Retry    retry.max [0,100] / retry.interval [0,86400] /
+#            retry.cooldown [0,86400]
+#   Advanced advanced.timeout [0,86400] / advanced.environment（K=V 列表，
+#            安全字符集）/ advanced.concurrency [0,100] /
+#            advanced.logging [0,1000000]
+#   （不提供 dependency/condition 编辑：P3 边界，见 P3-ARCHITECTURE-DECISIONS
+#   D6；runtime.*/source.* 只读保留——编辑不可篡改运行事实与来源事实）
+# 命名空间：tcfg_ 前缀沿用 §19（内部全局 tcfgv_ / tedv_ 前缀）。
+# ═══════════════════════════════════════════════════════════════════════════
+# 数值范围助手：<val> <min> <max> → 0=合法
+tcfg_editor_num() {
+    tedv_v=$1; tedv_min=$2; tedv_max=$3
+    case "$tedv_v" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$tedv_v" -ge "$tedv_min" ] 2>/dev/null && [ "$tedv_v" -le "$tedv_max" ] 2>/dev/null
+}
+tcfg_editor_bool() {   # <val> → 0=合法（0|1）
+    [ "$1" = "0" ] || [ "$1" = "1" ]
+}
+tcfg_editor_id_ok() {   # <id> → 0=合法（charset + 无路径穿越）
+    case "$1" in
+        ""|*[!A-Za-z0-9_.-]*) return 1 ;;
+        *..*|*/*|*\*) return 1 ;;
+    esac
+    return 0
+}
+tcfg_editor_trigger_ok() {   # <trigger> → 0=已实现合法触发器（拒绝未实现族）
+    case "$1" in
+        boot) return 0 ;;
+        [0-9][0-9]:[0-9][0-9]) return 0 ;;
+        [0-9][0-9][0-9][0-9]) return 0 ;;
+        weekly:[1-7]:[0-9][0-9][0-9][0-9]) return 0 ;;
+        nweekly:[0-9]*:[1-7]:[0-9][0-9][0-9][0-9]) return 0 ;;
+        monthly:[0-9]*:[0-9][0-9][0-9][0-9]) return 0 ;;
+        nmonthly:[0-9]*:[0-9]*:[0-9][0-9][0-9][0-9]) return 0 ;;
+        yearly:[0-9][0-9][0-9][0-9]:[0-9][0-9][0-9][0-9]) return 0 ;;
+        yearly:[0-9][0-9]:[0-9][0-9]:[0-9][0-9][0-9][0-9]) return 0 ;;
+    esac
+    return 1
+}
+# action 校验：<type> <command> → 0=合法（app 复用 P2-10 结构化校验；
+# script 绝对路径存在可读；command 非空且不含未转义真实换行）
+tcfg_editor_action_ok() {
+    tedv_at=$1; tedv_cmd=$2
+    case "$tedv_at" in
+        command|script)
+            [ -n "$tedv_cmd" ] || return 1
+            printf '%s' "$tedv_cmd" | awk 'NR>1 { exit 0 } END { exit 1 }' 2>/dev/null; tedv_rc=$?
+            if [ "$tedv_rc" -ne 1 ]; then return 1; fi
+            if [ "$tedv_at" = "script" ]; then
+                case "$tedv_cmd" in
+                    /*) [ -f "$tedv_cmd" ] && [ -r "$tedv_cmd" ] || return 1 ;;
+                    *) return 1 ;;
+                esac
+            fi
+            return 0 ;;
+        app)
+            tpr_action_app_validate "$tedv_cmd" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+# health 校验：<type> <target> → 0=合法（process/port 复用 P2-11 校验）
+tcfg_editor_health_ok() {
+    tedv_ht=$1; tedv_hg=$2
+    case "$tedv_ht" in
+        none) [ -z "$tedv_hg" ] || [ "$tedv_hg" = "none" ] ;;
+        process) tpr_health_process_validate "$tedv_hg" 2>/dev/null ;;
+        port) tpr_health_port_validate "$tedv_hg" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+# recovery 校验：<type> <script> → 0=合法（script 绝对路径存在可读）
+tcfg_editor_recovery_ok() {
+    tedv_rt=$1; tedv_rs=$2
+    case "$tedv_rt" in
+        none|restart|start|stopstart) return 0 ;;
+        script)
+            case "$tedv_rs" in
+                /*) [ -f "$tedv_rs" ] && [ -r "$tedv_rs" ] || return 1 ;;
+                *) return 1 ;;
+            esac
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
+# 完整 payload 校验：<content> → 0=合法 / 1=非法（错误 → stderr，逐条）
+# 校验失败**绝不写盘**（调用方 tcfg_apply_task 只在 0 时原子写）。
+tcfg_editor_validate_payload() {   # <content>
+    tedv_content=$1
+    tedv_tmp=$(mktemp "/tmp/tcfg-edit.XXXXXX" 2>/dev/null) || return 1
+    printf '%s\n' "$tedv_content" > "$tedv_tmp"
+    tedv_id=""; tedv_name=""; tedv_enabled=""; tedv_desc=""; tedv_trig=""
+    tedv_atype=""; tedv_acmd=""; tedv_htype=""; tedv_htgt=""; tedv_rtype=""; tedv_rscr=""
+    tedv_rmax=""; tedv_rint=""; tedv_rcool=""; tedv_advto=""; tedv_advenv=""; tedv_advconc=""; tedv_advlog=""
+    tedv_sv=""; tedv_err=0
+    while IFS= read -r tedv_line || [ -n "$tedv_line" ]; do
+        case "$tedv_line" in ''|[#]*) continue ;;
+        esac
+        case "$tedv_line" in *"="*) ;; *) continue ;; esac
+        tedv_key=$(printf '%s' "$tedv_line" | cut -d= -f1 | tr -d '\n')
+        tedv_val=$(printf '%s' "$tedv_line" | cut -d= -f2- | tr -d '\n')
+        case "$tedv_key" in
+            schema_version) tedv_sv=$tedv_val ;;
+            id) tedv_id=$tedv_val ;;
+            name) tedv_name=$tedv_val ;;
+            enabled) tedv_enabled=$tedv_val ;;
+            description) tedv_desc=$tedv_val ;;
+            trigger) tedv_trig=$tedv_val ;;
+            action.type) tedv_atype=$tedv_val ;;
+            action.command) tedv_acmd=$tedv_val ;;
+            action.notify_start|action.notify_end|action.delete|action.termux|action.interactive|action.run_once_now|action.boot)
+                tcfg_editor_bool "$tedv_val" || { echo "[editor] ERROR: $tedv_key must be 0|1 (got '$tedv_val')" >&2; tedv_err=1; } ;;
+            action.msg) [ ${#tedv_val} -le 256 ] || { echo "[editor] ERROR: action.msg > 256 chars" >&2; tedv_err=1; } ;;
+            health.type) tedv_htype=$tedv_val ;;
+            health.target) tedv_htgt=$tedv_val ;;
+            recovery.type) tedv_rtype=$tedv_val ;;
+            recovery.script) tedv_rscr=$tedv_val ;;
+            retry.max) tedv_rmax=$tedv_val ;;
+            retry.interval) tedv_rint=$tedv_val ;;
+            retry.cooldown) tedv_rcool=$tedv_val ;;
+            advanced.timeout) tedv_advto=$tedv_val ;;
+            advanced.environment) tedv_advenv=$tedv_val ;;
+            advanced.concurrency) tedv_advconc=$tedv_val ;;
+            advanced.logging) tedv_advlog=$tedv_val ;;
+            source.*|runtime.*) : ;;   # 只读保留字段（编辑器不可改）
+            *) echo "[editor] ERROR: unknown key '$tedv_key' (editor schema)" >&2; tedv_err=1 ;;
+        esac
+    done < "$tedv_tmp"
+    rm -f "$tedv_tmp" 2>/dev/null
+
+    [ "$tedv_sv" = "2" ] || { echo "[editor] ERROR: schema_version must be 2" >&2; tedv_err=1; }
+    tcfg_editor_id_ok "$tedv_id" || { echo "[editor] ERROR: invalid id '$tedv_id' (charset/path-traversal)" >&2; tedv_err=1; }
+    [ -z "$tedv_enabled" ] && tedv_enabled=1
+    tcfg_editor_bool "$tedv_enabled" || { echo "[editor] ERROR: enabled must be 0|1" >&2; tedv_err=1; }
+    [ ${#tedv_name} -le 64 ] || { echo "[editor] ERROR: name > 64 chars" >&2; tedv_err=1; }
+    [ ${#tedv_desc} -le 256 ] || { echo "[editor] ERROR: description > 256 chars" >&2; tedv_err=1; }
+    tcfg_editor_trigger_ok "$tedv_trig" || { echo "[editor] ERROR: trigger '$tedv_trig' not implemented (P3 supports boot/time/advanced families only)" >&2; tedv_err=1; }
+    [ -z "$tedv_atype" ] && tedv_atype=command
+    tcfg_editor_action_ok "$tedv_atype" "$tedv_acmd" || { echo "[editor] ERROR: invalid action type='$tedv_atype' command='$tedv_acmd'" >&2; tedv_err=1; }
+    [ -z "$tedv_htype" ] && tedv_htype=none
+    tcfg_editor_health_ok "$tedv_htype" "$tedv_htgt" || { echo "[editor] ERROR: invalid health type='$tedv_htype' target='$tedv_htgt'" >&2; tedv_err=1; }
+    [ -z "$tedv_rtype" ] && tedv_rtype=none
+    tcfg_editor_recovery_ok "$tedv_rtype" "$tedv_rscr" || { echo "[editor] ERROR: invalid recovery type='$tedv_rtype' script='$tedv_rscr'" >&2; tedv_err=1; }
+    [ -z "$tedv_rmax" ] && tedv_rmax=0
+    tcfg_editor_num "$tedv_rmax" 0 100 || { echo "[editor] ERROR: retry.max must be 0-100" >&2; tedv_err=1; }
+    [ -z "$tedv_rint" ] && tedv_rint=60
+    tcfg_editor_num "$tedv_rint" 0 86400 || { echo "[editor] ERROR: retry.interval must be 0-86400" >&2; tedv_err=1; }
+    [ -z "$tedv_rcool" ] && tedv_rcool=0
+    tcfg_editor_num "$tedv_rcool" 0 86400 || { echo "[editor] ERROR: retry.cooldown must be 0-86400" >&2; tedv_err=1; }
+    [ -z "$tedv_advto" ] && tedv_advto=0
+    tcfg_editor_num "$tedv_advto" 0 86400 || { echo "[editor] ERROR: advanced.timeout must be 0-86400" >&2; tedv_err=1; }
+    if [ -n "$tedv_advenv" ]; then
+        case "$tedv_advenv" in
+            *[!A-Za-z0-9_=,.:/+-]*) echo "[editor] ERROR: advanced.environment has unsafe chars (K=V,K=V)" >&2; tedv_err=1 ;;
+        esac
+    fi
+    [ -z "$tedv_advconc" ] && tedv_advconc=0
+    tcfg_editor_num "$tedv_advconc" 0 100 || { echo "[editor] ERROR: advanced.concurrency must be 0-100" >&2; tedv_err=1; }
+    [ -z "$tedv_advlog" ] && tedv_advlog=0
+    tcfg_editor_num "$tedv_advlog" 0 1000000 || { echo "[editor] ERROR: advanced.logging must be 0-1000000" >&2; tedv_err=1; }
+    [ "$tedv_err" -eq 0 ] || return 1
+    return 0
+}
+# 原子应用：<id> <content> → 0=成功 1=校验失败（不写盘） 2=硬错误
+# managed 模式；tmp+mv 原子；失败清理 tmp、旧 task 文件逐字节不变。
+tcfg_apply_task() {   # <id> <content>
+    tedv_id=$1; tedv_content=$2
+    tcfg_is_managed || { echo "[editor] ERROR: write ops require managed task-config (run: su-scheduler task-config import)" >&2; return 1; }
+    tcfg_editor_id_ok "$tedv_id" || { echo "[editor] ERROR: invalid id '$tedv_id'" >&2; return 1; }
+    tedv_reqid=$tedv_id   # 先保存请求 id（validate 内部会覆盖 tedv_id，POSIX 无局部变量）
+    tcfg_editor_validate_payload "$tedv_content" || return 1
+    # 一致性：payload 内 id= 必须等于请求 id（与文件名一致，防保存后 reload 隔离）
+    tedv_pid=$(printf '%s' "$tedv_content" | grep '^id=' | head -1 | cut -d= -f2- | tr -d '\n')
+    [ -n "$tedv_pid" ] && [ "$tedv_pid" = "$tedv_reqid" ] || { echo "[editor] ERROR: payload id mismatch (got '$tedv_pid' want '$tedv_reqid')" >&2; return 1; }
+    tedv_f=$(tcfg_task_file "$tedv_reqid")
+    tedv_tmp="$tedv_f.tmp.$$"
+    printf '%s\n' "$tedv_content" > "$tedv_tmp" 2>/dev/null || { rm -f "$tedv_tmp"; return 2; }
+    mv "$tedv_tmp" "$tedv_f" 2>/dev/null || { rm -f "$tedv_tmp"; return 2; }
+    return 0
+}
+# GET_TASK_EDIT：返回 task-config 完整原文（base64 载荷；编辑器回填表单用）
+ipc_op_get_task_edit() {   # <base> <req_id> <id>
+    ipcv_base=$1; ipcv_rid=$2; ipcv_id=$3
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_EDIT 1 invalid_request "missing id"; return 0; }
+    [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_EDIT 3 task_not_found "$ipcv_id"; return 0; }
+    ipcv_content=$(cat "$(tcfg_task_file "$ipcv_id")" 2>/dev/null)
+    ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_EDIT 0 ok "$(ipc_b64enc "$ipcv_content")"
+    return 0
+}
+# EDIT_TASK：完整 Task v2 内容原子写入（managed）+ reload
+# 参数：id + payload（完整 key=value 内容 base64；GET_TASK_EDIT 回显 → 编辑 → 回传）
+ipc_op_edit_task() {   # <base> <config> <req_id> <id> <payload>
+    ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_payload=$5
+    tcfg_is_managed || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+    [ -n "$ipcv_id" ] && [ -n "$ipcv_payload" ] || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 1 invalid_request "missing id/payload"; return 0; }
+    tcfg_apply_task "$ipcv_id" "$ipcv_payload"
+    ipcv_arc=$?
+    case "$ipcv_arc" in
+        0)
+            sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
+            ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 0 ok "saved $ipcv_id" ;;
+        1) ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 configuration_invalid "task invalid (config unchanged)" ;;
+        *) ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 configuration_invalid "write failed" ;;
+    esac
+    return 0
+}
+# ────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -3835,6 +4078,8 @@ runtime_lib_selfcheck() {
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
               web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
               web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
+              tcfg_editor_num tcfg_editor_bool tcfg_editor_id_ok tcfg_editor_trigger_ok tcfg_editor_action_ok \
+              tcfg_editor_health_ok tcfg_editor_recovery_ok tcfg_editor_validate_payload tcfg_apply_task ipc_op_get_task_edit ipc_op_edit_task \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \
               ipc_op_start ipc_op_stop ipc_op_restart ipc_client_send \
               ipc_b64enc ipc_b64dec ipc_task_state ipc_has_newline; do

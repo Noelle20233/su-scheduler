@@ -116,7 +116,7 @@ ipc_server_init "$BASE" >/dev/null 2>&1
 pm=$(ls -ld "$BASE/ipc" | awk '{print $1}')
 [ "$pm" = "drwx------" ] && ok "P3-04 transport: ipc dir perms $pm (root-only)" || bad "P3-04 transport: ipc perms=$pm"
 n=$(echo "$IPC_WHITELIST" | wc -w)
-[ "$n" -eq 16 ] && ok "P3-04/P3-05 transport: IPC_WHITELIST 16 ops (12 control + 4 WebUI read-only)" || bad "P3-04/P3-05/P3-06 transport: whitelist count=$n"
+[ "$n" -eq 18 ] && ok "P3-04/P3-05/P3-06 transport: IPC_WHITELIST 18 ops (12 control + 4 WebUI read-only + GET_TASK_EDIT/EDIT_TASK)" || bad "P3-04/P3-05/P3-06 transport: whitelist count=$n"
 grep -q 'GET_SUMMARY' <<< "$IPC_WHITELIST" && grep -q 'GET_TASK_DETAIL' <<< "$IPC_WHITELIST" \
   && grep -q 'GET_TASK_EVENTS' <<< "$IPC_WHITELIST" && grep -q 'GET_DAEMON_LOG' <<< "$IPC_WHITELIST" \
   && ok "P3-05 transport: WebUI read-only ops in whitelist (GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG)" \
