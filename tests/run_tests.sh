@@ -52,6 +52,14 @@
 #   L2  tests/task-control/test.sh   P3-07 Task 控制操作（WebUI/CLI 共用同一控制 API：§24
 #       tctl_* + TSM 强制（start/stop/check 可追踪）+ 并发 skip + stop 不误杀 + 旧运行 ID
 #       控制旧运行目录 + enable/disable 仅 managed + CLI 子命令经 IPC 全链路 + 失败零副作用）
+#   L2  tests/security/fuzz.sh       P3-08 输入安全（IPC 白名单/格式 fuzz、Task ID 字符集、
+#       请求大小限制、START/CREATE/UPDATE 命令注入全拒、App Action/脚本路径校验、零副作用）
+#   L2  tests/security/path-validation.sh  P3-08 路径安全（路径穿越/符号链接/允许目录约束/
+#       Task ID 门/IPC 穿越 id 拒绝零泄露）
+#   L2  tests/security/permission.sh P3-08 文件安全（secv_fix_perms 强制、原子写 tmp 清理、
+#       secv_sweep_tmp、未授权写 permission_denied）
+#   L2  tests/resource/stress.sh     P3-08 资源安全（100 Task 单循环无 100 永久循环、
+#       日志/快照/任务目录上限、单任务错误隔离、IPC 频率限制 rc 7、CPU/内存有界）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -133,6 +141,10 @@ else
         "tests/webui/security.test.sh" \
         "tests/webui/editor.test.sh" \
         "tests/task-control/test.sh" \
+        "tests/security/fuzz.sh" \
+        "tests/security/path-validation.sh" \
+        "tests/security/permission.sh" \
+        "tests/resource/stress.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

@@ -98,6 +98,10 @@ if [ "$RUNTIME_LOADED" -eq 1 ]; then
     done
     # ⚙️ 本地 IPC 控制面（P3-04）：建 0700 请求/响应目录 + daemon.pid 存活标记
     ipc_server_init "$DATA_DIR" >/dev/null 2>&1
+    # ⚙️ 安全与资源加固（P3-08）：权限强制（ipc 0700 / task-config 600 /
+    #   运行目录 700 / 文件 600）+ 请求频率限制状态重置（每 daemon 启动新窗）
+    secv_fix_perms "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+    rm -f "$(ipc_dir "$DATA_DIR")/rate.state" 2>/dev/null
 fi
 
 # 📝 Function to log events with pretty timestamps and colors

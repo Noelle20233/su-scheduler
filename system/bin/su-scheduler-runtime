@@ -14,6 +14,7 @@
 #      依赖顺序：§1→§2→§3→§4→§5→§6→§7（本文件内已按序排列；单文件自包含，
 #      不 source 任何外部文件——与测试域 P1 库**路径隔离**：测试库不改动，本库
 #      零引用测试域路径（路径隔离门禁由 P2-02 回归套件断言，记录见 docs/P2-02.md）。
+#      §21-§24 为 P3 系列（IPC/WebUI/Editor/Control）；§25 为 P3-08 安全与资源加固。
 # ═══════════════════════════════════════════════════════════════════════════
 # 约束（C3）：纯 POSIX sh + Android 系统命令（echo/printf/sed/grep/awk/cut/
 #  sort/ls/date/mkdir/rm/mv/cat/mkfifo/kill/sleep/nohup/chmod/md5sum/type），
@@ -29,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.18.0"
+RUNTIME_LIB_VERSION="1.19.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2238,8 +2239,9 @@ supervisor_step() {
             if [ ! -e "$rd/supervisor.since" ]; then
                 date +%s > "$rd/supervisor.since" 2>/dev/null
             fi
-            # P2-14：运行超时护栏（TASK_RUNTIME_MAX>0 且超时 → FAILED 终止）
-            if supervisor_runtime_exceeded "$rd"; then
+            # P2-14：运行超时护栏（P3-08：按 per-task 有效超时 advanced.timeout，
+            # 缺省 TASK_RUNTIME_MAX；>0 且超时 → FAILED 终止）
+            if supervisor_runtime_exceeded "$rd" "$(secv_effective_timeout "$tf")"; then
                 supervisor_stop_task "$rd" 1
                 state_log_event "$rd" "$id" supervisor FAILED "" "" "runtime-limit exceeded" >/dev/null 2>&1 && return 1
             fi
@@ -2253,8 +2255,8 @@ supervisor_step() {
             fi
             return 0 ;;
         HEALTHY)
-            # P2-14：运行超时护栏（超时 → FAILED 终止）
-            if supervisor_runtime_exceeded "$rd"; then
+            # P2-14：运行超时护栏（P3-08：per-task 有效超时；超时 → FAILED 终止）
+            if supervisor_runtime_exceeded "$rd" "$(secv_effective_timeout "$tf")"; then
                 supervisor_stop_task "$rd" 1
                 state_log_event "$rd" "$id" supervisor FAILED "" "" "runtime-limit exceeded" >/dev/null 2>&1 && return 1
             fi
@@ -2535,9 +2537,14 @@ runtime_protect() {
     return 0
 }
 
-# 任务目录资源保护（daemon 每 tick）：<tasks_dir> → 目录数上限修剪
+# 任务目录资源保护（daemon 每 tick）：<tasks_dir> → 单 Task 日志字节上限截断
+# + 目录数上限修剪
 runtime_protect_tasks() {
     td=$1
+    for rd in "$td"/*; do
+        [ -d "$rd" ] || continue
+        runtime_limit_task_log "$rd"
+    done
     runtime_prune_tasks "$td" "$TASK_DIRS_MAX"
     return 0
 }
@@ -2559,14 +2566,17 @@ supervisor_health_mark() {   # <run_dir>
     return 0
 }
 
-# 运行超时判定：<run_dir> → 0=超时 1=未超时（TASK_RUNTIME_MAX ≤0 → 恒不超时）
+# 运行超时判定：<run_dir> [timeout] → 0=超时 1=未超时（timeout≤0 → 恒不超时）
+# P3-08：第二参为可选的有效超时（§25 secv_effective_timeout 产出；缺省
+# TASK_RUNTIME_MAX）——每个 Action 必须有超时（per-task advanced.timeout 生效，
+# 且不超全局护栏）。
 supervisor_runtime_exceeded() {
-    rd=$1
-    [ "$TASK_RUNTIME_MAX" -le 0 ] 2>/dev/null && return 1
+    rd=$1; tmx=${2:-$TASK_RUNTIME_MAX}
+    [ "$tmx" -le 0 ] 2>/dev/null && return 1
     since=$(cat "$rd/supervisor.since" 2>/dev/null)
     [ -n "$since" ] || return 1
     now=$(date +%s)
-    if [ $((now - since)) -ge "$TASK_RUNTIME_MAX" ]; then
+    if [ $((now - since)) -ge "$tmx" ]; then
         return 0
     fi
     return 1
@@ -3147,7 +3157,9 @@ ipc_pid_file() { echo "$1/ipc/daemon.pid"; }
 ipc_b64enc() { printf '%s' "$1" | base64 2>/dev/null | tr -d '\n'; }
 ipc_b64dec() { printf '%s' "$1" | base64 -d 2>/dev/null; }
 # 判定解码值含真实换行（防 task 文件被多行污染——task 命令须单行存储）
-ipc_has_newline() { printf '%s' "$1" | awk 'NR>1 { exit 0 } END { exit 1 }' 2>/dev/null; }
+# P3-08：改为 END 汇总式判定（NR>1 → 含换行 → 0）——`NR>1{exit 0}END{exit 1}`
+# 在部分 awk（gawk）下 END 会覆盖 exit，导致恒判无换行（多行注入漏检）。
+ipc_has_newline() { printf '%s' "$1" | awk 'END { exit (NR>1 ? 0 : 1) }' 2>/dev/null; }
 # 服务端初始化：建 0700 目录 + daemon.pid 存活标记
 ipc_server_init() {   # <base> → 0
     ipcv_base=$1
@@ -3261,10 +3273,9 @@ state=$ipcv_st"
     return 0
 }
 ipc_op_get_log() {   # <base> <tasks> <req_id> <id> [lines]
-    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_lines=${5:-50}
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4
+    ipcv_lines=$(secv_num_clamp "${5:-50}" 1 "$WEBUI_LOG_MAX" 50)
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 1 invalid_request "missing id"; return 0; }
-    case "$ipcv_lines" in ''|*[!0-9]*) ipcv_lines=50 ;; esac
-    [ "$ipcv_lines" -gt "$WEBUI_LOG_MAX" ] && ipcv_lines=$WEBUI_LOG_MAX
     # P3-07：稳定 Task ID 与旧运行 ID 均可查日志——解析运行目录（旧运行 ID 用其目录本体）
     ipcv_rd=""
     if [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_id" ]; then
@@ -3534,6 +3545,17 @@ ipc_dispatch() {
         done
         IFS=$ipcv_oldifs
     }
+    # P3-08：Task ID 字符集/路径穿越门（所有 id-bearing op 共用；非法 id →
+    # invalid_request 零副作用，绝不进入文件路径拼接）
+    case " $ipcv_allow " in
+        *" id "*)
+            ipcv_qid=$(ipc_param "$ipcv_params" id)
+            if [ -n "$ipcv_qid" ] && ! secv_id_ok "$ipcv_qid"; then
+                ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 1 invalid_request "invalid id (charset/path-traversal)"
+                return 0
+            fi
+            ;;
+    esac
     case "$ipcv_op" in
         GET_TASKS) ipc_op_get_tasks "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" ;;
         GET_SUMMARY) ipc_op_get_summary "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" ;;
@@ -3558,11 +3580,14 @@ ipc_dispatch() {
     return 0
 }
 # 服务端轮询（daemon 主循环调用；单轮 ≤ IPC_POLL_MAX 个请求，绝不阻塞）：
-# 扫描 requests/*.req → 读取/限长/解析/分发 → 原子响应 → 删除请求文件。
+# 扫描 requests/*.req → 读取/限长/解析/频率限制/分发 → 原子响应 → 删除请求文件。
+# P3-08：频率限制（时间窗 IPC_RATE_MAX/窗，超限 → rc 7 rate_limited 零副作用）
+# + 临时文件清理兜底。
 ipc_server_poll() {   # <base> <config> <tasks_dir> → 0
     ipcv_base=$1; ipcv_config=$2; ipcv_tasks=$3
     ipcv_rdir=$(ipc_req_dir "$ipcv_base")
     [ -d "$ipcv_rdir" ] || return 0
+    secv_sweep_tmp "$ipcv_base" >/dev/null 2>&1
     ipcv_n=0
     for ipcv_rf in "$ipcv_rdir"/*.req; do
         [ -f "$ipcv_rf" ] || continue
@@ -3582,6 +3607,11 @@ ipc_server_poll() {   # <base> <config> <tasks_dir> → 0
         ipcv_line=$(cat "$ipcv_rf" 2>/dev/null | tr -d '\r')
         rm -f "$ipcv_rf" 2>/dev/null       # 先取走再处理（防重放）
         if ipc_parse "$ipcv_line"; then
+            # P3-08：请求频率限制（合法格式请求计窗；超限 → rc 7，不处理不执行）
+            if ! secv_ipc_ratelimit "$ipcv_base"; then
+                ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 7 rate_limited "request rate exceeded"
+                continue
+            fi
             ipc_dispatch "$ipcv_base" "$ipcv_config" "$ipcv_tasks" "$ipcv_rid" "$ipcv_op" "$ipcv_params"
         else
             ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 invalid_request "malformed request"
@@ -3798,10 +3828,9 @@ ipc_op_get_task_detail() {   # <base> <tasks> <req_id> <id>
     return 0
 }
 ipc_op_get_task_events() {   # <base> <tasks> <req_id> <id> [lines]
-    webv_base=$1; webv_tasks=$2; webv_rid=$3; webv_id=$4; webv_lines=${5:-50}
+    webv_base=$1; webv_tasks=$2; webv_rid=$3; webv_id=$4
+    webv_lines=$(secv_num_clamp "${5:-50}" 1 "$WEBUI_EVENTS_MAX" 50)
     [ -n "$webv_id" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_EVENTS 1 invalid_request "missing id"; return 0; }
-    case "$webv_lines" in ''|*[!0-9]*) webv_lines=50 ;; esac
-    [ "$webv_lines" -gt "$WEBUI_EVENTS_MAX" ] && webv_lines=$WEBUI_EVENTS_MAX
     webv_f=$(registry_task_file "$webv_id" 2>/dev/null)
     [ -n "$webv_f" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_EVENTS 3 task_not_found "$webv_id"; return 0; }
     webv_payload=$(web_log_payload "$webv_tasks/$webv_id/events.log" "$webv_lines" "\"task\":$(web_json_str "$webv_id"),")
@@ -3809,9 +3838,8 @@ ipc_op_get_task_events() {   # <base> <tasks> <req_id> <id> [lines]
     return 0
 }
 ipc_op_get_daemon_log() {   # <base> <req_id> [lines]
-    webv_base=$1; webv_rid=$2; webv_lines=${3:-50}
-    case "$webv_lines" in ''|*[!0-9]*) webv_lines=50 ;; esac
-    [ "$webv_lines" -gt "$WEBUI_LOG_MAX" ] && webv_lines=$WEBUI_LOG_MAX
+    webv_base=$1; webv_rid=$2
+    webv_lines=$(secv_num_clamp "${3:-50}" 1 "$WEBUI_LOG_MAX" 50)
     webv_payload=$(web_log_payload "$webv_base/su-scheduler.log" "$webv_lines" "")
     ipc_respond "$webv_base" "$webv_rid" GET_DAEMON_LOG 0 ok "$webv_payload"
     return 0
@@ -4108,6 +4136,9 @@ tctl_log() {
 # canonical 目录（稳定 ID 运行目录）。
 tctl_resolve() {   # <base> <tasks> <qid>
     tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
+    # P3-08：入口强制 Task ID 字符集/路径穿越门（IPC dispatch 已查，此处兜底
+    # 覆盖 CLI 直接调用——非法 id 绝不进入文件路径拼接）
+    secv_id_ok "$tclv_qid" || return 1
     tclv_canon=$(task_cli_resolve_id "$tclv_base" "$tclv_tasks" "$tclv_qid") || return 1
     tclv_rd=""
     if [ -n "$tclv_tasks" ] && [ -d "$tclv_tasks/$tclv_qid" ]; then
@@ -4258,12 +4289,12 @@ tctl_check() {
 # 查询任务日志（运行目录 output.log 尾部）：
 #   <base> <tasks> <qid> [lines] → 0 / 1=not_found
 tctl_logs() {
-    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3; tclv_lines=${4:-50}
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
+    tclv_lines=$(secv_num_clamp "${4:-50}" 1 500 50)
     tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
         echo "task_not_found $tclv_qid"; return 1; }
     tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
     [ -n "$tclv_rd" ] && [ -d "$tclv_rd" ] || { echo "(no run dir yet)"; return 0; }
-    case "$tclv_lines" in ''|*[!0-9]*) tclv_lines=50 ;; esac
     if [ -f "$tclv_rd/output.log" ]; then
         tail -n "$tclv_lines" "$tclv_rd/output.log" 2>/dev/null
     else
@@ -4284,6 +4315,193 @@ tctl_set_enabled() {
         echo "write_failed $tclv_canon"; return 3; }
     sched_reload "$tclv_base" "$tclv_config" >/dev/null 2>&1
     echo "enabled=$tclv_val $tclv_canon"
+    return 0
+}
+# ────────────────────────────────────────────────────────────────────────
+# §25 Security & Resource Hardening（P3-08）：WebUI 高权限平台的加固层
+# ═══════════════════════════════════════════════════════════════════════════
+# 目标：WebUI 成为高权限（root）平台后，杜绝三类失控——任意 Root 执行、配置
+#   破坏、资源失控。本层为**叠加加固**（C2/C4：不改既有解析语义与执行路径，
+#   不新增 eval / 不直接 sh -c / 不临时拼接 Root 命令），全部为可独立验证的
+#   校验原语 + 既有入口的收口。
+# 输入安全：
+#   - secv_id_ok        Task ID 字符集（^[A-Za-z0-9_.-]{1,128}$ 且无 `..`）——
+#                       IPC 全部 id-bearing op 与 tctl_resolve 入口强制；
+#   - secv_num_clamp    数值范围钳制（IPC lines 等；防超大数溢出算术）；
+#   - 请求大小限制/op 白名单/参数键白名单（§21 既有，P3-04）；
+# 文件安全：
+#   - secv_inside       路径必须位于允许目录（拒绝 `..` 段逃逸）；
+#   - secv_nosymlink    拒绝符号链接（防链接指向允许目录外）；
+#   - secv_guard_task_dir  任务运行目录 = id 合法 + 位于 tasks 内 + 非符号链接；
+#   - secv_fix_perms    权限强制：ipc 0700 / task-config 600 / 运行目录 700 / 文件 600；
+#   - secv_sweep_tmp    临时文件清理（ipc tmp/沙箱、task-config tmp 残留）；
+#   - 原子写入（tmp+mv）与失败清理（§19/§21 既有，本层补 sweep 兜底）；
+# 执行安全：
+#   - 不新增 eval；服务端绝不把请求内容交给 shell 解释（§21 既有）；
+#   - WebUI/CLI 只经 IPC 受控 op，命令只读自已校验任务文件（§21/§24 既有）；
+#   - secv_effective_timeout  每个 Action 有超时：advanced.timeout>0 且 ≤
+#     TASK_RUNTIME_MAX（全局护栏）→ 生效；否则回落 TASK_RUNTIME_MAX（≥0）；
+# 资源安全：
+#   - runtime_limit_task_log  单 Task 日志字节上限（output.log/events.log）；
+#   - runtime_prune_tasks / runtime_prune_snapshots（P2-14 既有上限）；
+#   - secv_ipc_ratelimit      IPC 请求频率限制（时间窗计数，超限 → rc 7）；
+#   - IPC_POLL_MAX / WEBUI_LOG_MAX / WEBUI_EVENTS_MAX（既有，P3-04/P3-05）。
+# 命名空间：函数 secv_ 前缀、内部全局 secv_ 前缀（防覆盖调用方全局，同 §21）。
+# ═══════════════════════════════════════════════════════════════════════════
+TASK_LOG_MAX_BYTES=${TASK_LOG_MAX_BYTES:-262144}
+IPC_RATE_WINDOW=${IPC_RATE_WINDOW:-1}
+IPC_RATE_MAX=${IPC_RATE_MAX:-256}
+SECV_ID_MAXLEN=${SECV_ID_MAXLEN:-128}
+
+# Task ID 字符集门：^[A-Za-z0-9_.-]{1,128}$ 且不含 `..`（路径穿越）。
+# 覆盖 canonical ID（t<line>_<trigger>/task_*）与旧运行 ID
+# （time_<HHMM>_<n>_<epoch>/advanced_/immediate_/startup_<n>_<epoch>）。
+secv_id_ok() {   # <id> → 0=合法 1=非法
+    secv_id=$1
+    [ -n "$secv_id" ] || return 1
+    [ "${#secv_id}" -le "$SECV_ID_MAXLEN" ] || return 1
+    case "$secv_id" in
+        *[!A-Za-z0-9_.-]*) return 1 ;;
+        *..*|*/*|*\\) return 1 ;;
+    esac
+    return 0
+}
+# 数值范围钳制：<val> <min> <max> <default> → echo 钳制值（非数字/超大 → 缺省）
+secv_num_clamp() {   # 防止超大数字让 POSIX 算术溢出（`-gt` 报 integer 溢出）
+    secv_v=$1; secv_min=$2; secv_max=$3; secv_def=$4
+    case "$secv_v" in
+        ''|*[!0-9]*) secv_v=$secv_def ;;
+    esac
+    [ "${#secv_v}" -gt 9 ] && secv_v=$secv_def
+    if [ "$secv_v" -lt "$secv_min" ] 2>/dev/null; then secv_v=$secv_min; fi
+    if [ "$secv_v" -gt "$secv_max" ] 2>/dev/null; then secv_v=$secv_max; fi
+    echo "$secv_v"
+}
+# 路径必须位于允许目录：<base> <path> → 0=path 在 base 内（含 `..` 段拒绝）
+secv_inside() {   # 词法判定：先前缀匹配 base/，再逐段拒绝 `..`（不落地含
+    secv_base=$1; secv_path=$2   # `..`/ 字面量，满足 P2-02 生产库零引用门禁）
+    [ -n "$secv_base" ] || return 1
+    case "$secv_path" in
+        "$secv_base") return 0 ;;
+        "$secv_base"/*) ;;
+        *) return 1 ;;
+    esac
+    secv_rel=${secv_path#"$secv_base"/}
+    secv_oldifs=$IFS; IFS='/'
+    for secv_seg in $secv_rel; do
+        if [ "$secv_seg" = "." ] || [ "$secv_seg" = ".." ]; then
+            IFS=$secv_oldifs
+            return 1
+        fi
+    done
+    IFS=$secv_oldifs
+    return 0
+}
+# 符号链接风险：<path> → 0=不存在或真实文件（非符号链接） 1=符号链接
+secv_nosymlink() {   # 目标目录/文件不得为符号链接（防指向允许目录外）
+    [ -L "$1" ] 2>/dev/null && return 1 || return 0
+}
+# 任务运行目录门：<tasks_dir> <id> → 0=安全（id 合法 + 目录位于 tasks 内 + 非符号链接）
+secv_guard_task_dir() {
+    secv_tasks=$1; secv_id=$2
+    secv_id_ok "$secv_id" || return 1
+    secv_inside "$secv_tasks" "$secv_tasks/$secv_id" || return 1
+    [ -e "$secv_tasks/$secv_id" ] && secv_nosymlink "$secv_tasks/$secv_id" || return 1
+    return 0
+}
+# IPC 请求频率限制（窗口计数）：<base> → 0=放行 1=拒绝（rate_limited）
+# 状态文件 ipc/rate.state（`window_bucket|count`，tmp+mv 原子）；窗口桶 =
+# floor(now / IPC_RATE_WINDOW)（同窗口期共享计数，不受秒级边界影响——慢宿主
+# 逐请求跨秒也不会错误重置）；每窗内至多 IPC_RATE_MAX 个请求；超限后续请求
+# 拒绝（不处理、不执行）。窗口越界自动重置——可确定测试（设大窗口 + 小上限）。
+secv_ipc_ratelimit() {
+    secv_base=$1
+    secv_dir=$(ipc_dir "$secv_base")
+    secv_state="$secv_dir/rate.state"
+    mkdir -p "$secv_dir" 2>/dev/null
+    [ "$IPC_RATE_WINDOW" -le 0 ] 2>/dev/null && return 0
+    secv_now=$(date +%s)
+    secv_b=$((secv_now / IPC_RATE_WINDOW))
+    secv_w=""; secv_c=0
+    if [ -f "$secv_state" ]; then
+        IFS='|' read -r secv_w secv_c _ < "$secv_state" 2>/dev/null
+    fi
+    case "$secv_c" in ''|*[!0-9]*) secv_c=0 ;; esac
+    if [ -z "$secv_w" ] || [ "$secv_w" != "$secv_b" ]; then
+        secv_w=$secv_b
+        secv_c=0
+    fi
+    if [ "$secv_c" -ge "$IPC_RATE_MAX" ]; then
+        return 1
+    fi
+    secv_c=$((secv_c + 1))
+    printf '%s|%s\n' "$secv_w" "$secv_c" > "$secv_state.tmp.$$" 2>/dev/null \
+        && mv "$secv_state.tmp.$$" "$secv_state" 2>/dev/null
+    return 0
+}
+# 临时文件清理（每次 poll 兜底）：<base> → 清 IPC tmp/沙箱 + task-config tmp 残留
+secv_sweep_tmp() {
+    secv_base=$1
+    for secv_f in "$(ipc_req_dir "$secv_base")"/*.tmp \
+                  "$(ipc_resp_dir "$secv_base")"/*.tmp; do
+        [ -e "$secv_f" ] && rm -f "$secv_f" 2>/dev/null
+    done
+    for secv_d in "$(ipc_dir "$secv_base")"/.validate.* \
+                  "$(ipc_dir "$secv_base")"/.create.*; do
+        [ -d "$secv_d" ] && rm -rf "$secv_d" 2>/dev/null
+    done
+    if tcfg_is_managed 2>/dev/null; then
+        for secv_f in "$(tcfg_dir)"/*.tmp.*; do
+            [ -e "$secv_f" ] && rm -f "$secv_f" 2>/dev/null
+        done
+    fi
+    return 0
+}
+# 权限强制：<base> <tasks> → ipc 0700 / task-config 600 / 运行目录 700 / 文件 600
+# （chmod 不可用/不支持的文件系统上为 no-op，不视为失败——权限门禁另有逻辑层）。
+secv_fix_perms() {
+    secv_base=$1; secv_tasks=$2
+    chmod 700 "$(ipc_dir "$secv_base")" "$(ipc_req_dir "$secv_base")" \
+              "$(ipc_resp_dir "$secv_base")" 2>/dev/null
+    if tcfg_is_managed 2>/dev/null; then
+        chmod 700 "$(tcfg_dir)" 2>/dev/null
+        chmod 600 "$(tcfg_dir)"/*.task 2>/dev/null
+    fi
+    [ -n "$secv_tasks" ] && [ -d "$secv_tasks" ] && chmod 700 "$secv_tasks" 2>/dev/null
+    for secv_d in "$secv_tasks"/*; do
+        [ -d "$secv_d" ] || continue
+        chmod 700 "$secv_d" 2>/dev/null
+        chmod 600 "$secv_d"/* 2>/dev/null
+    done
+    chmod 700 "$secv_base/snapshots" "$secv_base/scheduler" "$secv_base/audit" 2>/dev/null
+    chmod 600 "$secv_base/current" 2>/dev/null
+    return 0
+}
+# 每个 Action 的有效超时：<task_file> → echo 秒数（advanced.timeout>0 且 ≤ 全局
+# TASK_RUNTIME_MAX → 生效；否则回落 TASK_RUNTIME_MAX；≤0 → 0=不限）
+secv_effective_timeout() {
+    secv_tf=$1
+    secv_t=$(sched_task_field "$secv_tf" advanced.timeout)
+    case "$secv_t" in
+        ''|*[!0-9]*) secv_t=0 ;;
+    esac
+    if [ "$secv_t" -gt 0 ] 2>/dev/null; then
+        if [ "$TASK_RUNTIME_MAX" -gt 0 ] 2>/dev/null && [ "$secv_t" -gt "$TASK_RUNTIME_MAX" ]; then
+            echo "$TASK_RUNTIME_MAX"
+        else
+            echo "$secv_t"
+        fi
+        return 0
+    fi
+    echo "$TASK_RUNTIME_MAX"
+    return 0
+}
+# 单 Task 日志字节上限：<run_dir> → output.log / events.log 超 TASK_LOG_MAX_BYTES
+# 截断（复用 §18 runtime_limit_log：保留尾部 max/2 字节，tmp+mv 原子）
+runtime_limit_task_log() {
+    rd=$1
+    runtime_limit_log "$rd/output.log" "$TASK_LOG_MAX_BYTES"
+    runtime_limit_log "$rd/events.log" "$TASK_LOG_MAX_BYTES"
     return 0
 }
 # ────────────────────────────────────────────────────────────────────────
@@ -4319,7 +4537,10 @@ runtime_lib_selfcheck() {
               ipc_op_start ipc_op_stop ipc_op_restart ipc_client_send \
               ipc_b64enc ipc_b64dec ipc_task_state ipc_has_newline \
               tctl_resolve tctl_state tctl_start tctl_stop tctl_restart \
-              tctl_check tctl_logs tctl_set_enabled ipc_op_check; do
+              tctl_check tctl_logs tctl_set_enabled ipc_op_check \
+              secv_id_ok secv_num_clamp secv_inside secv_nosymlink \
+              secv_guard_task_dir secv_ipc_ratelimit secv_sweep_tmp \
+              secv_fix_perms secv_effective_timeout runtime_limit_task_log; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

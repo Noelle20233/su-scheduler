@@ -55,12 +55,13 @@ REQ_ID|OP|RC|ERROR
 | rc | error | 语义 |
 | :-- | :--- | :--- |
 | 0 | ok | 成功 |
-| 1 | invalid_request | 格式/未知 op/坏 base64/未知参数键/超长 |
+| 1 | invalid_request | 格式/未知 op/坏 base64/未知参数键/超长/**非法 Task ID** |
 | 2 | permission_denied | 请求目录不可写 |
 | 3 | task_not_found | 引用未知任务 id |
 | 4 | configuration_invalid | 写操作在 legacy / VALIDATE 失败 / 命令缺省或多行 |
 | 5 | operation_timeout | 客户端等待超时 |
 | 6 | daemon_unavailable | daemon.pid 缺失或进程已死 |
+| 7 | rate_limited | **P3-08**：IPC 请求频率限制（IPC_RATE_MAX/窗超限，拒绝不执行） |
 
 ### D5 安全边界（服务端绝不 eval）
 
@@ -68,6 +69,9 @@ REQ_ID|OP|RC|ERROR
 - **绝不把请求内容交给 shell 解释/执行**；任何校验失败 → 只写 invalid_request
   响应，零副作用（不启动、不写任务、不触发 Root action）。
 - `ipc_has_newline` 拒绝多行命令（task 文件按单行 key=value 存储，防污染）。
+- **P3-08 Task ID 字符集门**：所有 id-bearing op 在 dispatch 外层经 `secv_id_ok`
+  （`^[A-Za-z0-9_.-]{1,128}$` 且无 `..`/`/`/`\`/空白/元字符）——非法 id →
+  invalid_request 零副作用，绝不进入文件路径拼接（防路径穿越）。
 
 ### D6 操作白名单（19 op）与参数键白名单
 
@@ -137,12 +141,23 @@ legacy → configuration_invalid（提示先 `task-config import`）。只读/�
 - `ipc/` 及子目录 `chmod 700`（root-only）：非 root 进程无法写入请求。
 - 客户端写请求前检查 `[ -w requests ]` → 不可写即 rc 2 permission_denied。
 - daemon 停止（无 daemon.pid / 死 pid）→ rc 6 daemon_unavailable。
+- **P3-08 加固**：daemon 启动 `secv_fix_perms` 强制 ipc 0700 / task-config 600 /
+  运行目录 700 / 运行文件 600；`secv_sweep_tmp` 每次 poll 清理 IPC tmp/沙箱与
+  task-config tmp 残留（原子写失败不留半写可见）。
 
-### D12 命名空间与版本
+### D12 请求频率限制（P3-08）
+
+- 每窗（`IPC_RATE_WINDOW` 秒，窗口桶 = `floor(now/window)`）至多 `IPC_RATE_MAX`
+  个请求；超限后续请求 → **rc 7 rate_limited**（不处理、不执行，零副作用）。
+- 窗口桶随 `now/window` 自动重置；客户端正常等待响应（rate_limited 即返回）。
+- 参数：`IPC_RATE_WINDOW`（默认 1）/ `IPC_RATE_MAX`（默认 256），daemon 启动重置
+  `rate.state`。
+
+### D13 命名空间与版本
 
 - 新函数一律 `ipc_` 前缀、内部全局 `ipcv_` 前缀（防覆盖调用方全局，同 P3-03
   教训）；全部注册进 `runtime_lib_selfcheck`。
-- `RUNTIME_LIB_VERSION` 1.14.0 → **1.15.0**（新增 §21）。
+- `RUNTIME_LIB_VERSION` 1.14.0 → **1.15.0**（新增 §21）→ … → **1.19.0**（P3-08 §25 加固）。
 
 ## 客户端入口
 

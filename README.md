@@ -1419,6 +1419,28 @@ su-scheduler task logs <id> [n]    # 查询 Task 日志
 
 ---
 
+## 🔒 安全与资源加固（P3-08）
+
+> 本章节为 P3-08 追加，不改动本文件既有任何章节。
+
+WebUI 作为高权限（root）平台的安全与资源加固（Runtime §25）：输入/文件/执行/
+资源四类，全部为叠加校验原语 + 既有入口收口（不重构、不加 eval、不临时拼接
+Root 命令）。
+
+- **输入安全**：IPC 白名单 + 参数键白名单（P3-04）；`secv_id_ok` Task ID 字符集
+  门（id-bearing op 外层拒绝路径穿越 id → invalid_request）；`secv_num_clamp`
+  数值钳制（日志 lines）；请求大小限制（IPC_REQ_MAX）。
+- **文件安全**：`secv_inside`/`secv_nosymlink`/`secv_guard_task_dir` 路径必须位于
+  允许目录（拒绝 `..`/符号链接逃逸）；`secv_fix_perms` 权限强制（ipc 0700 /
+  task-config 600 / 运行目录 700）；`secv_sweep_tmp` 临时文件清理（原子写兜底）。
+- **执行安全**：命令只读自已校验任务文件（WebUI/CLI 不能临时拼接 Root 命令）；
+  `secv_effective_timeout` 每个 Action 有超时（advanced.timeout ≤ TASK_RUNTIME_MAX）。
+- **资源安全**：`runtime_limit_task_log` 单 Task 日志字节上限；快照/任务目录上限
+  （P2-14）；`secv_ipc_ratelimit` IPC 频率限制（超限 → rc 7 `rate_limited`）。
+- 审计清单见 `docs/security-audit.md`；执行记录见 `docs/P3-08.md`。
+
+---
+
 ## 🧪 回归测试（P2-01 追加）
 
 > 本章节为 P2-01 追加，不改动本文件既有任何章节。P0/P1 门禁的**唯一回归入口**
@@ -1462,6 +1484,10 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | WebUI 安全（P3-05：webroot 无 Root 直执特征、恶意请求零 exec/零 config 写、`<script>`/引号/换行 JSON 转义、malformed→invalid_request、有界日志 + truncated 标志） | `tests/webui/security.test.sh` |
 | L2 | WebUI Task Editor（P3-06：GET_TASK_EDIT/EDIT_TASK/VALIDATE_TASK(payload) 分步表单保存/校验/回滚、合法保存重载、非法拒绝、旧配置不变、无重复 ID、App Action 注入拒、Health/Recovery 可被 Supervisor 读取） | `tests/webui/editor.test.sh` |
 | L2 | Task 控制操作（P3-07：WebUI 与 CLI 共用同一控制 API `task enable\|disable\|start\|stop\|restart\|check\|logs`，§24 tctl_* + TSM 强制可追踪、并发 start skip、stop 不误杀、旧运行 ID 控制旧运行目录、CHECK_TASK 立即健康检查、enable/disable 仅 managed、CLI 子命令经 IPC 全链路、失败不破坏 Registry/旧工件） | `tests/task-control/test.sh` |
+| L2 | 安全与资源加固（P3-08 输入安全：IPC 白名单/格式 fuzz、Task ID 字符集门、请求大小限制、START/CREATE/UPDATE 命令注入全拒、App Action/脚本路径校验，全零副作用） | `tests/security/fuzz.sh` |
+| L2 | 安全与资源加固（P3-08 路径安全：路径穿越/符号链接/允许目录约束/Task ID 门/IPC 穿越 id 拒绝零泄露、相对脚本拒） | `tests/security/path-validation.sh` |
+| L2 | 安全与资源加固（P3-08 文件安全：secv_fix_perms 强制 0700/600、原子写 tmp 清理、secv_sweep_tmp、未授权写 permission_denied） | `tests/security/permission.sh` |
+| L2 | 安全与资源加固（P3-08 资源安全：100 Task 单循环无 100 永久循环、日志/快照/任务目录上限、单任务错误隔离、IPC 频率限制 rc 7、CPU/内存有界） | `tests/resource/stress.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

@@ -128,7 +128,9 @@ rc=$(resp_rc "$r")
 BAD2=$(printf 'schema_version=2\nid=../../etc\ntrigger=boot\naction.type=command\naction.command=echo x\n')
 r=$(send_req "re2" "re2|EDIT_TASK|id=$(ipc_b64enc '../../etc')&payload=$(ipc_b64enc "$BAD2")")
 rc=$(resp_rc "$r")
-[ "$rc" = "4" ] && ok "P3-06 reject: path traversal id -> rc4" || bad "P3-06 reject: traversal rc=$rc"
+# P3-08：路径穿越 id 现被 §25 secv_id_ok 在 dispatch 外层拒绝为 invalid_request（rc 1）
+# 或后端校验拒绝（rc 4）——两种都是拒绝、绝不落盘（语义更严，最外层即拦截）。
+[ "$rc" = "4" ] || [ "$rc" = "1" ] && [ ! -f "$TCFG_DIR/../../etc" ] && ok "P3-06 reject: path traversal id rejected (rc $rc, not persisted)" || bad "P3-06 reject: traversal rc=$rc"
 BAD3=$(printf 'schema_version=2\nid=task_bad3\ntrigger=boot\naction.type=command\naction.command=echo x\nretry.max=999\n')
 r=$(send_req "re3" "re3|EDIT_TASK|id=$(ipc_b64enc task_bad3)&payload=$(ipc_b64enc "$BAD3")")
 rc=$(resp_rc "$r")

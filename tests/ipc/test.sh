@@ -199,8 +199,11 @@ r=$(send_req "w_dlog" "w_dlog|GET_DAEMON_LOG|lines=$(ipc_b64enc 5)")
     && ok "P3-05 read: GET_DAEMON_LOG returns daemon log JSON" || bad "P3-05 read: daemon log rc=$(resp_rc "$r")"
 
 # 新只读 op 注入（元字符）→ 零 exec
+# P3-08：注入 id（含 `;`/空格）现被 §25 secv_id_ok 拒绝为 invalid_request（rc 1）
+# 或 task_not_found（rc 3）——两种都是拒绝、零副作用；语义更严（合法 id 字符集门）。
 r=$(send_req "w_inj" "w_inj|GET_TASK_DETAIL|id=$(ipc_b64enc 'a;touch pwn')")
-[ "$(resp_rc "$r")" = "3" ] && ok "P3-05 read: malicious id -> task_not_found (zero side-effect)" || bad "P3-05 read: malicious id rc=$(resp_rc "$r")"
+rc_inj=$(resp_rc "$r")
+[ "$rc_inj" = "3" ] || [ "$rc_inj" = "1" ] && ok "P3-05 read: malicious id rejected (rc $rc_inj, zero side-effect)" || bad "P3-05 read: malicious id rc=$rc_inj"
 [ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P3-05 read: WebUI read-only ops had ZERO exec side effects" || bad "P3-05 read: exec leaked ($(wc -l < "$EXEC_LOG"))"
 
 # ── 5) VALIDATE_TASK ───────────────────────────────────────────────────────
