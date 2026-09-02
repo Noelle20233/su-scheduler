@@ -69,7 +69,7 @@ REQ_ID|OP|RC|ERROR
   响应，零副作用（不启动、不写任务、不触发 Root action）。
 - `ipc_has_newline` 拒绝多行命令（task 文件按单行 key=value 存储，防污染）。
 
-### D6 操作白名单（18 op）与参数键白名单
+### D6 操作白名单（19 op）与参数键白名单
 
 | OP | 允许参数键 | 说明 |
 | :--- | :--- | :--- |
@@ -87,7 +87,8 @@ REQ_ID|OP|RC|ERROR
 | UPDATE_TASK | id name trigger command enabled termux interactive notify_start notify_end msg | **仅 managed**；原子更新 + 校验 + reload |
 | DELETE_TASK | id | **仅 managed**；移除 + reload |
 | ENABLE_TASK / DISABLE_TASK | id | **仅 managed**；enabled=1/0 + reload |
-| START_TASK / STOP_TASK / RESTART_TASK | id | 命令取自已校验任务文件；**请求不可注入命令** |
+| START_TASK / STOP_TASK / RESTART_TASK | id | 命令取自已校验任务文件；**请求不可注入命令**；P3-07 起委托 §24 tctl_*（TSM 强制 + skip 策略） |
+| CHECK_TASK | id | **P3-07**：立即执行一次健康检查（§24 tctl_check；无 health 配置 → rc 0 `no_health_configured`；只追加 probe 事件不改 state.txt） |
 
 未知参数键 → invalid_request（例：`START_TASK` 带 `command=` → 拒绝）。
 
@@ -98,13 +99,24 @@ legacy 模式 config.txt 是用户手工权威，行级改写风险大；P3-02 �
 legacy → configuration_invalid（提示先 `task-config import`）。只读/控制 op
 （GET_*/START/STOP/RESTART）在两种模式均可（经 Registry 快照 + 运行态）。
 
-### D8 START/STOP/RESTART 语义
+### D8 START/STOP/RESTART 语义（P3-07：委托 §24 tctl_*）
 
-- **START_TASK**：仅取 id → 解析 canonical（registry 或 idmap）→ 从任务文件读
-  `action.command` 及 modifier 字段 → `action_run`（统一 ActionProvider 入口，
-  落 execute_task）。已 RUNNING/STARTING → ok「already ...」**不重复启动**。
-- **STOP_TASK**：`supervisor_stop_task <run_dir> force=1`（TERM→KILL）。
-- **RESTART_TASK**：停（force）+ 强启（跳过 running 检查）。
+- **START_TASK**：仅取 id → 解析 canonical（registry 或 idmap；旧运行 ID 亦支持）
+  → 终态重武装（FAILED/STOPPED/DISABLED → PENDING）→ `PENDING→STARTING`
+  （manual_exec）→ `action_run`（STARTING→RUNNING，spawn）。已 RUNNING/STARTING
+  → `ok "skip already <state>"`（**并发 start skip 策略**，不重复启动）；
+  STOPPING/RECOVERING/WAITING → rc 4 `illegal …`（状态机拒绝，不强行写状态文件）。
+- **STOP_TASK**：`RUNNING/HEALTHY/UNHEALTHY/STARTING/RECOVERING → STOPPING`
+  （stop_request）→ `supervisor_stop_task <run_dir>`（**只杀本运行目录 pid，
+  不误杀其他任务**）→ 等进程退出 → `STOPPING→STOPPED`。PENDING/STOPPED/FAILED/
+  DISABLED → `ok "not_running …"`（不写状态）。
+- **RESTART_TASK**：停止（若运行中）+ 强启。
+- **CHECK_TASK**：立即健康检查（§16 health_check）→ 三态行载荷；只追加 probe
+  事件（events.log），**不改 state.txt**；无 health 配置 → rc 0 `no_health_configured`。
+
+全部状态迁移经 `state_log_event`（TSM 允许边校验）；**非法迁移 → 返回错误且不
+写状态文件**。操作失败不破坏 Registry（task-config 原子写）与旧工件
+（status.txt/pid.txt/output.log 只读不动）。
 
 ### D9 重复请求幂等（不重复启动）
 

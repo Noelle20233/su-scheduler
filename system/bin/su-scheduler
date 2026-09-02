@@ -111,10 +111,10 @@ print_help() {
     echo -e "  ${GREEN}edit${RESET} ${CYAN}[editor]${RESET}             Crack open the config 🎨"
     echo -e "  ${GREEN}log${RESET} ${YELLOW}[-f|-n NUM]${RESET}          View logs (-f=follow, -n=lines) 🕵️"
     echo -e "  ${GREEN}tasks${RESET}                    List only running tasks 📋"
-    echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id>}${RESET}   Registry-backed Task CLI (P2-08) 🗂️"
+    echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id> | enable <id> | disable <id> | start <id> | stop <id> | restart <id> | check <id> | logs <id>}${RESET}   Registry Task CLI + 控制 (P2-08/P3-07) 🗂️"
     echo -e "  ${GREEN}task-config${RESET} ${CYAN}{status|import|export|rollback|list|show|set|new|apply|rm}${RESET}   Task v2 配置存储与迁移 (P3-02) 🗄️"
     echo -e "  ${GREEN}ipc${RESET} ${CYAN}<OP> [k=v ...]${RESET}         本地 IPC 控制面客户端 (P3-04) 🔌"
-    echo -e "      ${YELLOW}OP:${RESET} GET_TASKS|GET_TASK_STATUS|GET_TASK_LOG|VALIDATE_TASK|CREATE_TASK|UPDATE_TASK|DELETE_TASK|ENABLE_TASK|DISABLE_TASK|START_TASK|STOP_TASK|RESTART_TASK|GET_SUMMARY|GET_TASK_DETAIL|GET_TASK_EVENTS|GET_DAEMON_LOG|GET_TASK_EDIT|EDIT_TASK"
+    echo -e "      ${YELLOW}OP:${RESET} GET_TASKS|GET_TASK_STATUS|GET_TASK_LOG|VALIDATE_TASK|CREATE_TASK|UPDATE_TASK|DELETE_TASK|ENABLE_TASK|DISABLE_TASK|START_TASK|STOP_TASK|RESTART_TASK|CHECK_TASK|GET_SUMMARY|GET_TASK_DETAIL|GET_TASK_EVENTS|GET_DAEMON_LOG|GET_TASK_EDIT|EDIT_TASK"
     echo -e "  ${GREEN}webui${RESET} ${CYAN}<OP> [k=v ...]${RESET}        WebUI 只读数据面 Reader (P3-05，只读 JSON) 🌐"
     echo -e "  ${GREEN}audit${RESET} ${YELLOW}[-f|-n NUM|clear]${RESET}    The Mission Auditor feed 🕵️"
     echo -e "  ${GREEN}history | all-tasks${RESET}      List all tasks (running & finished) 📜"
@@ -1145,8 +1145,15 @@ cmd_task() {
     case "$sub" in
         list) shift; cmd_task_list "$@" ;;
         status) shift; cmd_task_status "$@" ;;
-        ""|-h|--help) echo "Usage: su-scheduler task {list | status <id>}" >&2; return 0 ;;
-        *) echo "ERROR: unknown task subcommand: $sub (usage: task list | task status <id>)" >&2; return 1 ;;
+        enable) shift; cmd_task_enable "$@" ;;
+        disable) shift; cmd_task_disable "$@" ;;
+        start) shift; cmd_task_start "$@" ;;
+        stop) shift; cmd_task_stop "$@" ;;
+        restart) shift; cmd_task_restart "$@" ;;
+        check) shift; cmd_task_check "$@" ;;
+        logs) shift; cmd_task_logs "$@" ;;
+        ""|-h|--help) echo "Usage: su-scheduler task {list | status <id> | enable <id> | disable <id> | start <id> | stop <id> | restart <id> | check <id> | logs <id> [lines]}" >&2; return 0 ;;
+        *) echo "ERROR: unknown task subcommand: $sub (usage: task list | task status <id> | task {enable|disable|start|stop|restart|check|logs} <id>)" >&2; return 1 ;;
     esac
 }
 cmd_task_list() {
@@ -1160,6 +1167,75 @@ cmd_task_status() {
     local id="${1:-}"
     [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task status <id>" >&2; return 1; }
     task_cli_status_id "$DATA_DIR" "$TASKS_DIR" "/dev/.su_scheduler.lock" "$id"
+}
+
+# 🎛️ Task 控制子命令（P3-07）：与 WebUI 共用同一控制 API
+# CLI 不直接执行任务命令——enable/disable/start/stop/restart/check 全部经
+# IPC op 落到 daemon → §24 tctl_*（统一控制 API + TSM 强制 + skip 策略）。
+# 生产 = 同一 `su-scheduler` 进程内 ipc_client_send（与 WebUI bridge 同通道）。
+task_ctl_send() {   # <op> <id> → rc；stdout=响应载荷（去首行）；非 0 → stderr 错误
+    local op="$1" id="$2"
+    local enc timeout resp rc err
+    enc="$(ipc_b64enc "$id")"
+    timeout="${SU_SCHEDULER_IPC_TIMEOUT:-5}"
+    resp=$(ipc_client_send "$DATA_DIR" "$op" "id=$enc" "$timeout")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$resp" | tail -n +2
+    else
+        err=$(printf '%s\n' "$resp" | head -1 | cut -d'|' -f4)
+        [ -n "$err" ] || err="operation_failed"
+        echo "ERROR: $op $id failed (rc=$rc): $err" >&2
+    fi
+    return "$rc"
+}
+cmd_task_enable() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task enable <id>" >&2; return 1; }
+    task_ctl_send ENABLE_TASK "$id"
+}
+cmd_task_disable() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task disable <id>" >&2; return 1; }
+    task_ctl_send DISABLE_TASK "$id"
+}
+cmd_task_start() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task start <id>" >&2; return 1; }
+    task_ctl_send START_TASK "$id"
+}
+cmd_task_stop() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task stop <id>" >&2; return 1; }
+    task_ctl_send STOP_TASK "$id"
+}
+cmd_task_restart() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task restart <id>" >&2; return 1; }
+    task_ctl_send RESTART_TASK "$id"
+}
+cmd_task_check() {
+    local id="${1:-}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task check <id>" >&2; return 1; }
+    task_ctl_send CHECK_TASK "$id"
+}
+cmd_task_logs() {
+    local id="${1:-}" lines="${2:-50}"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task logs <id> [lines]" >&2; return 1; }
+    local encL encN timeout resp rc err
+    encL="$(ipc_b64enc "$id")"
+    encN="$(ipc_b64enc "$lines")"
+    timeout="${SU_SCHEDULER_IPC_TIMEOUT:-5}"
+    resp=$(ipc_client_send "$DATA_DIR" GET_TASK_LOG "id=$encL&lines=$encN" "$timeout")
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        printf '%s\n' "$resp" | tail -n +2
+    else
+        err=$(printf '%s\n' "$resp" | head -1 | cut -d'|' -f4)
+        [ -n "$err" ] || err="operation_failed"
+        echo "ERROR: logs $id failed (rc=$rc): $err" >&2
+    fi
+    return "$rc"
 }
 
 # 🗄️ Canonical Task Config Store（P3-02，RUNTIME_LOADED 门控）

@@ -116,11 +116,12 @@ ipc_server_init "$BASE" >/dev/null 2>&1
 pm=$(ls -ld "$BASE/ipc" | awk '{print $1}')
 [ "$pm" = "drwx------" ] && ok "P3-04 transport: ipc dir perms $pm (root-only)" || bad "P3-04 transport: ipc perms=$pm"
 n=$(echo "$IPC_WHITELIST" | wc -w)
-[ "$n" -eq 18 ] && ok "P3-04/P3-05/P3-06 transport: IPC_WHITELIST 18 ops (12 control + 4 WebUI read-only + GET_TASK_EDIT/EDIT_TASK)" || bad "P3-04/P3-05/P3-06 transport: whitelist count=$n"
+[ "$n" -eq 19 ] && ok "P3-04/P3-05/P3-06/P3-07 transport: IPC_WHITELIST 19 ops (12 control + CHECK_TASK + 4 WebUI read-only + GET_TASK_EDIT/EDIT_TASK)" || bad "P3-04/P3-05/P3-06/P3-07 transport: whitelist count=$n"
 grep -q 'GET_SUMMARY' <<< "$IPC_WHITELIST" && grep -q 'GET_TASK_DETAIL' <<< "$IPC_WHITELIST" \
   && grep -q 'GET_TASK_EVENTS' <<< "$IPC_WHITELIST" && grep -q 'GET_DAEMON_LOG' <<< "$IPC_WHITELIST" \
   && ok "P3-05 transport: WebUI read-only ops in whitelist (GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG)" \
   || bad "P3-05 transport: WebUI read-only ops missing from whitelist"
+grep -q 'CHECK_TASK' <<< "$IPC_WHITELIST" && ok "P3-07 transport: CHECK_TASK in whitelist" || bad "P3-07 transport: CHECK_TASK missing from whitelist"
 
 # ── 3) 协议：固定格式 + 非法请求零副作用 ───────────────────────────────────
 : > "$EXEC_LOG"
@@ -270,6 +271,24 @@ r=$(send_req "st1" "st1|STOP_TASK|id=$(ipc_b64enc "$rid2")")
 r=$(send_req "rs1" "rs1|RESTART_TASK|id=$(ipc_b64enc "$rid2")")
 [ "$(resp_rc "$r")" = "0" ] && [ "$(wc -l < "$EXEC_LOG")" -eq 2 ] \
     && ok "P3-04 restart: RESTART_TASK stops+starts (2nd exec)" || bad "P3-04 restart: rc=$(resp_rc "$r") exec=$(wc -l < "$EXEC_LOG")"
+
+# ── 7b) P3-07 CHECK_TASK（立即健康检查；无 health 配置 → ok 明示）─────────
+r=$(send_req "c1x" "c1x|CHECK_TASK|id=$(ipc_b64enc "$rid2")")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q 'no_health_configured' \
+    && ok "P3-07 check: CHECK_TASK no-health -> rc 0 with no_health_configured" \
+    || bad "P3-07 check: no-health rc=$(resp_rc "$r") payload=$(printf '%s' "$r" | tail -n +2)"
+r=$(send_req "c2x" "c2x|CHECK_TASK|id=$(ipc_b64enc ghost)")
+[ "$(resp_rc "$r")" = "3" ] && ok "P3-07 check: CHECK_TASK unknown -> task_not_found" || bad "P3-07 check: ghost rc=$(resp_rc "$r")"
+r=$(send_req "c3x" "c3x|CHECK_TASK|")
+[ "$(resp_rc "$r")" = "1" ] && ok "P3-07 check: CHECK_TASK missing id -> invalid_request" || bad "P3-07 check: no-id rc=$(resp_rc "$r")"
+# 有 health 配置 → 真实探针三态行（process:$$ = 本 shell 存活）
+tcfg_set_field "$rid2" health.type process >/dev/null 2>&1
+tcfg_set_field "$rid2" health.target "$$" >/dev/null 2>&1
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+r=$(send_req "c4x" "c4x|CHECK_TASK|id=$(ipc_b64enc "$rid2")")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q 'HEALTHY|reason=' \
+    && ok "P3-07 check: CHECK_TASK runs real health probe (HEALTHY line)" \
+    || bad "P3-07 check: probe rc=$(resp_rc "$r") payload=$(printf '%s' "$r" | tail -n +2)"
 
 # ── 8) 错误码可区分（客户端路径）───────────────────────────────────────────
 # daemon_unavailable：无 daemon.pid

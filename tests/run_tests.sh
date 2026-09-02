@@ -49,6 +49,9 @@
 #   L2  tests/webui/security.test.sh    P3-05 WebUI 安全（webroot 无 Root 直执特征、恶意
 #       请求零 exec/零 config 写、<script>/引号/换行 JSON 转义、malformed→invalid_request、
 #       有界日志 + truncated 标志）
+#   L2  tests/task-control/test.sh   P3-07 Task 控制操作（WebUI/CLI 共用同一控制 API：§24
+#       tctl_* + TSM 强制（start/stop/check 可追踪）+ 并发 skip + stop 不误杀 + 旧运行 ID
+#       控制旧运行目录 + enable/disable 仅 managed + CLI 子命令经 IPC 全链路 + 失败零副作用）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -129,6 +132,7 @@ else
         "tests/webui/read-only.test.sh" \
         "tests/webui/security.test.sh" \
         "tests/webui/editor.test.sh" \
+        "tests/task-control/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

@@ -1390,6 +1390,35 @@ su-scheduler webui GET_TASK_LOG id=<base64(task_id)> lines=<base64(100)>
 
 ---
 
+## 🎛️ Task 控制操作（P3-07）
+
+> 本章节为 P3-07 追加，不改动本文件既有任何章节。
+
+WebUI 与 CLI 共用**同一控制 API**：CLI `su-scheduler task <op> <id>` 与 WebUI
+控制按钮（Task Detail 的 Start/Stop/Restart/Check/Enable/Disable/Logs）都经
+IPC op（`START_TASK`/`STOP_TASK`/`RESTART_TASK`/`CHECK_TASK`/`ENABLE_TASK`/
+`DISABLE_TASK`/`GET_TASK_LOG`）落到 daemon 的 Runtime §24 `tctl_*`（唯一控制
+语义 + TSM 状态机强制），旧 CLI 命令（`task-info`/`task-output`/`task-kill`/
+`tasks`/`status`/`stop`/`restart`）零改动保留。
+
+```bash
+su-scheduler task enable <id>      # 修改配置状态（仅 Managed）
+su-scheduler task disable <id>
+su-scheduler task start <id>       # 手动启动（已运行 → skip，不重复启动）
+su-scheduler task stop <id>        # 停止当前运行实例（只杀本运行目录 pid）
+su-scheduler task restart <id>     # 停止后重新启动
+su-scheduler task check <id>       # 立即执行一次健康检查
+su-scheduler task logs <id> [n]    # 查询 Task 日志
+```
+
+- **状态机强制**：start 经 `PENDING→STARTING→RUNNING`、stop 经
+  `RUNNING/HEALTHY→STOPPING→STOPPED`、终态重武装 `FAILED→PENDING`；非法操作
+  （如 STOPPING 中 start）返回错误且**不强行写状态文件**。
+- 支持稳定 Task ID 与旧运行 ID（旧运行 ID 控制其旧运行目录）。
+- 执行记录见 `docs/P3-07.md`。
+
+---
+
 ## 🧪 回归测试（P2-01 追加）
 
 > 本章节为 P2-01 追加，不改动本文件既有任何章节。P0/P1 门禁的**唯一回归入口**
@@ -1427,11 +1456,12 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | Canonical Task Config Store（P3-02：双模式 legacy/managed 权威、导入幂等、失败原子性、回滚、导出、新建 ID `task_` 命名空间、损坏回退、接线） | `tests/config-v2/test.sh` |
 | L2 | Task v2 编辑校验矩阵（P3-06：ID 路径穿越拒绝、trigger 枚举、App Action 注入全拒、recovery script 绝对路径可读、数值范围钳制、保存原子性、后端权威校验） | `tests/config-v2/validation.sh` |
 | L2 | Registry 正式调度接管（P3-03：Registry 从 Shadow 提升为正式调度源、双模式 legacy/managed、TriggerProvider→ActionProvider、同周期去重、配置变更不重复执行、损坏 KEPT、task.v2 快照移除监督兜底、旧 CLI 查询/终止、单任务错误隔离、审计日志、接线） | `tests/scheduler-prod/test.sh` |
-| L2 | 本地 IPC 控制面（P3-04：请求/响应文件通道、固定格式、base64 值、12 op 白名单、可区分错误码、写操作仅 managed、START/STOP/RESTART 经 action_run、重复请求不重复启动、原子响应、接线） | `tests/ipc/test.sh` |
+| L2 | 本地 IPC 控制面（P3-04：请求/响应文件通道、固定格式、base64 值、19 op 白名单（P3-07 起含 CHECK_TASK）、可区分错误码、写操作仅 managed、START/STOP/RESTART 经 action_run→§24 tctl_*、重复请求不重复启动、原子响应、接线） | `tests/ipc/test.sh` |
 | L2 | IPC 安全边界（P3-04：fuzz/注入零副作用、Shell 元字符不进入执行路径、同 req_id 幂等、已运行不重复 START、单轮有界不阻塞、0700 权限、未授权写 permission_denied、daemon 停止 daemon_unavailable、超时 operation_timeout） | `tests/ipc/security.sh` |
 | L2 | WebUI 只读数据面（P3-05：GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG 统一 JSON、GET_TASK_LOG meta 行、JSON 转义防注入、空/损坏/daemon 离线三态、CLI Reader 只读白名单 + JSON 信封、零 exec） | `tests/webui/read-only.test.sh` |
 | L2 | WebUI 安全（P3-05：webroot 无 Root 直执特征、恶意请求零 exec/零 config 写、`<script>`/引号/换行 JSON 转义、malformed→invalid_request、有界日志 + truncated 标志） | `tests/webui/security.test.sh` |
 | L2 | WebUI Task Editor（P3-06：GET_TASK_EDIT/EDIT_TASK/VALIDATE_TASK(payload) 分步表单保存/校验/回滚、合法保存重载、非法拒绝、旧配置不变、无重复 ID、App Action 注入拒、Health/Recovery 可被 Supervisor 读取） | `tests/webui/editor.test.sh` |
+| L2 | Task 控制操作（P3-07：WebUI 与 CLI 共用同一控制 API `task enable\|disable\|start\|stop\|restart\|check\|logs`，§24 tctl_* + TSM 强制可追踪、并发 start skip、stop 不误杀、旧运行 ID 控制旧运行目录、CHECK_TASK 立即健康检查、enable/disable 仅 managed、CLI 子命令经 IPC 全链路、失败不破坏 Registry/旧工件） | `tests/task-control/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

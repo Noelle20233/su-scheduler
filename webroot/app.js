@@ -188,6 +188,39 @@
       });
     });
     view.appendChild(evBtn);
+
+    /* 控制按钮（P3-07）：经 IPC 写操作桥（suWriter）→ daemon → §24 tctl_*；
+       与 CLI task <op> <id> 共用同一控制 API。按钮只发起受控 IPC op，不执行
+       任何 shell。 */
+    var ctlBar = el("div", { class: "ctlbar" });
+    function ctlBtn(label, op) {
+      var b = el("button", { text: label, "data-op": op });
+      b.addEventListener("click", function () {
+        b.disabled = true;
+        write(op, { id: t.id }).then(function (res) {
+          b.disabled = false;
+          var msg;
+          if (res && res.ok) { msg = op + " 成功"; }
+          else {
+            var rc = (res && res.rc === undefined) ? "?" : (res && res.rc);
+            msg = op + " 失败: rc=" + rc + " " + escText((res && res.error) || "");
+          }
+          var note = el("p", { class: "note", text: msg });
+          view.appendChild(note);
+        });
+      });
+      return b;
+    }
+    [["Start", "START_TASK"], ["Stop", "STOP_TASK"], ["Restart", "RESTART_TASK"],
+     ["Check", "CHECK_TASK"], ["Enable", "ENABLE_TASK"], ["Disable", "DISABLE_TASK"]].forEach(function (pair) {
+      ctlBar.appendChild(ctlBtn(pair[0], pair[1]));
+    });
+    var logsBtn = el("button", { text: "日志 (logs)" });
+    logsBtn.addEventListener("click", function () {
+      read("GET_TASK_LOG", { id: t.id, lines: "100" }).then(function (d) { renderLogBlock(d, "Task 日志 " + t.id); });
+    });
+    ctlBar.appendChild(logsBtn);
+    view.appendChild(ctlBar);
   }
 
   function renderEvents(data, id) {
@@ -269,8 +302,10 @@
     view.appendChild(block);
   }
 
-  /* ── Task Editor（P3-06）────────────────────────────────────────────────── */
-  var WRITE_OPS = ["GET_TASK_EDIT", "VALIDATE_TASK", "EDIT_TASK", "DELETE_TASK", "ENABLE_TASK", "DISABLE_TASK"];
+  /* ── Task Editor（P3-06）+ 控制按钮（P3-07）────────────────────────────────── */
+  var WRITE_OPS = ["GET_TASK_EDIT", "VALIDATE_TASK", "EDIT_TASK", "DELETE_TASK",
+                   "ENABLE_TASK", "DISABLE_TASK", "START_TASK", "STOP_TASK",
+                   "RESTART_TASK", "CHECK_TASK"];
 
   function b64encode(str) {
     try { return btoa(unescape(encodeURIComponent(str))); } catch (e) { return ""; }

@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.17.0"
+RUNTIME_LIB_VERSION="1.18.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -3136,7 +3136,7 @@ scheduler_boot() {   # <base> <config> <tasks_dir> → 0
 # 命名空间：内部全局一律 ipcv_ 前缀（防覆盖调用方全局，同 P3-03 教训）。
 # ═══════════════════════════════════════════════════════════════════════════
 ipc_log() { [ "${IPC_LOG:-1}" = "1" ] && echo "[ipc] $1" >&2; }
-IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK GET_SUMMARY GET_TASK_DETAIL GET_TASK_EVENTS GET_DAEMON_LOG GET_TASK_EDIT EDIT_TASK"
+IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK CHECK_TASK GET_SUMMARY GET_TASK_DETAIL GET_TASK_EVENTS GET_DAEMON_LOG GET_TASK_EDIT EDIT_TASK"
 IPC_REQ_MAX=4096
 IPC_POLL_MAX=64
 ipc_dir() { echo "$1/ipc"; }
@@ -3265,20 +3265,31 @@ ipc_op_get_log() {   # <base> <tasks> <req_id> <id> [lines]
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 1 invalid_request "missing id"; return 0; }
     case "$ipcv_lines" in ''|*[!0-9]*) ipcv_lines=50 ;; esac
     [ "$ipcv_lines" -gt "$WEBUI_LOG_MAX" ] && ipcv_lines=$WEBUI_LOG_MAX
+    # P3-07：稳定 Task ID 与旧运行 ID 均可查日志——解析运行目录（旧运行 ID 用其目录本体）
+    ipcv_rd=""
+    if [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_id" ]; then
+        ipcv_rd="$ipcv_tasks/$ipcv_id"
+    else
+        ipcv_canon=$(task_cli_resolve_id "$ipcv_base" "$ipcv_tasks" "$ipcv_id" 2>/dev/null)
+        if [ -n "$ipcv_canon" ] && [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_canon" ]; then
+            ipcv_rd="$ipcv_tasks/$ipcv_canon"
+        fi
+    fi
     ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
-    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 3 task_not_found "$ipcv_id"; return 0; }
+    [ -n "$ipcv_f" ] || [ -n "$ipcv_rd" ] || {
+        ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 3 task_not_found "$ipcv_id"; return 0; }
     ipcv_total=0
-    if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/output.log" ]; then
-        ipcv_total=$(wc -l < "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null || echo 0)
+    if [ -n "$ipcv_rd" ] && [ -f "$ipcv_rd/output.log" ]; then
+        ipcv_total=$(wc -l < "$ipcv_rd/output.log" 2>/dev/null || echo 0)
     fi
     ipcv_returned=$ipcv_total
     [ "$ipcv_returned" -gt "$ipcv_lines" ] && ipcv_returned=$ipcv_lines
     ipcv_trunc=0
     [ "$ipcv_returned" -lt "$ipcv_total" ] && ipcv_trunc=1
     # 首载荷行为 meta：truncated/total/lines（前端据此明确提示日志已截断）
-    if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/output.log" ]; then
+    if [ -n "$ipcv_rd" ] && [ -f "$ipcv_rd/output.log" ]; then
         ipcv_payload="#truncated=$ipcv_trunc|total=$ipcv_total|lines=$ipcv_returned
-$(tail -n "$ipcv_returned" "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null)"
+$(tail -n "$ipcv_returned" "$ipcv_rd/output.log" 2>/dev/null)"
     else
         ipcv_payload="#truncated=0|total=0|lines=0
 (no output yet)"
@@ -3419,67 +3430,74 @@ ipc_op_delete() {   # <base> <config> <req_id> <id>
     ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 0 ok "deleted $ipcv_id"
     return 0
 }
-ipc_op_set_enabled() {   # <base> <config> <req_id> <id> <val> <opname>
-    ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_val=$5; ipcv_opname=$6
-    tcfg_is_managed || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+ipc_op_set_enabled() {   # <base> <config> <tasks> <req_id> <id> <val> <opname>
+    ipcv_base=$1; ipcv_config=$2; ipcv_tasks=$3; ipcv_rid=$4; ipcv_id=$5; ipcv_val=$6; ipcv_opname=$7
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
-    [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
-    tcfg_set_field "$ipcv_id" enabled "$ipcv_val" >/dev/null 2>&1
-    sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
-    ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "enabled=$ipcv_val $ipcv_id"
+    ipcv_out=$(tctl_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_tasks" "$ipcv_id" "$ipcv_val" 2>/dev/null)
+    ipcv_trc=$?
+    case "$ipcv_trc" in
+        0) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "$ipcv_out" ;;
+        1) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id" ;;
+        2) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+        3) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+    esac
     return 0
 }
-# 启动（经 action_run，命令取自已校验任务文件——请求不可注入）；已运行不重复启动
+# 启动（经 action_run，命令取自已校验任务文件——请求不可注入）；已运行不重复启动。
+# P3-07：委托 §24 tctl_start（统一控制 API + TSM 强制 + skip 策略）。
 ipc_op_start() {   # <base> <tasks> <req_id> <id> <opname> [force]
     ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_opname=$5; ipcv_force=${6:-0}
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
-    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
-    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
-    if [ "$ipcv_force" -ne 1 ]; then
-        ipcv_st=$(ipc_task_state "$ipcv_tasks" "$ipcv_id")
-        case "$ipcv_st" in
-            RUNNING|STARTING) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "already $ipcv_st"; return 0 ;;
-        esac
-    fi
-    ipcv_cmd=$(sched_task_field "$ipcv_f" action.command)
-    [ -n "$ipcv_cmd" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "no command"; return 0; }
-    ipcv_tmx=$(sched_task_field "$ipcv_f" action.termux); [ -z "$ipcv_tmx" ] && ipcv_tmx=0
-    ipcv_itr=$(sched_task_field "$ipcv_f" action.interactive); [ -z "$ipcv_itr" ] && ipcv_itr=0
-    ipcv_ns=$(sched_task_field "$ipcv_f" action.notify_start); [ -z "$ipcv_ns" ] && ipcv_ns=0
-    ipcv_ne=$(sched_task_field "$ipcv_f" action.notify_end); [ -z "$ipcv_ne" ] && ipcv_ne=0
-    ipcv_msg=$(sched_task_field "$ipcv_f" action.msg)
-    action_run "$ipcv_id" "$ipcv_cmd" "$ipcv_tmx" "$ipcv_itr" "$ipcv_ns" "$ipcv_ne" "$ipcv_msg" >/dev/null 2>&1
-    ipcv_arc=$?
-    if [ "$ipcv_arc" -eq 0 ]; then
-        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "started $ipcv_id"
-    else
-        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "start failed rc=$ipcv_arc"
-    fi
+    ipcv_out=$(tctl_start "$ipcv_base" "$ipcv_tasks" "$ipcv_id" "$ipcv_force" 2>/dev/null)
+    ipcv_trc=$?
+    case "$ipcv_trc" in
+        0) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "$ipcv_out" ;;
+        1) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id" ;;
+        2) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "$ipcv_out" ;;   # skip（并发 start）
+        3) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+        4) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+    esac
     return 0
 }
+# 停止：委托 §24 tctl_stop（只杀本运行目录 pid；TSM）
 ipc_op_stop() {   # <base> <tasks> <req_id> <id> <opname>
     ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_opname=$5
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
-    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
-    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
-    if [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_id" ]; then
-        supervisor_stop_task "$ipcv_tasks/$ipcv_id" 1 >/dev/null 2>&1
-        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "stopped $ipcv_id"
-    else
-        ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "not running $ipcv_id"
-    fi
+    ipcv_out=$(tctl_stop "$ipcv_base" "$ipcv_tasks" "$ipcv_id" 2>/dev/null)
+    ipcv_trc=$?
+    case "$ipcv_trc" in
+        0) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "$ipcv_out" ;;
+        1) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id" ;;
+        3) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+    esac
     return 0
 }
+# 重启：委托 §24 tctl_restart（停止 + 强启）
 ipc_op_restart() {   # <base> <tasks> <req_id> <id> <opname>
     ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_opname=$5
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 1 invalid_request "missing id"; return 0; }
-    ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
-    [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id"; return 0; }
-    if [ -n "$ipcv_tasks" ] && [ -d "$ipcv_tasks/$ipcv_id" ]; then
-        supervisor_stop_task "$ipcv_tasks/$ipcv_id" 1 >/dev/null 2>&1
-    fi
-    ipc_op_start "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$ipcv_id" "$ipcv_opname" 1
+    ipcv_out=$(tctl_restart "$ipcv_base" "$ipcv_tasks" "$ipcv_id" 2>/dev/null)
+    ipcv_trc=$?
+    case "$ipcv_trc" in
+        0) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 0 ok "$ipcv_out" ;;
+        1) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 3 task_not_found "$ipcv_id" ;;
+        3) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+        4) ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_opname" 4 configuration_invalid "$ipcv_out" ;;
+    esac
+    return 0
+}
+# 立即健康检查：委托 §24 tctl_check（不改 state.txt；无 health 配置 → ok 明示）
+ipc_op_check() {   # <base> <tasks> <req_id> <id>
+    ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" CHECK_TASK 1 invalid_request "missing id"; return 0; }
+    ipcv_out=$(tctl_check "$ipcv_base" "$ipcv_tasks" "$ipcv_id" 2>/dev/null)
+    ipcv_trc=$?
+    case "$ipcv_trc" in
+        0) ipc_respond "$ipcv_base" "$ipcv_rid" CHECK_TASK 0 ok "$ipcv_out" ;;
+        1) ipc_respond "$ipcv_base" "$ipcv_rid" CHECK_TASK 3 task_not_found "$ipcv_id" ;;
+        5) ipc_respond "$ipcv_base" "$ipcv_rid" CHECK_TASK 0 ok "$ipcv_out" ;;
+        3) ipc_respond "$ipcv_base" "$ipcv_rid" CHECK_TASK 4 configuration_invalid "$ipcv_out" ;;
+    esac
     return 0
 }
 # 分发：<base> <config> <tasks> <req_id> <op> <params>
@@ -3495,7 +3513,7 @@ ipc_allowed_keys() {   # <op> → 允许的参数键（空格分隔）
         CREATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
         UPDATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
         DELETE_TASK|ENABLE_TASK|DISABLE_TASK) echo "id" ;;
-        START_TASK|STOP_TASK|RESTART_TASK) echo "id" ;;
+        START_TASK|STOP_TASK|RESTART_TASK|CHECK_TASK) echo "id" ;;
         *) echo "" ;;
     esac
 }
@@ -3530,11 +3548,12 @@ ipc_dispatch() {
         CREATE_TASK) ipc_op_create "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
         UPDATE_TASK) ipc_op_update "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
         DELETE_TASK) ipc_op_delete "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
-        ENABLE_TASK) ipc_op_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" 1 ENABLE_TASK ;;
-        DISABLE_TASK) ipc_op_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" 0 DISABLE_TASK ;;
+        ENABLE_TASK) ipc_op_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" 1 ENABLE_TASK ;;
+        DISABLE_TASK) ipc_op_set_enabled "$ipcv_base" "$ipcv_config" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" 0 DISABLE_TASK ;;
         START_TASK) ipc_op_start "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" START_TASK ;;
         STOP_TASK) ipc_op_stop "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" STOP_TASK ;;
         RESTART_TASK) ipc_op_restart "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" RESTART_TASK ;;
+        CHECK_TASK) ipc_op_check "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
     esac
     return 0
 }
@@ -4051,6 +4070,222 @@ ipc_op_edit_task() {   # <base> <config> <req_id> <id> <payload>
     esac
     return 0
 }
+# ═══════════════════════════════════════════════════════════════════════════
+# §24 Task Control API（P3-07）：WebUI 与 CLI 共用同一控制 API
+# ═══════════════════════════════════════════════════════════════════════════
+# 目标：把「任务控制操作」（enable/disable/start/stop/restart/check/logs）收敛
+# 为**单一控制 API**——WebUI（经 IPC op → daemon）与 CLI（`su-scheduler task
+# <op> <id>`，经同一 IPC 通道）都路由到本层 `tctl_*` 函数。本层是控制语义与
+# 状态机强制（TSM 允许边）的唯一事实源。
+#   - 稳定 Task ID 与旧运行 ID 双向解析（§13 task_cli_resolve_id + §9 idmap）；
+#   - start：终态重武装（FAILED/STOPPED/DISABLED → PENDING）→ PENDING→STARTING
+#     （manual_exec）→ action_run（STARTING→RUNNING，spawn）；已 RUNNING/STARTING
+#     → **skip 策略**（不重复启动）；STOPPING/RECOVERING/WAITING → 非法拒绝；
+#   - stop：RUNNING/HEALTHY/UNHEALTHY/STARTING/RECOVERING → STOPPING
+#     （stop_request）→ supervisor_stop_task（**只杀本运行目录 pid**，不误杀
+#     其他任务）→ 等进程退出 → STOPPING→STOPPED；PENDING/STOPPED/FAILED/
+#     DISABLED → not_running（不写状态）；STOPPING → already_stopping；
+#   - restart：stop（若运行中）+ force start；
+#   - check：立即执行一次健康检查（§16 health_check），**只追加 probe 事件，
+#     不改 state.txt**（避免非法状态转换）；无 health 配置 → no_health_configured；
+#   - logs：查询运行目录 output.log 尾部；
+#   - enable/disable：改 task-config 权威存储（**仅 Managed 模式**）+ reload。
+# **非法操作必须返回错误且不得强行写状态文件**：所有状态迁移一律经
+# state_log_event（TSM 校验；非法边 → 拒绝 + 调用方返回错误），绝不直接写
+# state.txt。操作失败不破坏 Registry（task-config 原子写）与旧工件（status.txt
+# /pid.txt/output.log/exit_code.txt 只读不动）。
+# 返回约定（tctl 层）：
+#   0=ok | 1=task not found | 2=skip（并发 start 已运行）| 3=illegal（状态机
+#   拒绝）| 4=操作失败（启动失败/无命令）| 5=check 无 health 配置
+# 命名空间：函数 tctl_ 前缀、内部全局 tclv_ 前缀（防覆盖调用方全局，同 §21）。
+# ═══════════════════════════════════════════════════════════════════════════
+tctl_log() {
+    [ "${TCTL_LOG:-1}" = "1" ] && echo "[tctl] $1" >&2
+}
+
+# 解析：稳定 Task ID 或旧运行 ID → echo "canonical|run_dir"；rc 1=not found
+# 旧运行 ID 控制旧运行目录：优先命中 `$tasks/<qid>`（旧运行目录本体），否则
+# canonical 目录（稳定 ID 运行目录）。
+tctl_resolve() {   # <base> <tasks> <qid>
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
+    tclv_canon=$(task_cli_resolve_id "$tclv_base" "$tclv_tasks" "$tclv_qid") || return 1
+    tclv_rd=""
+    if [ -n "$tclv_tasks" ] && [ -d "$tclv_tasks/$tclv_qid" ]; then
+        tclv_rd="$tclv_tasks/$tclv_qid"
+    elif [ -n "$tclv_tasks" ] && [ -d "$tclv_tasks/$tclv_canon" ]; then
+        tclv_rd="$tclv_tasks/$tclv_canon"
+    fi
+    echo "$tclv_canon|$tclv_rd"
+    return 0
+}
+
+tctl_state() {   # <run_dir> → 当前状态（无目录/未知 → UNKNOWN）
+    if [ -n "$1" ] && [ -d "$1" ]; then
+        runtime_current_state "$1"
+    else
+        echo "UNKNOWN"
+    fi
+}
+
+# 手动启动（skip 策略 + TSM）：
+#   <base> <tasks> <qid> [force] → 0=started / 1=not_found / 2=skip / 3=illegal / 4=failed
+tctl_start() {
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3; tclv_force=${4:-0}
+    tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
+        echo "task_not_found $tclv_qid"; return 1; }
+    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    tclv_tf=$(registry_task_file "$tclv_canon" 2>/dev/null) || {
+        echo "task_not_found $tclv_canon"; return 1; }
+    if [ -z "$tclv_rd" ]; then
+        tclv_rd="$tclv_tasks/$tclv_canon"
+        mkdir -p "$tclv_rd" 2>/dev/null
+    fi
+    tclv_cur=$(tctl_state "$tclv_rd")
+    [ "$tclv_cur" = "UNKNOWN" ] && tclv_cur="PENDING"
+    if [ "$tclv_force" -ne 1 ]; then
+        case "$tclv_cur" in
+            RUNNING|STARTING)
+                echo "skip already $tclv_cur ($tclv_canon)"; return 2 ;;
+            STOPPING|RECOVERING|WAITING)
+                echo "illegal cannot start while $tclv_cur ($tclv_canon)"; return 3 ;;
+        esac
+    fi
+    # 终态重武装 → PENDING（TSM 允许边：FAILED>PENDING / STOPPED>PENDING / DISABLED>PENDING）
+    case "$tclv_cur" in
+        FAILED)   state_log_event "$tclv_rd" "$tclv_canon" rearm PENDING "" "" "manual rearm before start" >/dev/null 2>&1 ;;
+        STOPPED)  state_log_event "$tclv_rd" "$tclv_canon" rearm PENDING "" "" "manual rearm before start" >/dev/null 2>&1 ;;
+        DISABLED) state_log_event "$tclv_rd" "$tclv_canon" enable PENDING "" "" "manual start while disabled" >/dev/null 2>&1 ;;
+    esac
+    tclv_cur=$(tctl_state "$tclv_rd")
+    case "$tclv_cur" in
+        PENDING|WAITING)
+            state_log_event "$tclv_rd" "$tclv_canon" manual_exec STARTING "" "" "manual start" >/dev/null 2>&1 || {
+                echo "illegal transition $tclv_cur->STARTING ($tclv_canon)"; return 3; }
+            ;;
+        *) echo "illegal cannot start while $tclv_cur ($tclv_canon)"; return 3 ;;
+    esac
+    tclv_cmd=$(sched_task_field "$tclv_tf" action.command)
+    if [ -z "$tclv_cmd" ]; then
+        echo "failed no command ($tclv_canon)"
+        state_log_event "$tclv_rd" "$tclv_canon" action_failure FAILED "" "" "manual start: no command" >/dev/null 2>&1
+        return 4
+    fi
+    tclv_tmx=$(sched_task_field "$tclv_tf" action.termux);       [ -z "$tclv_tmx" ] && tclv_tmx=0
+    tclv_itr=$(sched_task_field "$tclv_tf" action.interactive);  [ -z "$tclv_itr" ] && tclv_itr=0
+    tclv_ns=$(sched_task_field "$tclv_tf" action.notify_start);  [ -z "$tclv_ns" ] && tclv_ns=0
+    tclv_ne=$(sched_task_field "$tclv_tf" action.notify_end);    [ -z "$tclv_ne" ] && tclv_ne=0
+    tclv_msg=$(sched_task_field "$tclv_tf" action.msg)
+    action_run "$tclv_canon" "$tclv_cmd" "$tclv_tmx" "$tclv_itr" "$tclv_ns" "$tclv_ne" "$tclv_msg" >/dev/null 2>&1
+    tclv_arc=$?
+    if [ "$tclv_arc" -eq 0 ]; then
+        echo "started $tclv_canon"
+        return 0
+    fi
+    state_log_event "$tclv_rd" "$tclv_canon" action_failure FAILED "" "" "manual start failed rc=$tclv_arc" >/dev/null 2>&1
+    echo "failed start rc=$tclv_arc ($tclv_canon)"
+    return 4
+}
+
+# 手动停止（只杀本运行目录 pid；TSM）：
+#   <base> <tasks> <qid> → 0=stopped/not_running / 1=not_found / 3=illegal
+tctl_stop() {
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
+    tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
+        echo "task_not_found $tclv_qid"; return 1; }
+    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    [ -n "$tclv_rd" ] || { echo "not_running $tclv_canon (no run dir)"; return 0; }
+    tclv_cur=$(tctl_state "$tclv_rd")
+    case "$tclv_cur" in
+        STOPPING) echo "already_stopping $tclv_canon"; return 0 ;;
+        PENDING|STOPPED|FAILED|DISABLED|UNKNOWN)
+            echo "not_running $tclv_canon ($tclv_cur)"; return 0 ;;
+    esac
+    # RUNNING/HEALTHY/UNHEALTHY/STARTING/RECOVERING → STOPPING（TSM 允许边）
+    state_log_event "$tclv_rd" "$tclv_canon" stop_request STOPPING "" "" "manual stop" >/dev/null 2>&1 || {
+        echo "illegal transition $tclv_cur->STOPPING ($tclv_canon)"; return 3; }
+    supervisor_stop_task "$tclv_rd" 1 >/dev/null 2>&1
+    # 有界等待进程退出，随后 STOPPING→STOPPED
+    tclv_pid=$(cat "$tclv_rd/pid.txt" 2>/dev/null)
+    tclv_i=0
+    while [ -n "$tclv_pid" ] && [ -d "/proc/$tclv_pid" ] && [ "$tclv_i" -lt 30 ]; do
+        sleep 0.1
+        tclv_i=$((tclv_i + 1))
+    done
+    state_log_event "$tclv_rd" "$tclv_canon" stop_request STOPPED "" "" "stopped by user" >/dev/null 2>&1 || true
+    echo "stopped $tclv_canon"
+    return 0
+}
+
+# 重启：停止（若运行中）+ 强启
+#   <base> <tasks> <qid> → 0 / 1=not_found / 3=illegal / 4=failed
+tctl_restart() {
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
+    tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
+        echo "task_not_found $tclv_qid"; return 1; }
+    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    tclv_cur=$(tctl_state "$tclv_rd")
+    case "$tclv_cur" in
+        RUNNING|HEALTHY|UNHEALTHY|STARTING|RECOVERING|STOPPING)
+            tctl_stop "$tclv_base" "$tclv_tasks" "$tclv_qid" >/dev/null 2>&1 ;;
+    esac
+    tctl_start "$tclv_base" "$tclv_tasks" "$tclv_qid" 1
+}
+
+# 立即健康检查（只追加 probe 事件，不改 state.txt）：
+#   <base> <tasks> <qid> → 0=ok / 1=not_found / 5=no_health / 3=probe 错误
+tctl_check() {
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
+    tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
+        echo "task_not_found $tclv_qid"; return 1; }
+    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    tclv_tf=$(registry_task_file "$tclv_canon" 2>/dev/null) || {
+        echo "task_not_found $tclv_canon"; return 1; }
+    tclv_spec=$(supervisor_health_spec "$tclv_tf")
+    [ -n "$tclv_spec" ] || { echo "no_health_configured $tclv_canon"; return 5; }
+    tclv_kind=${tclv_spec%%:*}; tclv_target=${tclv_spec#*:}
+    tclv_resline=$(health_check "$tclv_kind" "$tclv_target" 2>/dev/null)
+    tclv_prc=$?
+    # probe 事件（RT_EVENTS 含 probe）只追加 events.log——不改 state.txt
+    if [ -n "$tclv_rd" ] && [ -d "$tclv_rd" ]; then
+        tclv_cur=$(tctl_state "$tclv_rd")
+        tclv_line="$(date '+%Y-%m-%d %H:%M:%S')|$tclv_canon|probe|$tclv_cur|||$(printf '%s' "$tclv_resline" | sed 's/|/;/g')"
+        printf '%s\n' "$tclv_line" >> "$tclv_rd/events.log" 2>/dev/null
+    fi
+    echo "$tclv_resline"
+    return "$tclv_prc"
+}
+
+# 查询任务日志（运行目录 output.log 尾部）：
+#   <base> <tasks> <qid> [lines] → 0 / 1=not_found
+tctl_logs() {
+    tclv_base=$1; tclv_tasks=$2; tclv_qid=$3; tclv_lines=${4:-50}
+    tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
+        echo "task_not_found $tclv_qid"; return 1; }
+    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    [ -n "$tclv_rd" ] && [ -d "$tclv_rd" ] || { echo "(no run dir yet)"; return 0; }
+    case "$tclv_lines" in ''|*[!0-9]*) tclv_lines=50 ;; esac
+    if [ -f "$tclv_rd/output.log" ]; then
+        tail -n "$tclv_lines" "$tclv_rd/output.log" 2>/dev/null
+    else
+        echo "(no output yet)"
+    fi
+    return 0
+}
+
+# 启/禁用（改配置状态；仅 Managed 模式权威存储 + reload）：
+#   <base> <config> <tasks> <qid> <val> → 0=ok / 1=not_found / 2=legacy-only / 3=write_failed
+tctl_set_enabled() {
+    tclv_base=$1; tclv_config=$2; tclv_tasks=$3; tclv_qid=$4; tclv_val=$5
+    tcfg_is_managed || { echo "write ops require managed task-config (run: su-scheduler task-config import)"; return 2; }
+    tclv_canon=$(task_cli_resolve_id "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
+        echo "task_not_found $tclv_qid"; return 1; }
+    [ -f "$(tcfg_task_file "$tclv_canon")" ] || { echo "task_not_found $tclv_canon"; return 1; }
+    tcfg_set_field "$tclv_canon" enabled "$tclv_val" >/dev/null 2>&1 || {
+        echo "write_failed $tclv_canon"; return 3; }
+    sched_reload "$tclv_base" "$tclv_config" >/dev/null 2>&1
+    echo "enabled=$tclv_val $tclv_canon"
+    return 0
+}
 # ────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
@@ -4082,7 +4317,9 @@ runtime_lib_selfcheck() {
               tcfg_editor_health_ok tcfg_editor_recovery_ok tcfg_editor_validate_payload tcfg_apply_task ipc_op_get_task_edit ipc_op_edit_task \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \
               ipc_op_start ipc_op_stop ipc_op_restart ipc_client_send \
-              ipc_b64enc ipc_b64dec ipc_task_state ipc_has_newline; do
+              ipc_b64enc ipc_b64dec ipc_task_state ipc_has_newline \
+              tctl_resolve tctl_state tctl_start tctl_stop tctl_restart \
+              tctl_check tctl_logs tctl_set_enabled ipc_op_check; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
