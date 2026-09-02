@@ -1,0 +1,86 @@
+/* Su Scheduler — WebUI 只读数据面（P3-05）— 简洁暗色主题 */
+:root {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --line: #334155;
+  --fg: #e2e8f0;
+  --muted: #94a3b8;
+  --ok: #22c55e;
+  --bad: #ef4444;
+  --warn: #f59e0b;
+  --mono: ui-monospace, "SF Mono", Consolas, "Courier New", monospace;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}
+header {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.75rem 1rem;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  flex-wrap: wrap;
+}
+header h1 { font-size: 1.1rem; margin: 0; }
+nav { display: flex; gap: 0.25rem; flex: 1; }
+nav a {
+  color: var(--fg);
+  text-decoration: none;
+  padding: 0.4rem 0.8rem;
+  border-radius: 6px;
+  opacity: 0.75;
+}
+nav a.active { background: var(--line); opacity: 1; }
+.badge { padding: 0.25rem 0.6rem; border-radius: 999px; font-size: 0.8rem; }
+.badge.online { background: rgba(34,197,94,0.15); color: var(--ok); }
+.badge.offline { background: rgba(239,68,68,0.15); color: var(--bad); }
+.badge.unknown { background: rgba(148,163,184,0.15); color: var(--muted); }
+main { padding: 1rem; max-width: 1100px; margin: 0 auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 0.75rem; margin-bottom: 1rem; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 0.75rem; }
+.card-label { font-size: 0.75rem; color: var(--muted); }
+.card-value { font-size: 1.6rem; font-weight: 600; }
+.c-running .card-value { color: var(--ok); }
+.c-failed .card-value { color: var(--bad); }
+.c-healthy .card-value { color: var(--ok); }
+.tbl { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+.tbl th, .tbl td { border: 1px solid var(--line); padding: 0.4rem 0.5rem; text-align: left; }
+.tbl th { background: var(--panel); }
+.tbl td.mono, dd.mono { font-family: var(--mono); word-break: break-all; }
+.st { font-weight: 600; }
+.st-RUNNING, .st-HEALTHY { color: var(--ok); }
+.st-FAILED { color: var(--bad); }
+.st-RECOVERING, .st-UNHEALTHY { color: var(--warn); }
+.kv { display: grid; grid-template-columns: 160px 1fr; gap: 0.15rem 0.75rem; margin-bottom: 1rem; }
+.kv dt { color: var(--muted); }
+.kv dd { margin: 0; }
+.log {
+  background: #020617;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 0.75rem;
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  font-size: 0.8rem;
+}
+.logform { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+.note { color: var(--muted); font-size: 0.8rem; }
+.banner {
+  padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem;
+}
+.banner.offline { background: rgba(239,68,68,0.12); color: var(--bad); border: 1px solid var(--bad); }
+.empty { color: var(--muted); font-style: italic; }
+button, select, input {
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--line); border-radius: 6px; padding: 0.4rem 0.7rem;
+}
+button { cursor: pointer; }
+button:hover { border-color: var(--muted); }
+footer { padding: 1rem; text-align: center; color: var(--muted); font-size: 0.75rem; }
+a { color: #60a5fa; }

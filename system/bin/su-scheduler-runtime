@@ -29,7 +29,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.15.0"
+RUNTIME_LIB_VERSION="1.16.0"
 
 # ───────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -3136,7 +3136,7 @@ scheduler_boot() {   # <base> <config> <tasks_dir> → 0
 # 命名空间：内部全局一律 ipcv_ 前缀（防覆盖调用方全局，同 P3-03 教训）。
 # ═══════════════════════════════════════════════════════════════════════════
 ipc_log() { [ "${IPC_LOG:-1}" = "1" ] && echo "[ipc] $1" >&2; }
-IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK"
+IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK GET_SUMMARY GET_TASK_DETAIL GET_TASK_EVENTS GET_DAEMON_LOG"
 IPC_REQ_MAX=4096
 IPC_POLL_MAX=64
 ipc_dir() { echo "$1/ipc"; }
@@ -3264,13 +3264,24 @@ ipc_op_get_log() {   # <base> <tasks> <req_id> <id> [lines]
     ipcv_base=$1; ipcv_tasks=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_lines=${5:-50}
     [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 1 invalid_request "missing id"; return 0; }
     case "$ipcv_lines" in ''|*[!0-9]*) ipcv_lines=50 ;; esac
-    [ "$ipcv_lines" -gt 500 ] && ipcv_lines=500
+    [ "$ipcv_lines" -gt "$WEBUI_LOG_MAX" ] && ipcv_lines=$WEBUI_LOG_MAX
     ipcv_f=$(registry_task_file "$ipcv_id" 2>/dev/null)
     [ -n "$ipcv_f" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 3 task_not_found "$ipcv_id"; return 0; }
+    ipcv_total=0
     if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/output.log" ]; then
-        ipcv_payload=$(tail -n "$ipcv_lines" "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null)
+        ipcv_total=$(wc -l < "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null || echo 0)
+    fi
+    ipcv_returned=$ipcv_total
+    [ "$ipcv_returned" -gt "$ipcv_lines" ] && ipcv_returned=$ipcv_lines
+    ipcv_trunc=0
+    [ "$ipcv_returned" -lt "$ipcv_total" ] && ipcv_trunc=1
+    # 首载荷行为 meta：truncated/total/lines（前端据此明确提示日志已截断）
+    if [ -n "$ipcv_tasks" ] && [ -f "$ipcv_tasks/$ipcv_id/output.log" ]; then
+        ipcv_payload="#truncated=$ipcv_trunc|total=$ipcv_total|lines=$ipcv_returned
+$(tail -n "$ipcv_returned" "$ipcv_tasks/$ipcv_id/output.log" 2>/dev/null)"
     else
-        ipcv_payload="(no output yet)"
+        ipcv_payload="#truncated=0|total=0|lines=0
+(no output yet)"
     fi
     ipc_respond "$ipcv_base" "$ipcv_rid" GET_TASK_LOG 0 ok "$ipcv_payload"
     return 0
@@ -3465,8 +3476,9 @@ ipc_op_restart() {   # <base> <tasks> <req_id> <id> <opname>
 # 每 op 的**参数键白名单**（固定格式 → 未知键即 invalid_request，绝不透传）：
 ipc_allowed_keys() {   # <op> → 允许的参数键（空格分隔）
     case "$1" in
-        GET_TASKS) echo "" ;;
-        GET_TASK_STATUS|GET_TASK_LOG) echo "id lines" ;;
+        GET_TASKS|GET_SUMMARY) echo "" ;;
+        GET_TASK_STATUS|GET_TASK_LOG|GET_TASK_DETAIL|GET_TASK_EVENTS) echo "id lines" ;;
+        GET_DAEMON_LOG) echo "lines" ;;
         VALIDATE_TASK) echo "name trigger command enabled termux interactive notify_start notify_end msg" ;;
         CREATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
         UPDATE_TASK) echo "id name trigger command enabled termux interactive notify_start notify_end msg" ;;
@@ -3494,8 +3506,12 @@ ipc_dispatch() {
     }
     case "$ipcv_op" in
         GET_TASKS) ipc_op_get_tasks "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" ;;
+        GET_SUMMARY) ipc_op_get_summary "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" ;;
         GET_TASK_STATUS) ipc_op_get_status "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
         GET_TASK_LOG) ipc_op_get_log "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" "$(ipc_param "$ipcv_params" lines)" ;;
+        GET_TASK_DETAIL) ipc_op_get_task_detail "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" ;;
+        GET_TASK_EVENTS) ipc_op_get_task_events "$ipcv_base" "$ipcv_tasks" "$ipcv_rid" "$(ipc_param "$ipcv_params" id)" "$(ipc_param "$ipcv_params" lines)" ;;
+        GET_DAEMON_LOG) ipc_op_get_daemon_log "$ipcv_base" "$ipcv_rid" "$(ipc_param "$ipcv_params" lines)" ;;
         VALIDATE_TASK) ipc_op_validate "$ipcv_base" "$ipcv_rid" "$ipcv_params" ;;
         CREATE_TASK) ipc_op_create "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
         UPDATE_TASK) ipc_op_update "$ipcv_base" "$ipcv_config" "$ipcv_rid" "$ipcv_params" ;;
@@ -3573,6 +3589,225 @@ ipc_client_send() {   # <base> <op> <params> [timeout] → rc；stdout 响应文
     echo "0|$ipcv_op|5|operation_timeout"
     return 5
 }
+# §22 WebUI Read-Only Data Plane（P3-05）：Runtime Read Aggregator
+# ═══════════════════════════════════════════════════════════════════════════
+# 目标：为 KernelSU WebUI（webroot/）与 `su-scheduler webui` CLI Reader 提供
+# **只读**统一 JSON 数据面。**严格只读**：本层全部 op 只聚合 Registry 快照 +
+# 运行目录工件 + daemon 日志；零 exec、零 config 写、零副作用（对齐 P3-04
+# 安全模型——UI 只经 IPC 读，JS 不读 /data/adb、不调 su/sh -c/eval）。
+# 统一 JSON Schema：每个只读 op 返回单行 JSON 载荷；所有字符串值经
+#   web_json_escape 编码（\ " 与 C0 控制符转义 + < > & → \uXXXX），保证日志
+#   中的 <script>、引号、换行不会注入 HTML/JS（P3-05 安全验收条款）。
+# 有界日志读取：task log ≤500 行、daemon log ≤500 行、events ≤200 行；响应
+#   携带 truncated=1/0 + total/returned，前端据此明确提示「日志已截断」。
+# daemon 离线：本层在 IPC 服务端内运行（daemon 必存活）；离线态由客户端
+#   （su-scheduler webui → ipc_client_send rc 6）转为 {"ok":false,...} 输出。
+# 命名空间：函数 web_ 前缀、内部全局 webv_ 前缀（防覆盖调用方全局，同 §21）。
+# ═══════════════════════════════════════════════════════════════════════════
+WEBUI_LOG_MAX=500
+WEBUI_EVENTS_MAX=200
+web_log() { [ "${WEBUI_LOG:-1}" = "1" ] && echo "[webui] $1" >&2; }
+# JSON 字符串转义（不含首尾引号；多行值以字面 \n 表示；< > & → \uXXXX）
+web_json_escape() {
+    printf '%s' "$1" | tr -d '\000-\010\013\014\016-\037' | awk '
+        {
+            gsub(/\\/, "\\\\")
+            gsub(/"/, "\\\"")
+            gsub(/\t/, "\\t")
+            gsub(/\r/, "\\r")
+            gsub(/</, "\\u003c")
+            gsub(/>/, "\\u003e")
+            gsub(/&/, "\\u0026")
+            if (NR > 1) printf "\\n"
+            printf "%s", $0
+        }
+    '
+}
+# JSON 字符串字段（带首尾引号）
+web_json_str() { printf '"%s"' "$(web_json_escape "$1")"; }
+# 运行目录工件优先，缺省回退 task 文件 runtime.* 字段
+web_run_or_task() {   # <tasks_dir> <id> <runfile> <task_file> <taskkey>
+    webv_rd="$1/$2"
+    if [ -f "$webv_rd/$3" ]; then
+        cat "$webv_rd/$3" 2>/dev/null
+        return 0
+    fi
+    [ -f "$4" ] && sched_task_field "$4" "$5" || echo ""
+}
+# 一行 JSON 日志（尾部 N 行 → ["...","..."]）
+web_log_lines_json() {   # <file> <returned>
+    webv_f=$1; webv_ret=$2
+    printf '['
+    webv_sep=""
+    if [ -f "$webv_f" ] && [ "$webv_ret" -gt 0 ]; then
+        tail -n "$webv_ret" "$webv_f" 2>/dev/null | while IFS= read -r webv_line; do
+            printf '%s%s' "$webv_sep" "$(web_json_str "$webv_line")"
+            webv_sep=","
+        done
+    fi
+    printf ']'
+}
+# 任务紧凑行（GET_SUMMARY.tasks 元素）
+web_task_row() {   # <tasks_dir> <task_file> <id>
+    webv_tasks=$1; webv_f=$2; webv_id=$3
+    webv_st=$(ipc_task_state "$webv_tasks" "$webv_id")
+    webv_en=$(sched_task_field "$webv_f" enabled); [ -z "$webv_en" ] && webv_en=0
+    webv_trig=$(sched_task_field "$webv_f" trigger)
+    webv_act=$(sched_task_field "$webv_f" action.command)
+    webv_last=$(web_run_or_task "$webv_tasks" "$webv_id" start_time.txt "$webv_f" runtime.last_start)
+    webv_rcount=$(cat "$webv_tasks/$webv_id/recovery.count" 2>/dev/null); [ -n "$webv_rcount" ] || webv_rcount=0
+    webv_hasrun=0; [ -d "$webv_tasks/$webv_id" ] && webv_hasrun=1
+    webv_ht=$(sched_task_field "$webv_f" health.type); [ -z "$webv_ht" ] && webv_ht=none
+    webv_health=$webv_ht
+    case "$webv_st" in HEALTHY|UNHEALTHY|UNKNOWN|RECOVERING) webv_health=$webv_st ;; esac
+    printf '{"id":%s,"name":%s,"status":%s,"trigger":%s,"action":%s,"enabled":%s,"health":%s,"last_run":%s,"restart_count":%s,"has_run_dir":%s}' \
+        "$(web_json_str "$webv_id")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" name)")" \
+        "$(web_json_str "$webv_st")" \
+        "$(web_json_str "$webv_trig")" \
+        "$(web_json_str "$webv_act")" \
+        "$(web_json_str "$webv_en")" \
+        "$(web_json_str "$webv_health")" \
+        "$(web_json_str "$webv_last")" \
+        "$webv_rcount" "$webv_hasrun"
+}
+# ── GET_SUMMARY：计数 + 任务紧凑列表（Dashboard + Task List 单调用）────────
+web_agg_summary() {   # <base> <tasks> → 单行 JSON
+    webv_base=$1; webv_tasks=$2
+    webv_total=0 webv_running=0 webv_healthy=0 webv_failed=0 webv_disabled=0 webv_unhealthy=0 webv_unknown=0
+    webv_rows="" webv_sep=""
+    for webv_id in $(registry_task_ids); do
+        webv_f=$(registry_task_file "$webv_id" 2>/dev/null) || continue
+        webv_total=$((webv_total + 1))
+        webv_en=$(sched_task_field "$webv_f" enabled)
+        [ "$webv_en" = "0" ] && webv_disabled=$((webv_disabled + 1))
+        webv_st=$(ipc_task_state "$webv_tasks" "$webv_id")
+        case "$webv_st" in
+            RUNNING|STARTING) webv_running=$((webv_running + 1)) ;;
+            HEALTHY) webv_healthy=$((webv_healthy + 1)) ;;
+            FAILED) webv_failed=$((webv_failed + 1)) ;;
+            UNHEALTHY) webv_unhealthy=$((webv_unhealthy + 1)) ;;
+            *) webv_unknown=$((webv_unknown + 1)) ;;
+        esac
+        webv_row=$(web_task_row "$webv_tasks" "$webv_f" "$webv_id")
+        webv_rows="${webv_rows}${webv_sep}${webv_row}"
+        webv_sep=","
+    done
+    webv_mode=$(sched_source_mode "$webv_base")
+    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s},"tasks":[%s]}' \
+        "$(web_json_str "$webv_mode")" \
+        "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" \
+        "$webv_rows"
+}
+# ── GET_TASK_DETAIL：完整任务详情（Task Detail 页）─────────────────────────
+web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
+    webv_tasks=$1; webv_f=$2; webv_id=$3
+    webv_st=$(ipc_task_state "$webv_tasks" "$webv_id")
+    webv_rd="$webv_tasks/$webv_id"
+    webv_pid=$(web_run_or_task "$webv_tasks" "$webv_id" pid.txt "$webv_f" runtime.pid)
+    webv_exit=$(web_run_or_task "$webv_tasks" "$webv_id" exit_code.txt "$webv_f" runtime.last_exit)
+    webv_start=$(web_run_or_task "$webv_tasks" "$webv_id" start_time.txt "$webv_f" runtime.last_start)
+    webv_end=$(web_run_or_task "$webv_tasks" "$webv_id" end_time.txt "$webv_f" runtime.last_end)
+    webv_rcount=$(cat "$webv_rd/recovery.count" 2>/dev/null); [ -n "$webv_rcount" ] || webv_rcount=0
+    webv_run_count=$(sched_task_field "$webv_f" runtime.run_count); [ -n "$webv_run_count" ] || webv_run_count=0
+    webv_ht=$(sched_task_field "$webv_f" health.type); [ -z "$webv_ht" ] && webv_ht=none
+    webv_htgt=$(sched_task_field "$webv_f" health.target)
+    webv_rtype=$(sched_task_field "$webv_f" recovery.type); [ -z "$webv_rtype" ] && webv_rtype=none
+    webv_rmax=$(sched_task_field "$webv_f" retry.max); [ -n "$webv_rmax" ] || webv_rmax=0
+    webv_rint=$(sched_task_field "$webv_f" retry.interval); [ -n "$webv_rint" ] || webv_rint=60
+    webv_hasrun=0; [ -d "$webv_rd" ] && webv_hasrun=1
+    printf '{"ok":true,"task":{'
+    printf '"id":%s,"name":%s,"status":%s,"trigger":%s,"action":%s,"enabled":%s,' \
+        "$(web_json_str "$webv_id")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" name)")" \
+        "$(web_json_str "$webv_st")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" trigger)")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" action.command)")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" enabled)")"
+    printf '"health":{"type":%s,"target":%s},' "$(web_json_str "$webv_ht")" "$(web_json_str "$webv_htgt")"
+    printf '"recovery":{"type":%s,"max":%s,"interval":%s},' "$(web_json_str "$webv_rtype")" "$webv_rmax" "$webv_rint"
+    printf '"pid":%s,"last_exit":%s,"last_start":%s,"last_end":%s,' \
+        "$(web_json_str "$webv_pid")" "$(web_json_str "$webv_exit")" "$(web_json_str "$webv_start")" "$(web_json_str "$webv_end")"
+    printf '"restart_count":%s,"run_count":%s,' "$webv_rcount" "$webv_run_count"
+    printf '"source":{"type":%s,"line":%s,"raw":%s},' \
+        "$(web_json_str "$(sched_task_field "$webv_f" source.type)")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" source.line)")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" source.raw)")"
+    printf '"has_run_dir":%s}}' "$webv_hasrun"
+}
+# ── 日志聚合（GET_TASK_EVENTS / GET_DAEMON_LOG / GET_TASK_LOG）──────────────
+web_log_payload() {   # <file> <max> <label> → {"ok":true,<label>...,"total":..,"returned":..,"truncated":..,"lines":[...]}
+    webv_f=$1; webv_max=$2; webv_label=$3
+    webv_total=0
+    [ -f "$webv_f" ] && webv_total=$(wc -l < "$webv_f" 2>/dev/null || echo 0)
+    webv_returned=$webv_total
+    [ "$webv_returned" -gt "$webv_max" ] && webv_returned=$webv_max
+    webv_trunc=0
+    [ "$webv_returned" -lt "$webv_total" ] && webv_trunc=1
+    webv_lines=$(web_log_lines_json "$webv_f" "$webv_returned")
+    printf '{"ok":true,%s"total":%s,"returned":%s,"truncated":%s,"lines":%s}' \
+        "$webv_label" "$webv_total" "$webv_returned" "$webv_trunc" "$webv_lines"
+}
+# ── IPC op 处理器（全部只读）────────────────────────────────────────────────
+ipc_op_get_summary() {   # <base> <tasks> <req_id>
+    webv_base=$1; webv_tasks=$2; webv_rid=$3
+    webv_payload=$(web_agg_summary "$webv_base" "$webv_tasks")
+    ipc_respond "$webv_base" "$webv_rid" GET_SUMMARY 0 ok "$webv_payload"
+    return 0
+}
+ipc_op_get_task_detail() {   # <base> <tasks> <req_id> <id>
+    webv_base=$1; webv_tasks=$2; webv_rid=$3; webv_id=$4
+    [ -n "$webv_id" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_DETAIL 1 invalid_request "missing id"; return 0; }
+    webv_f=$(registry_task_file "$webv_id" 2>/dev/null)
+    [ -n "$webv_f" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_DETAIL 3 task_not_found "$webv_id"; return 0; }
+    webv_payload=$(web_task_detail "$webv_tasks" "$webv_f" "$webv_id")
+    ipc_respond "$webv_base" "$webv_rid" GET_TASK_DETAIL 0 ok "$webv_payload"
+    return 0
+}
+ipc_op_get_task_events() {   # <base> <tasks> <req_id> <id> [lines]
+    webv_base=$1; webv_tasks=$2; webv_rid=$3; webv_id=$4; webv_lines=${5:-50}
+    [ -n "$webv_id" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_EVENTS 1 invalid_request "missing id"; return 0; }
+    case "$webv_lines" in ''|*[!0-9]*) webv_lines=50 ;; esac
+    [ "$webv_lines" -gt "$WEBUI_EVENTS_MAX" ] && webv_lines=$WEBUI_EVENTS_MAX
+    webv_f=$(registry_task_file "$webv_id" 2>/dev/null)
+    [ -n "$webv_f" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_EVENTS 3 task_not_found "$webv_id"; return 0; }
+    webv_payload=$(web_log_payload "$webv_tasks/$webv_id/events.log" "$webv_lines" "\"task\":$(web_json_str "$webv_id"),")
+    ipc_respond "$webv_base" "$webv_rid" GET_TASK_EVENTS 0 ok "$webv_payload"
+    return 0
+}
+ipc_op_get_daemon_log() {   # <base> <req_id> [lines]
+    webv_base=$1; webv_rid=$2; webv_lines=${3:-50}
+    case "$webv_lines" in ''|*[!0-9]*) webv_lines=50 ;; esac
+    [ "$webv_lines" -gt "$WEBUI_LOG_MAX" ] && webv_lines=$WEBUI_LOG_MAX
+    webv_payload=$(web_log_payload "$webv_base/su-scheduler.log" "$webv_lines" "")
+    ipc_respond "$webv_base" "$webv_rid" GET_DAEMON_LOG 0 ok "$webv_payload"
+    return 0
+}
+# GET_TASK_LOG 载荷 → 统一 JSON（CLI Reader 与前端共用；meta 行透传截断态）
+web_task_log_to_json() {   # <payload> → 单行 JSON
+    webv_payload=$1
+    webv_meta=$(printf '%s\n' "$webv_payload" | head -1)
+    webv_lines=$(printf '%s\n' "$webv_payload" | tail -n +2)
+    webv_trunc=0; webv_total=0; webv_ret=0
+    case "$webv_meta" in
+        \#truncated=*)
+            webv_trunc=${webv_meta#*truncated=}; webv_trunc=${webv_trunc%%|*}
+            webv_total=${webv_meta#*total=}; webv_total=${webv_total%%|*}
+            webv_ret=${webv_meta#*lines=}
+            ;;
+    esac
+    printf '{"ok":true,"truncated":%s,"total":%s,"returned":%s,"lines":[' \
+        "$webv_trunc" "$webv_total" "$webv_ret"
+    webv_sep=""
+    printf '%s\n' "$webv_lines" | while IFS= read -r webv_line; do
+        printf '%s%s' "$webv_sep" "$(web_json_str "$webv_line")"
+        webv_sep=","
+    done
+    printf ']}'
+}
+# ───────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
 # ───────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
@@ -3597,6 +3832,9 @@ runtime_lib_selfcheck() {
               sched_task_field sched_audit ipc_server_init ipc_server_poll \
               ipc_parse ipc_params_valid ipc_param ipc_respond ipc_dispatch \
               ipc_allowed_keys ipc_op_get_tasks ipc_op_get_status ipc_op_get_log ipc_op_validate \
+              ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
+              web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
+              web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \
               ipc_op_start ipc_op_stop ipc_op_restart ipc_client_send \
               ipc_b64enc ipc_b64dec ipc_task_state ipc_has_newline; do

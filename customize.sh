@@ -28,6 +28,7 @@ ui_print "- 📂 Extracting core module files..."
 unzip -o "$ZIPFILE" 'system/*' -d $MODPATH >&2
 unzip -o "$ZIPFILE" 'service.sh' -d $MODPATH >&2
 unzip -o "$ZIPFILE" 'module.prop' -d $MODPATH >&2
+unzip -o "$ZIPFILE" 'webroot/*' -d $MODPATH >&2   # KernelSU 原生 WebUI 静态资源（P3-05）
 
 # 📁 [PHASE 2] Data Directory Setup
 # This is where your logs/state live

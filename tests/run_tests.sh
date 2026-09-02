@@ -41,6 +41,12 @@
 #   L2  tests/ipc/security.sh           P3-04 IPC 安全边界（fuzz/注入零副作用、Shell 元字符
 #       不进入执行路径、同 req_id 幂等、已运行不重复 START、单轮有界不阻塞、0700 权限、
 #       未授权写 permission_denied、daemon 停止 daemon_unavailable、超时 operation_timeout）
+#   L2  tests/webui/read-only.test.sh   P3-05 WebUI 只读数据面（GET_SUMMARY/GET_TASK_DETAIL/
+#       GET_TASK_EVENTS/GET_DAEMON_LOG 统一 JSON、GET_TASK_LOG meta 行、JSON 转义防注入、
+#       空/损坏/daemon 离线三态、CLI Reader 只读白名单 + JSON 信封、零 exec）
+#   L2  tests/webui/security.test.sh    P3-05 WebUI 安全（webroot 无 Root 直执特征、恶意
+#       请求零 exec/零 config 写、<script>/引号/换行 JSON 转义、malformed→invalid_request、
+#       有界日志 + truncated 标志）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -117,6 +123,8 @@ else
         "tests/scheduler-prod/test.sh" \
         "tests/ipc/test.sh" \
         "tests/ipc/security.sh" \
+        "tests/webui/read-only.test.sh" \
+        "tests/webui/security.test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

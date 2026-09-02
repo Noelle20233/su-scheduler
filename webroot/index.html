@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Su Scheduler — WebUI (只读)</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>Su Scheduler</h1>
+  <nav id="nav">
+    <a href="#dashboard" data-view="dashboard" class="active">Dashboard</a>
+    <a href="#tasks" data-view="tasks">Task List</a>
+    <a href="#logs" data-view="logs">Logs</a>
+  </nav>
+  <div id="daemon-badge" class="badge unknown">daemon: …</div>
+</header>
+<main id="view"></main>
+<footer>
+  <p>只读数据面 — 数据全部经 IPC（Runtime Read Aggregator）读取；本页不执行任何 Root 命令。</p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

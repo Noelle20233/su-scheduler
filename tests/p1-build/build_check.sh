@@ -61,7 +61,7 @@ else
     zt=$(unzip -t "$ZIP" 2>&1)
     [ "$(printf '%s\n' "$zt" | grep -c 'No errors detected')" -eq 1 ] && ok "unzip -t integrity OK" || bad "zip integrity"
 
-    for e in module.prop service.sh customize.sh system/bin/su-schedulerd system/bin/su-scheduler system/bin/su-scheduler-termux system/bin/su-scheduler-runtime; do
+    for e in module.prop service.sh customize.sh system/bin/su-schedulerd system/bin/su-scheduler system/bin/su-scheduler-termux system/bin/su-scheduler-runtime webroot/index.html webroot/app.js webroot/style.css; do
         unzip -l "$ZIP" 2>/dev/null | grep -q " $e$" && ok "zip contains $e" || bad "zip missing $e"
     done
 fi

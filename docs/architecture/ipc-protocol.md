@@ -69,13 +69,17 @@ REQ_ID|OP|RC|ERROR
   响应，零副作用（不启动、不写任务、不触发 Root action）。
 - `ipc_has_newline` 拒绝多行命令（task 文件按单行 key=value 存储，防污染）。
 
-### D6 操作白名单（12 op）与参数键白名单
+### D6 操作白名单（16 op）与参数键白名单
 
 | OP | 允许参数键 | 说明 |
 | :--- | :--- | :--- |
 | GET_TASKS | （无） | 列出 registry 任务 `id|name|trigger|enabled|state` |
 | GET_TASK_STATUS | id | 任务字段 key=value |
-| GET_TASK_LOG | id lines | run dir output.log 尾部（≤500 行） |
+| GET_TASK_LOG | id lines | run dir output.log 尾部（meta 行 `#truncated=…|total=…|lines=…` + 内容行，≤500 行） |
+| GET_SUMMARY | （无） | **P3-05 只读**：统一 JSON 计数 + 任务紧凑列表（total/running/healthy/failed/disabled/unhealthy/unknown + tasks[]） |
+| GET_TASK_DETAIL | id | **P3-05 只读**：统一 JSON 完整任务详情（config + health/recovery + pid/last_exit/last_start/last_end/restart_count/run_count/source/has_run_dir） |
+| GET_TASK_EVENTS | id lines | **P3-05 只读**：统一 JSON 运行历史（events.log 尾部，≤200 行，truncated 标志） |
+| GET_DAEMON_LOG | lines | **P3-05 只读**：统一 JSON daemon 主日志（su-scheduler.log 尾部，≤500 行，truncated 标志） |
 | VALIDATE_TASK | name trigger command enabled termux interactive notify_start notify_end msg | 临时文件校验，不持久化 |
 | CREATE_TASK | id name trigger command enabled termux interactive notify_start notify_end msg | **仅 managed**；写 task-config + reload |
 | UPDATE_TASK | id name trigger command enabled termux interactive notify_start notify_end msg | **仅 managed**；原子更新 + 校验 + reload |

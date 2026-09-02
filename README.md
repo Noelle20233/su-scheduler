@@ -1364,6 +1364,32 @@ su-scheduler task-output <task_id>
 
 ---
 
+## 🌐 WebUI 只读数据面（P3-05）
+
+> 本章节为 P3-05 追加，不改动本文件既有任何章节。
+
+Su Scheduler 提供**只读** WebUI（Dashboard / Task List / Task Detail / Logs），
+数据全部经 IPC（Runtime Read Aggregator，Runtime §22）读取——**不提供任何
+Root Shell，前端 JS 不读数据目录、不调系统命令/动态求值**。静态资源位于
+模块 `webroot/`（KernelSU 原生 WebUI 伺服），同时提供 CLI Reader 供主机/脚本使用：
+
+```bash
+# 主机/脚本验收与 KernelSU WebUI Bridge 共用同一 CLI Reader（只读白名单）
+su-scheduler webui GET_SUMMARY
+su-scheduler webui GET_TASK_DETAIL id=<base64(task_id)>
+su-scheduler webui GET_TASK_EVENTS id=<base64(task_id)> lines=<base64(50)>
+su-scheduler webui GET_DAEMON_LOG lines=<base64(100)>
+su-scheduler webui GET_TASK_LOG id=<base64(task_id)> lines=<base64(100)>
+```
+
+- 成功输出**单行统一 JSON**；失败输出 `{"ok":false,"rc":N,"error":"..."}`
+  （rc 6 = daemon_unavailable 离线；rc 3 = task_not_found）。
+- 日志读取有界（task/daemon ≤500 行、events ≤200 行），`truncated` 标志
+  明确提示「日志已截断」。
+- 页面范围与数据契约见 **`docs/P3-05-WEBUI-DATA.md`**；执行记录见 `docs/P3-05.md`。
+
+---
+
 ## 🧪 回归测试（P2-01 追加）
 
 > 本章节为 P2-01 追加，不改动本文件既有任何章节。P0/P1 门禁的**唯一回归入口**
@@ -1402,6 +1428,8 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | Registry 正式调度接管（P3-03：Registry 从 Shadow 提升为正式调度源、双模式 legacy/managed、TriggerProvider→ActionProvider、同周期去重、配置变更不重复执行、损坏 KEPT、task.v2 快照移除监督兜底、旧 CLI 查询/终止、单任务错误隔离、审计日志、接线） | `tests/scheduler-prod/test.sh` |
 | L2 | 本地 IPC 控制面（P3-04：请求/响应文件通道、固定格式、base64 值、12 op 白名单、可区分错误码、写操作仅 managed、START/STOP/RESTART 经 action_run、重复请求不重复启动、原子响应、接线） | `tests/ipc/test.sh` |
 | L2 | IPC 安全边界（P3-04：fuzz/注入零副作用、Shell 元字符不进入执行路径、同 req_id 幂等、已运行不重复 START、单轮有界不阻塞、0700 权限、未授权写 permission_denied、daemon 停止 daemon_unavailable、超时 operation_timeout） | `tests/ipc/security.sh` |
+| L2 | WebUI 只读数据面（P3-05：GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG 统一 JSON、GET_TASK_LOG meta 行、JSON 转义防注入、空/损坏/daemon 离线三态、CLI Reader 只读白名单 + JSON 信封、零 exec） | `tests/webui/read-only.test.sh` |
+| L2 | WebUI 安全（P3-05：webroot 无 Root 直执特征、恶意请求零 exec/零 config 写、`<script>`/引号/换行 JSON 转义、malformed→invalid_request、有界日志 + truncated 标志） | `tests/webui/security.test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |

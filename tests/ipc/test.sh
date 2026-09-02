@@ -86,6 +86,14 @@ for fn in ipc_server_init ipc_server_poll ipc_parse ipc_params_valid ipc_param \
 done
 [ "$fn_miss" -eq 0 ] && ok "P3-04 entry: §21 ipc_* functions defined"
 
+web_miss=0
+for fn in ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events \
+          ipc_op_get_daemon_log web_json_escape web_agg_summary web_task_detail \
+          web_log_payload web_task_log_to_json; do
+    type "$fn" >/dev/null 2>&1 || { bad "P3-05 entry: $fn missing"; web_miss=1; }
+done
+[ "$web_miss" -eq 0 ] && ok "P3-05 entry: §22 WebUI read-only aggregator functions defined"
+
 sel=$(sed -n '/^runtime_lib_selfcheck()/,/^}/p' "$RTLIB")
 sel_miss=0
 for fn in ipc_server_init ipc_server_poll ipc_dispatch ipc_op_start ipc_client_send; do
@@ -108,7 +116,11 @@ ipc_server_init "$BASE" >/dev/null 2>&1
 pm=$(ls -ld "$BASE/ipc" | awk '{print $1}')
 [ "$pm" = "drwx------" ] && ok "P3-04 transport: ipc dir perms $pm (root-only)" || bad "P3-04 transport: ipc perms=$pm"
 n=$(echo "$IPC_WHITELIST" | wc -w)
-[ "$n" -eq 12 ] && ok "P3-04 transport: IPC_WHITELIST 12 ops" || bad "P3-04 transport: whitelist count=$n"
+[ "$n" -eq 16 ] && ok "P3-04/P3-05 transport: IPC_WHITELIST 16 ops (12 control + 4 WebUI read-only)" || bad "P3-04/P3-05/P3-06 transport: whitelist count=$n"
+grep -q 'GET_SUMMARY' <<< "$IPC_WHITELIST" && grep -q 'GET_TASK_DETAIL' <<< "$IPC_WHITELIST" \
+  && grep -q 'GET_TASK_EVENTS' <<< "$IPC_WHITELIST" && grep -q 'GET_DAEMON_LOG' <<< "$IPC_WHITELIST" \
+  && ok "P3-05 transport: WebUI read-only ops in whitelist (GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG)" \
+  || bad "P3-05 transport: WebUI read-only ops missing from whitelist"
 
 # ── 3) 协议：固定格式 + 非法请求零副作用 ───────────────────────────────────
 : > "$EXEC_LOG"
@@ -161,6 +173,34 @@ r=$(send_req "g_log_miss" "g_log_miss|GET_TASK_LOG|id=$(ipc_b64enc nope)")
 
 r=$(send_req "g_log" "g_log|GET_TASK_LOG|id=$(ipc_b64enc t1_0830)")
 [ "$(resp_rc "$r")" = "0" ] && ok "P3-04 get: GET_TASK_LOG no-output -> rc 0" || bad "P3-04 get: log rc=$(resp_rc "$r")"
+
+# ── 4b) P3-05 WebUI 只读 op（GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG）──
+: > "$EXEC_LOG"   # 只读操作必须零 exec
+r=$(send_req "w_sum" "w_sum|GET_SUMMARY|")
+rc=$(resp_rc "$r")
+[ "$rc" = "0" ] && printf '%s\n' "$r" | grep -q '"total":2' && printf '%s\n' "$r" | grep -q 't1_0830' \
+    && ok "P3-05 read: GET_SUMMARY returns totals+tasks JSON" || bad "P3-05 read: GET_SUMMARY rc=$rc payload=$(printf '%s' "$r" | tail -n +2)"
+
+r=$(send_req "w_det" "w_det|GET_TASK_DETAIL|id=$(ipc_b64enc t1_0830)")
+rc=$(resp_rc "$r")
+[ "$rc" = "0" ] && printf '%s\n' "$r" | grep -q '"ok":true' && printf '%s\n' "$r" | grep -q '"task"' \
+    && ok "P3-05 read: GET_TASK_DETAIL returns detail JSON" || bad "P3-05 read: detail rc=$rc payload=$(printf '%s' "$r" | tail -n +2)"
+
+r=$(send_req "w_det_miss" "w_det_miss|GET_TASK_DETAIL|id=$(ipc_b64enc nope)")
+[ "$(resp_rc "$r")" = "3" ] && ok "P3-05 read: GET_TASK_DETAIL unknown -> task_not_found" || bad "P3-05 read: detail unknown rc=$(resp_rc "$r")"
+
+r=$(send_req "w_ev" "w_ev|GET_TASK_EVENTS|id=$(ipc_b64enc t1_0830)&lines=$(ipc_b64enc 5)")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q '"lines":\[' \
+    && ok "P3-05 read: GET_TASK_EVENTS returns events JSON" || bad "P3-05 read: events rc=$(resp_rc "$r")"
+
+r=$(send_req "w_dlog" "w_dlog|GET_DAEMON_LOG|lines=$(ipc_b64enc 5)")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q '"truncated":' \
+    && ok "P3-05 read: GET_DAEMON_LOG returns daemon log JSON" || bad "P3-05 read: daemon log rc=$(resp_rc "$r")"
+
+# 新只读 op 注入（元字符）→ 零 exec
+r=$(send_req "w_inj" "w_inj|GET_TASK_DETAIL|id=$(ipc_b64enc 'a;touch pwn')")
+[ "$(resp_rc "$r")" = "3" ] && ok "P3-05 read: malicious id -> task_not_found (zero side-effect)" || bad "P3-05 read: malicious id rc=$(resp_rc "$r")"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P3-05 read: WebUI read-only ops had ZERO exec side effects" || bad "P3-05 read: exec leaked ($(wc -l < "$EXEC_LOG"))"
 
 # ── 5) VALIDATE_TASK ───────────────────────────────────────────────────────
 v="command=$(ipc_b64enc 'echo hi')&trigger=$(ipc_b64enc '09:00')"

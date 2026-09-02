@@ -31,7 +31,7 @@ echo "✅ Documentation prepared ($(wc -l < "$DOCS_FILE") lines)"
 
 # Create zip
 echo "📦 Creating $ZIP_NAME..."
-zip -r "$ZIP_NAME" module.prop customize.sh service.sh system/ -x "build.sh"
+zip -r "$ZIP_NAME" module.prop customize.sh service.sh system/ webroot/ -x "build.sh"
 
 echo "✅ Done! File ready: $ZIP_NAME"
 ls -lh "$ZIP_NAME"
