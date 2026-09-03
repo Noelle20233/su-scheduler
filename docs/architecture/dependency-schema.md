@@ -185,6 +185,66 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 8. P4-04 增补裁决：WAITING 门控决策层（ADR D11–D14）
+
+> **状态**：已接受（P4-04 冻结）。在 D1–D10 之上把 TSM reserved 边
+> （PENDING>WAITING / WAITING>STARTING / WAITING>PENDING / WAITING>FAILED）
+> 接入调度层，实现「触发匹配但依赖未满足 → WAITING」门控链。
+> **配套实现**：Runtime §20 `sched_dep_satisfied` / `sched_gate_check` /
+> `sched_advance_waiting` / `sched_gate_*` + `WAIT_MAX`；`sched_execute_one` 门控
+> 插入点；`scheduler_tick` WAITING 复查通道；`state_rehydrate_residual` WAITING
+> 保留（P4-04 合法语义变更）。详见 docs/P4-04.md。
+
+### D11 门控插入点
+
+- 门控判定位于 `sched_execute_one` 的 due=Y 分支内、`trigger_decide` 返回 due
+  之后、`action_run` 之前；已 WAITING 任务由 `scheduler_tick` 首部的 advance 通道
+  逐周期复查（每个 tick 至多一次）。
+- 门控判定入口（单一）：`sched_gate_check <tasks_dir> <id>` → 0=通过 1=未通过；
+  当前仅依赖维度，P4-06（Condition 求值）在同一入口叠加 AND 语义。
+
+### D12 依赖满足判定
+
+- 解析复用 §26：`dep_normalize`（D1 容错）得规范逗号串，逐条切分
+  `[?]<task-id>[:<STATE>]`（D2）。
+- 被依赖任务实时态 = `runtime_current_state "<tasks_dir>/<dep_id>"`——只读运行
+  目录 `state.txt`（缺省 PENDING），**无副作用**（需求 §4 边界）。
+- Required 条目须达到该 entry 指定 `:STATE`（缺省 STOPPED）才算满足；`?` Optional
+  未满足**不阻断**（只记 `opt-unsat:` 原因；失败传播策略归 P4-05）。
+- 依赖任务处于 **WAITING** 视为未满足（等待其先解除）。
+- `DISABLED` 任务不做门控（沿用既有行为）。
+
+### D13 WAITING 边接线（cause 令牌）
+
+| 场景 | 转换 | 事件令牌（RT_EVENTS） | TSM cause（语义） |
+| :-- | :-- | :-- | :-- |
+| 触发匹配 + 依赖未满足 | PENDING>WAITING | `gate_wait`（msg=原因如 `dep unsat: t_b`） | time_trigger |
+| 依赖全部满足 + 触发仍匹配 | WAITING>STARTING | `gate_ok` | time_trigger |
+| 依赖满足但触发不再匹配 / 依赖未满足且触发不再匹配 | WAITING>PENDING（rearm） | `rearm` | rearm |
+| 依赖未满足 + 触发仍匹配 + 超过 `WAIT_MAX` | WAITING>FAILED | `gate_fail`（msg=`wait timeout …`） | action_failure |
+
+- `gate_*` 令牌只入 `RT_EVENTS`，**不入** `TSM_CAUSES`（TSM cause 保持规范令牌；
+  `state_log_event` 对 WAITING 边不校验 cause，写入校验通过）。
+- 终态（STOPPED/FAILED）任务触发时先 `rearm` 回 PENDING 再门控（TSM 无
+  STOPPED>WAITING 边；FAILED>WAITING 保留给重试退避语义）。
+- 超时兜底优先级：**依赖满足判定先行**（满足即解除/执行）；`WAIT_MAX` 超时作为
+  「触发窗口内持续等待」的后置硬性兜底，保证无永久 WAITING。
+- `WAIT_MAX=86400` 秒（需求「有界 WAITING」硬性；依赖 P4-05 细化语义），可经
+  环境覆盖（测试确定性）。
+
+### D14 每窗口一次 + 重启保留
+
+- 进入 WAITING **不 mark** cycle（未解除不误标为已执行）；解除后同窗口至多执行
+  一次（执行时 mark）——与 P3-03「同周期去重、配置变更后可执行一次」语义兼容。
+- daemon 重启后 WAITING **原样保留**（`state_rehydrate_residual` 不再
+  WAITING→FAILED，P4-04 合法语义变更）；下个 tick 复查依赖；`gate.wait_start`
+  重启后重新计时（保持有界）。
+- `runtime_dir_active` 视 WAITING 目录为活跃（门控等待豁免，不被上限修剪误删，
+  P4-07 深化）；`supervisor_step` 对 WAITING 无动作（保持）。
+- disable WAITING 任务沿用既有 tcfg/disable 路径，不报错。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -192,3 +252,7 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 - 2026-09-04：P4-03 增补 D6–D10（依赖图校验与循环检测）。环策略 = 简单 DFS、
   Optional 参与环校验、前向引用允许、图校验接入 apply/set/import/snapshot。
   运行时门控（P4-04）、Required/Optional 失败传播（P4-05）不在本 ADR 范围。
+- 2026-09-04：P4-04 增补 D11–D14（WAITING 门控决策层）。门控插入点 =
+  `sched_execute_one` due=Y 分支 + `scheduler_tick` WAITING 复查通道；`gate_*`
+  事件令牌入 RT_EVENTS 不入 TSM_CAUSES；重启 WAITING 保留为合法语义变更。
+  失败传播（P4-05）、Condition 求值（P4-06）不在本 ADR 范围。

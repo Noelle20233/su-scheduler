@@ -16,6 +16,8 @@
 #   §store   tcfg_validate_task 对含非法 dependency/condition 的任务文件拒绝；
 #   §cli     CLI task-config set/show dependency/condition round-trip（managed）；
 #   §legacy  Legacy config.txt 零影响（legacy 路径无新解析接线）。
+#   §gate    P4-04 依赖门控 + WAITING 接线（scheduler-prod 式 execute_task shim +
+#            SCHED_CYCLE_NOW/GATE_NOW 确定性时钟）。
 # 加载：`. ./$RTLIB`（TCFG_DIR 先 export 隔离）。
 # ═══════════════════════════════════════════════════════════════════════════
 set -u
@@ -34,6 +36,22 @@ trap 'rm -rf "$T"' EXIT
 
 export TCFG_DIR="$T/task-config"
 mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+# ── P4-04 daemon 上下文 shim：action_run 委托到 execute_task（镜像 daemon 工件）──
+TASKS_DIR="$T/tasks"
+mkdir -p "$TASKS_DIR"
+EXEC_LOG="$T/exec.log"
+execute_task() {            # 7 参：id cmd notify_start notify_end custom_msg interactive termux
+    id=$1; cmd=$2; ns=$3; ne=$4; msg=$5; itr=$6; tmx=$7
+    d="$TASKS_DIR/$id"
+    mkdir -p "$d"
+    echo "$cmd" > "$d/command.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$d/start_time.txt"
+    echo "RUNNING" > "$d/status.txt"
+    echo "$id|$cmd" >> "$EXEC_LOG"
+    echo "0" > "$d/exit_code.txt"
+    echo "SUCCESS" > "$d/status.txt"
+    return 0
+}
 . ./$RTLIB
 
 # ── 助手：构造合法 payload ────────────────────────────────────────────────
@@ -316,6 +334,125 @@ sched_snapshot_managed "$BASE_S" >/dev/null 2>&1
 [ "$(cat "$BASE_S/current" 2>/dev/null)" = "$CUR1" ] \
     && ok "P4-03 snapshot: current unchanged (old snapshot kept)" || bad "P4-03 snapshot: current replaced"
 export TCFG_DIR="$T/task-config"
+
+# ── §gate：依赖门控 + WAITING 状态接线（P4-04）───────────────────────────
+# daemon 上下文 shim（execute_task 拦截 + EXEC_LOG）由文件顶部定义；时间确定性：
+#   SCHED_CYCLE_NOW=周期 token（sched_cycle_token 覆盖）、GATE_NOW=门控时钟
+#   （sched_gate_epoch 覆盖）。门控插入点 = sched_execute_one due=Y 分支（trigger
+#   之后、action_run 之前）；WAITING 复查 = scheduler_tick 首部 advance 通道。
+G_BASE="$T/g-base"; G_TCFG="$T/g-tc"; G_TASKS="$T/g-tasks"; G_CFG="$T/g.cfg"
+rm -rf "$G_BASE" "$G_TCFG" "$G_TASKS"; mkdir -p "$G_BASE" "$G_TCFG" "$G_TASKS"
+echo managed > "$G_TCFG/MANAGED"; : > "$G_CFG"
+export TCFG_DIR="$G_TCFG"; export TR_BASE="$G_BASE"; export TASKS_DIR="$G_TASKS"
+G_EXEC="$T/g-exec.log"; : > "$G_EXEC"
+# execute_task shim 改写 EXEC_LOG 目标：切到 G_EXEC
+execute_task() { id=$1; cmd=$2; ns=$3; ne=$4; msg=$5; itr=$6; tmx=$7
+    d="$TASKS_DIR/$id"; mkdir -p "$d"
+    echo "$cmd" > "$d/command.txt"; echo "RUNNING" > "$d/status.txt"
+    echo "$id|$cmd" >> "$G_EXEC"
+    echo "0" > "$d/exit_code.txt"; echo "SUCCESS" > "$d/status.txt"; return 0; }
+gate_task() {   # <id> <trigger> <dep> <cmd> → 最小合法 Task v2
+    printf 'schema_version=2\nid=%s\ntrigger=%s\ndependency=%s\naction.command=%s\n' \
+        "$1" "$2" "$3" "$4" > "$G_TCFG/$1.task"
+}
+gtick() {   # <now> → 单次调度周期 + 终态对账（镜像 daemon 主循环 tick+sync）
+    scheduler_tick "$G_BASE" "$G_CFG" "$G_TASKS" "$1" >/dev/null 2>&1
+    state_sync_all "$G_TASKS" >/dev/null 2>&1
+}
+
+# A) 依赖未满足触发 → PENDING>WAITING（gate_wait + 原因 + 不执行 + 不 mark cycle）
+gate_task dep_a 08:50 "" "echo A-dep"
+gate_task t_a 08:50 "dep_a" "echo A-task"
+SCHED_CYCLE_NOW=202609040850 GATE_NOW=1000 gtick 0850
+[ "$(cat "$G_TASKS/dep_a/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-04 A: dep_a executed and materialized STOPPED" || bad "P4-04 A: dep_a state=$(cat "$G_TASKS/dep_a/state.txt" 2>/dev/null)"
+[ "$(cat "$G_TASKS/t_a/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-04 A: t_a trigger matched but dep unmet → WAITING (PENDING>WAITING)" || bad "P4-04 A: t_a state=$(cat "$G_TASKS/t_a/state.txt" 2>/dev/null)"
+grep -q '|gate_wait|WAITING|' "$G_TASKS/t_a/events.log" 2>/dev/null \
+    && ok "P4-04 A: events.log records gate_wait→WAITING" || bad "P4-04 A: events=$(cat "$G_TASKS/t_a/events.log" 2>/dev/null)"
+grep -q 'dep unsat: dep_a' "$G_TASKS/t_a/events.log" 2>/dev/null \
+    && ok "P4-04 A: gate reason recorded (dep unsat: dep_a)" || bad "P4-04 A: reason missing"
+grep -q 'echo A-task' "$G_EXEC" && bad "P4-04 A: gated task executed (forbidden)" || ok "P4-04 A: gated task NOT executed"
+[ -f "$G_TASKS/t_a/gate.wait_start" ] \
+    && ok "P4-04 A: wait clock started (gate.wait_start)" || bad "P4-04 A: gate.wait_start missing"
+
+# A2) 同触发窗口内依赖解除 → WAITING>STARTING（gate_ok）+ 执行恰一次
+SCHED_CYCLE_NOW=202609040850 GATE_NOW=1100 gtick 0850
+grep -q 'echo A-task' "$G_EXEC" && ok "P4-04 A2: WAITING task released in-window → executed (dep satisfied)" || bad "P4-04 A2: t_a not executed"
+grep -q '|gate_ok|STARTING|' "$G_TASKS/t_a/events.log" 2>/dev/null \
+    && ok "P4-04 A2: events.log records gate_ok→STARTING (WAITING>STARTING)" || bad "P4-04 A2: gate_ok missing"
+[ "$(grep -c 'echo A-task' "$G_EXEC")" -eq 1 ] \
+    && ok "P4-04 A2: t_a executed exactly once per window (cycle dedup intact)" || bad "P4-04 A2: exec count=$(grep -c 'echo A-task' "$G_EXEC")"
+[ ! -f "$G_TASKS/t_a/gate.wait_start" ] \
+    && ok "P4-04 A2: wait clock cleared on release" || bad "P4-04 A2: gate.wait_start not cleared"
+
+# B) 触发窗口过后依赖仍不满足 → WAITING>PENDING（rearm），避免永久挂起
+gate_task dep_b 08:55 "" "echo B-dep"
+gate_task t_b 08:55 "dep_b" "echo B-task"
+SCHED_CYCLE_NOW=202609040855 GATE_NOW=2000 gtick 0855
+[ "$(cat "$G_TASKS/t_b/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-04 B: t_b entered WAITING (dep_b not yet terminal in-window)" || bad "P4-04 B: t_b state=$(cat "$G_TASKS/t_b/state.txt" 2>/dev/null)"
+SCHED_CYCLE_NOW=202609040856 GATE_NOW=3000 gtick 0856
+[ "$(cat "$G_TASKS/t_b/state.txt" 2>/dev/null)" = "PENDING" ] \
+    && ok "P4-04 B: WAITING rearm → PENDING (trigger window closed, dep still unmet)" || bad "P4-04 B: t_b state=$(cat "$G_TASKS/t_b/state.txt" 2>/dev/null)"
+grep -q '|rearm|PENDING|' "$G_TASKS/t_b/events.log" 2>/dev/null \
+    && ok "P4-04 B: events.log records rearm→PENDING" || bad "P4-04 B: rearm event missing"
+[ ! -f "$G_TASKS/t_b/gate.wait_start" ] \
+    && ok "P4-04 B: wait clock cleared on rearm (bounded)" || bad "P4-04 B: gate.wait_start left after rearm"
+grep -q 'echo B-task' "$G_EXEC" && bad "P4-04 B: rearmed task executed (forbidden)" || ok "P4-04 B: rearmed task NOT executed"
+
+# C) Optional（?）依赖未满足 → 不阻断门控，直接执行
+gate_task dep_c 23:59 "" "echo C-dep"
+gate_task t_c 08:57 "?dep_c" "echo C-task"
+SCHED_CYCLE_NOW=202609040857 GATE_NOW=4000 gtick 0857
+grep -q 'echo C-task' "$G_EXEC" && ok "P4-04 C: optional dep unmet does NOT block (executed)" || bad "P4-04 C: t_c not executed"
+[ "$(cat "$G_TASKS/t_c/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-04 C: optional-gated task completed STOPPED" || bad "P4-04 C: t_c state=$(cat "$G_TASKS/t_c/state.txt" 2>/dev/null)"
+[ ! -d "$G_TASKS/t_c/gate.wait_start" ] \
+    && ok "P4-04 C: optional unmet did NOT enter WAITING (no wait clock)" || bad "P4-04 C: t_c wrongly waited"
+
+# D) WAIT_MAX 超时 → WAITING>FAILED（gate_fail，有界）
+# 同周期 token（触发窗口保持匹配）二次 tick：首次进入 WAITING，二次推进 GATE_NOW
+# 使 elapsed > WAIT_MAX → 超时 FAILED（rearm 不抢占超时兜底）
+gate_task dep_d 23:59 "" "echo D-dep"
+gate_task t_d 08:58 "dep_d" "echo D-task"
+SCHED_CYCLE_NOW=202609040858 GATE_NOW=5000 gtick 0858
+[ "$(cat "$G_TASKS/t_d/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-04 D: t_d entered WAITING (required dep unmet)" || bad "P4-04 D: t_d state=$(cat "$G_TASKS/t_d/state.txt" 2>/dev/null)"
+WAIT_MAX=5 SCHED_CYCLE_NOW=202609040858 GATE_NOW=5010 gtick 0858
+[ "$(cat "$G_TASKS/t_d/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-04 D: WAITING > WAIT_MAX → FAILED (bounded, no permanent WAITING)" || bad "P4-04 D: t_d state=$(cat "$G_TASKS/t_d/state.txt" 2>/dev/null)"
+grep -q '|gate_fail|FAILED|' "$G_TASKS/t_d/events.log" 2>/dev/null \
+    && ok "P4-04 D: events.log records gate_fail→FAILED (wait timeout)" || bad "P4-04 D: gate_fail missing"
+grep -q 'wait timeout' "$G_TASKS/t_d/events.log" 2>/dev/null \
+    && ok "P4-04 D: timeout reason recorded" || bad "P4-04 D: timeout reason missing"
+grep -q 'echo D-task' "$G_EXEC" && bad "P4-04 D: timed-out task executed (forbidden)" || ok "P4-04 D: timed-out task NOT executed"
+
+# E) disable WAITING 任务不报错（既有 tcfg/disable 路径；TSM WAITING>DISABLED wired）
+gate_task dep_e 23:59 "" "echo E-dep"
+gate_task t_e 08:59 "dep_e" "echo E-task"
+SCHED_CYCLE_NOW=202609040859 GATE_NOW=6000 gtick 0859
+[ "$(cat "$G_TASKS/t_e/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-04 E: t_e entered WAITING (pre-disable)" || bad "P4-04 E: t_e state=$(cat "$G_TASKS/t_e/state.txt" 2>/dev/null)"
+E_DIS=$(tctl_set_enabled "$G_BASE" "$G_CFG" "$G_TASKS" t_e 0 2>/dev/null)
+[ "$?" -eq 0 ] && ok "P4-04 E: disable on WAITING task succeeds (no error)" || bad "P4-04 E: disable rc=$? out=$E_DIS"
+
+# F) daemon 重启后 WAITING 保留（不再 WAITING→FAILED）+ 下个 tick 复查依赖
+gate_task dep_f 23:59 "" "echo F-dep"
+gate_task t_f 09:00 "dep_f" "echo F-task"
+SCHED_CYCLE_NOW=202609040900 GATE_NOW=7000 gtick 0900
+[ "$(cat "$G_TASKS/t_f/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-04 F: t_f entered WAITING (pre-restart)" || bad "P4-04 F: t_f state=$(cat "$G_TASKS/t_f/state.txt" 2>/dev/null)"
+# 模拟重启：legacy status.txt=RUNNING（剪枝目标）+ 依赖在停机期间完成
+echo "RUNNING" > "$G_TASKS/t_f/status.txt"
+mkdir -p "$G_TASKS/dep_f"; echo "STOPPED" > "$G_TASKS/dep_f/state.txt"
+state_rehydrate_residual "$G_TASKS" >/dev/null 2>&1
+[ "$(cat "$G_TASKS/t_f/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-04 F: rehydrate PRESERVES WAITING (P4-04 semantic: non-exec state kept)" || bad "P4-04 F: WAITING lost after rehydrate=$(cat "$G_TASKS/t_f/state.txt" 2>/dev/null)"
+grep -q '|daemon_restart|FAILED|' "$G_TASKS/t_f/events.log" 2>/dev/null \
+    && bad "P4-04 F: WAITING wrongly forced to FAILED on restart" || ok "P4-04 F: no daemon_restart forced on WAITING"
+SCHED_CYCLE_NOW=202609040900 GATE_NOW=8000 gtick 0900
+grep -q 'echo F-task' "$G_EXEC" && ok "P4-04 F: after restart, WAITING rechecked → released+executed (dep satisfied)" || bad "P4-04 F: t_f not released after restart"
 
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────
 # legacy 解析/执行路径无 dependency/condition 新接线（C2/C4 零改动）

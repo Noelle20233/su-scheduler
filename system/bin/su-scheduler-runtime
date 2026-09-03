@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.21.0"
+RUNTIME_LIB_VERSION="1.22.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -660,7 +660,11 @@ provider_register recovery builtin tpr_recovery_builtin
 # ────────────────────────────────────────────────────────────────────────
 # 新状态源 <dir>/state.txt + 事件日志 <dir>/events.log（7 字段）；旧兼容文件
 # （status.txt/pid.txt/...）**只读不写**；日志失败不中止任务（仅返回非 0）。
-RT_EVENTS='create delete config_load time_trigger manual_exec spawn action_success action_failure timeout stop_request daemon_restart rearm enable disable supervisor probe recover'
+# P4-04：新增 WAITING 门控事件令牌（gate_wait=进入 WAITING / gate_ok=门控解除→
+# STARTING / gate_fail=门控超时/终态失败）。它们不属于 TSM_CAUSES（语义 cause 仍为
+# time_trigger / action_failure，见 task-state-machine.md）；state_log_event 对
+# WAITING 边不校验 cause（边本身在 TSM_ALLOWED），故写入校验通过、事件令牌可审计。
+RT_EVENTS='create delete config_load time_trigger manual_exec spawn action_success action_failure timeout stop_request daemon_restart rearm enable disable supervisor probe recover gate_wait gate_ok gate_fail'
 
 runtime_log() {
     [ "${RT_LOG:-1}" = "1" ] && echo "[runtime] $1" >&2
@@ -1678,6 +1682,8 @@ state_sync_all() {   # <tasks_dir> → 0=ok 1=存在未完成/错误目录 2=目
 
 # 重启残留再水合：daemon 启动剪枝后的运行态（RUNNING/STARTING/
 # ZOMBIE_CRASHED/STALE）→ state.txt=FAILED + daemon_restart 事件；旧工件不动。
+# P4-04：WAITING 为「门控等待」非执行态，重启后**原样保留**（下个 tick 复查依赖、
+# 重新计时 WAIT_MAX）——不再强制 FAILED（合法语义变更，docs/P4-04.md §3）。
 state_rehydrate_residual() {   # <tasks_dir>
     tasks=$1
     [ -d "$tasks" ] || { state_log "ERROR rehydrate: no tasks dir $tasks"; return 2; }
@@ -1690,7 +1696,8 @@ state_rehydrate_residual() {   # <tasks_dir>
             RUNNING|STARTING|ZOMBIE_CRASHED|STALE)
                 cur=$(runtime_current_state "$p")
                 case "$cur" in
-                    STARTING|RUNNING|PENDING|WAITING)
+                    WAITING) : ;;   # 门控等待：保留，重启后复查依赖（P4-04）
+                    STARTING|RUNNING|PENDING)
                         state_log_event "$p" "$id" daemon_restart FAILED "" "" "residual after daemon restart" >/dev/null 2>&1
                         ;;
                     FAILED)
@@ -2474,7 +2481,8 @@ runtime_limit_log() {
     return 0
 }
 
-# 运行目录是否活跃：pid.txt 进程存活 或 状态机处于运行态
+# 运行目录是否活跃：pid.txt 进程存活 或 状态机处于运行态（含门控等待 WAITING——
+# P4-04：依赖未满足的 WAITING 任务目录不得被上限修剪误删，P4-07 深化）
 runtime_dir_active() {
     rd=$1
     pid=$(cat "$rd/pid.txt" 2>/dev/null)
@@ -2484,6 +2492,9 @@ runtime_dir_active() {
     st=$(cat "$rd/status.txt" 2>/dev/null)
     case "$st" in
         STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|STOPPING) return 0 ;;
+    esac
+    case "$(cat "$rd/state.txt" 2>/dev/null)" in
+        WAITING) return 0 ;;
     esac
     return 1
 }
@@ -2910,7 +2921,8 @@ tcfg_remove_task() {   # <id>
 # legacy 实际执行」的双轨状态。调用方（daemon 主循环 RUNTIME_LOADED=1 分支）
 # 只经 `scheduler_tick` 获取任务：
 #   Registry Task ──trigger_decide(TriggerProvider)──▶ 到期？
-#       └─due=Y─▶ action_run(ActionProvider) ──▶ Runtime State ──▶ Supervisor
+#       ├─due=Y + 依赖门控通过（P4-04）─▶ action_run(ActionProvider) ─▶ State
+#       └─due=Y + 依赖门控未过（P4-04）─▶ PENDING>WAITING（下一 tick 复查）
 # 双模式：
 #   - managed（task-config/MANAGED 存在，P3-02）：registry 快照从 task-config/
 #     重建（**不再重新扫描 config.txt**）；
@@ -3015,7 +3027,8 @@ sched_reload() {   # <base> <config> → 0=未变/ok 1=kept 2=硬错误
 }
 # 周期去重（分钟级）：<base> <token>；seen=0 已执行
 sched_cycle_file() { echo "$1/scheduler/cycle-$2"; }
-sched_cycle_token() { date +%Y%m%d%H%M; }
+# P4-04：周期 token 可经 SCHED_CYCLE_NOW 覆盖（测试确定性；生产缺省 = 真实分钟）
+sched_cycle_token() { echo "${SCHED_CYCLE_NOW:-$(date +%Y%m%d%H%M)}"; }
 sched_cycle_mark() {   # <base> <id> <token>
     f=$(sched_cycle_file "$1" "$3")
     mkdir -p "$(dirname "$f")" 2>/dev/null
@@ -3083,8 +3096,175 @@ sched_prune_ron() {   # <base> <config> <id>
     sched_audit "$base" "op=prune-ron|task=$id|mode=$(sched_source_mode "$base")"
     return 0
 }
-# 单任务执行：trigger_decide（TriggerProvider）→ action_run（ActionProvider）→ 后置
-# 返回：0=已执行 1=未到期 2=错误（调用方循环隔离，不中止 tick）
+# ────────────────────────────────────────────────────────────────────────
+# §20 P4-04 依赖门控（WAITING 状态接线）：把 TSM reserved 边（PENDING>WAITING /
+# WAITING>STARTING / WAITING>PENDING / WAITING>FAILED）接入调度层。门控插入点 =
+# sched_execute_one 的 due=Y 分支内、trigger_decide 之后、action_run 之前；另在
+# scheduler_tick 首部对已 WAITING 任务逐周期复查（sched_advance_waiting）。
+# 语义（docs/P4-04.md / dependency-schema.md ADR D11–D14）：
+#   - 依赖满足判定：读运行目录实时态 `runtime_current_state <tasks>/<dep_id>`（
+#     缺省 PENDING）；Required 须达到该 entry 指定 `:STATE`（缺省 STOPPED）；
+#     `?` Optional 未满足不阻断（只记原因，P4-05 传播细节后接）；依赖处于
+#     WAITING 视为未满足（等待其先解除）。
+#   - 进入 WAITING：触发匹配 + 依赖未满足 → PENDING>WAITING（gate_wait 事件，
+#     msg=原因如 `dep unsat: t_b`）；终态（STOPPED/FAILED）先 rearm 回 PENDING
+#     再门控（TSM 无 STOPPED>WAITING 边）。
+#   - 解除：WAITING 任务依赖全部满足 + 触发仍匹配 → WAITING>STARTING（gate_ok）
+#     → action_run；依赖仍不满足 → 保持 WAITING（等待）；触发不再匹配 →
+#     WAITING>PENDING（rearm，避免永久挂起）；超过 WAIT_MAX 秒 → WAITING>FAILED
+#     （gate_fail，硬性有界；P4-05 细化传播）。
+#   - 每触发窗口至多执行一次：门控不改 cycle 去重——进入 WAITING 不 mark cycle，
+#     解除后同一窗口至多执行一次（执行时 mark）；未解除不误标为已执行。
+#   - 重启保留：state_rehydrate_residual 不再把 WAITING→FAILED（P4-04 合法语义
+#     变更）；重启后下个 tick 复查依赖，gate.wait_start 重新计时（有界）。
+# 常量：WAIT_MAX=86400 秒（依赖 P4-05 细化），可经环境覆盖（测试用短超时）。
+# 命名空间：函数 sched_gate_/sched_dep_/sched_advance_ 前缀，内部全局 gdv_ 前缀。
+# ═══════════════════════════════════════════════════════════════════════════
+WAIT_MAX=${WAIT_MAX:-86400}
+
+sched_gate_file()  { echo "$1/gate.wait_start"; }
+# P4-04：门控时钟可经 GATE_NOW 覆盖（测试确定性；生产缺省 = 真实 epoch 秒）
+sched_gate_epoch() { echo "${GATE_NOW:-$(date +%s)}"; }
+sched_gate_start() {   # <run_dir> → 记录等待起点（epoch 秒）
+    gdv_f=$(sched_gate_file "$1")
+    [ -f "$gdv_f" ] || echo "$(sched_gate_epoch)" > "$gdv_f" 2>/dev/null
+    return 0
+}
+sched_gate_clear() {   # <run_dir> → 清除等待起点
+    rm -f "$(sched_gate_file "$1")" 2>/dev/null
+    return 0
+}
+sched_gate_elapsed() {   # <run_dir> → echo 已等待秒数（无起点 → 0）
+    gdv_f=$(sched_gate_file "$1")
+    if [ -f "$gdv_f" ]; then
+        gdv_s=$(cat "$gdv_f" 2>/dev/null)
+        case "$gdv_s" in
+            ''|*[!0-9]*) echo 0 ;;
+            *) echo $(( $(sched_gate_epoch) - gdv_s )) ;;
+        esac
+    else
+        echo 0
+    fi
+}
+
+# 依赖满足判定：<tasks_dir> <id> → 0=满足 1=未满足；stdout=原因（仅供审计/msg）
+# 解析复用 §26 dep_normalize（D1 容错）+ 单条 entry 切分（D2 `[?]id[:STATE]`）。
+sched_dep_satisfied() {
+    gdv_tasks=$1; gdv_id=$2
+    gdv_tf=$(registry_task_file "$gdv_id" 2>/dev/null) || { echo "no task file"; return 1; }
+    gdv_dep=$(sched_task_field "$gdv_tf" dependency)
+    [ -n "$gdv_dep" ] || { echo "deps ok (none)"; return 0; }
+    gdv_norm=$(dep_normalize "$gdv_dep")
+    [ -n "$gdv_norm" ] || { echo "deps ok (none)"; return 0; }
+    gdv_unsat=""
+    gdv_e=""
+    gdv_tokens=$(printf '%s' "$gdv_norm" | sed 's/,/ /g')
+    for gdv_e in $gdv_tokens; do
+        gdv_opt=0
+        case "$gdv_e" in
+            "?"*) gdv_opt=1; gdv_e=${gdv_e#\?} ;;
+        esac
+        gdv_depid=$gdv_e; gdv_want=STOPPED
+        case "$gdv_e" in
+            *:*)
+                gdv_depid=${gdv_e%%:*}
+                gdv_want=${gdv_e#*:}
+                ;;
+        esac
+        gdv_cur=$(runtime_current_state "$gdv_tasks/$gdv_depid" 2>/dev/null)
+        if [ "$gdv_cur" = "$gdv_want" ]; then
+            continue
+        fi
+        if [ "$gdv_opt" -eq 1 ]; then
+            gdv_unsat="$gdv_unsat opt-unsat:$gdv_depid"
+            continue
+        fi
+        echo "dep unsat: $gdv_depid (want $gdv_want, got $gdv_cur)"
+        return 1
+    done
+    [ -z "$gdv_unsat" ] && echo "deps ok" || echo "deps ok (opt ignored: $gdv_unsat)"
+    return 0
+}
+
+# 门控判定（P4-04 决策层；P4-06 在此叠加 condition 求值）：<tasks_dir> <id>
+# → 0=通过 1=未通过（stdout=原因）。当前仅依赖维度。
+sched_gate_check() {
+    sched_dep_satisfied "$1" "$2"
+}
+
+# 已 WAITING 任务复查（每个 tick 一次）：<base> <config> <tasks_dir> <id> <now> <boot>
+# → 0=解除并执行（cycle 由调用方 mark） 1=非 WAITING（跳过） 2=保持 WAITING
+#   3=rearm 回 PENDING（触发窗口已过） 4=超时→FAILED（gate_fail）
+sched_advance_waiting() {
+    base=$1; config=$2; tasks=$3; id=$4
+    now=${5:-$(date +%H%M)}; boot=${6:-0}
+    run_dir="$tasks/$id"
+    [ -d "$run_dir" ] || return 1
+    [ "$(runtime_current_state "$run_dir" 2>/dev/null)" = "WAITING" ] || return 1
+    tf=$(registry_task_file "$id" 2>/dev/null) || return 2
+    trig=$(sched_task_field "$tf" trigger)
+    gres=$(sched_gate_check "$tasks" "$id")
+    grc=$?
+    out=$(trigger_decide "$base" "$id" "$now" "$boot" "$base/schedule_state.txt")
+    case "$out" in
+        *due=Y*) due=1 ;;
+        *) due=0 ;;
+    esac
+    if [ "$grc" -eq 0 ]; then
+        # 依赖已满足：触发仍匹配 → WAITING>STARTING → action_run；不再匹配 → rearm
+        if [ "$due" -eq 1 ]; then
+            state_log_event "$run_dir" "$id" gate_ok STARTING "" "" "deps satisfied" >/dev/null 2>&1
+            sched_gate_clear "$run_dir"
+            cmd=$(sched_task_field "$tf" action.command)
+            tmx=$(sched_task_field "$tf" action.termux);  [ -z "$tmx" ] && tmx=0
+            itr=$(sched_task_field "$tf" action.interactive); [ -z "$itr" ] && itr=0
+            ns=$(sched_task_field "$tf" action.notify_start); [ -z "$ns" ] && ns=0
+            ne=$(sched_task_field "$tf" action.notify_end);   [ -z "$ne" ] && ne=0
+            msg=$(sched_task_field "$tf" action.msg)
+            action_run "$id" "$cmd" "$tmx" "$itr" "$ns" "$ne" "$msg" >/dev/null 2>&1
+            arc=$?
+            [ -d "$run_dir" ] && cp "$tf" "$run_dir/task.v2" 2>/dev/null
+            ron=$(sched_task_field "$tf" action.run_once_now)
+            del=$(sched_task_field "$tf" action.delete)
+            if [ "$del" = "1" ]; then
+                sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
+            elif [ "$ron" = "1" ]; then
+                sched_prune_ron "$base" "$config" "$id" >/dev/null 2>&1
+            fi
+            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=start|rc=$arc|mode=$(sched_source_mode "$base")"
+            return 0
+        fi
+        state_log_event "$run_dir" "$id" rearm PENDING "" "" "deps ok but window closed" >/dev/null 2>&1
+        sched_gate_clear "$run_dir"
+        sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=rearm|reason=window-closed|mode=$(sched_source_mode "$base")"
+        return 3
+    fi
+    # 依赖仍不满足：触发仍匹配且等待超 WAIT_MAX → WAITING>FAILED（reserved 边，
+    # cause 语义 action_failure；事件令牌 gate_fail；P4-05 细化传播）
+    if [ "$due" -eq 1 ] && [ "$WAIT_MAX" -gt 0 ] 2>/dev/null; then
+        gdv_el=$(sched_gate_elapsed "$run_dir")
+        if [ "$gdv_el" -gt "$WAIT_MAX" ] 2>/dev/null; then
+            sched_gate_clear "$run_dir"
+            state_log_event "$run_dir" "$id" gate_fail FAILED "" "" "wait timeout > WAIT_MAX=${WAIT_MAX}s" >/dev/null 2>&1
+            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=fail-timeout|mode=$(sched_source_mode "$base")"
+            return 4
+        fi
+    fi
+    if [ "$due" -eq 1 ]; then
+        # 触发仍匹配且未超时 → 保持 WAITING（下一 tick 复查）
+        sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=keep-waiting|reason=$gres|mode=$(sched_source_mode "$base")"
+        return 2
+    fi
+    # 触发不再匹配 → WAITING>PENDING（rearm，避免永久挂起）
+    state_log_event "$run_dir" "$id" rearm PENDING "" "" "dep window closed: $gres" >/dev/null 2>&1
+    sched_gate_clear "$run_dir"
+    sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=rearm|reason=$gres|mode=$(sched_source_mode "$base")"
+    return 3
+}
+# 单任务执行：trigger_decide（TriggerProvider）→ 依赖门控（P4-04）→ action_run
+# （ActionProvider）→ 后置
+# 返回：0=已执行 1=未到期 2=错误 3=触发匹配但被依赖门控（进入/保持 WAITING，不执行）
+#   （调用方循环隔离，不中止 tick；3 时不 mark cycle——解除后同窗口仍可执行一次）
 sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     base=$1; config=$2; tasks=$3; id=$4
     now=${5:-$(date +%H%M)}; boot=${6:-0}
@@ -3095,6 +3275,26 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
         *due=Y*) ;;
         *) return 1 ;;
     esac
+    # P4-04 门控插入点：触发匹配 + 依赖未满足 → PENDING>WAITING（gate_wait）。
+    # 终态（STOPPED/FAILED）先 rearm 回 PENDING 再门控；DISABLED 不门控（沿用
+    # 既有行为）。
+    run_dir="$tasks/$id"
+    gdv_cur=""
+    [ -f "$run_dir/state.txt" ] && gdv_cur=$(cat "$run_dir/state.txt" 2>/dev/null)
+    case "$gdv_cur" in
+        STOPPED|FAILED)
+            state_log_event "$run_dir" "$id" rearm PENDING "" "" "rearm before gate" >/dev/null 2>&1 ;;
+        DISABLED) ;;
+    esac
+    gres=$(sched_gate_check "$tasks" "$id")
+    grc=$?
+    if [ "$grc" -ne 0 ]; then
+        mkdir -p "$run_dir" 2>/dev/null
+        sched_gate_start "$run_dir"
+        state_log_event "$run_dir" "$id" gate_wait WAITING "" "" "$gres" >/dev/null 2>&1
+        sched_audit "$base" "op=gate|task=$id|trigger=$trig|blocked=1|reason=$gres|mode=$(sched_source_mode "$base")"
+        return 3
+    fi
     cmd=$(sched_task_field "$tf" action.command)
     tmx=$(sched_task_field "$tf" action.termux);  [ -z "$tmx" ] && tmx=0
     itr=$(sched_task_field "$tf" action.interactive); [ -z "$itr" ] && itr=0
@@ -3117,13 +3317,30 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del"
     return "$arc"
 }
-# Registry 正式调度 tick（daemon 主循环 RUNTIME_LOADED=1 调用）：源重载 + 逐任务决策执行
+# Registry 正式调度 tick（daemon 主循环 RUNTIME_LOADED=1 调用）：源重载 + 已
+# WAITING 任务复查（P4-04）+ 逐任务决策执行
 scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
     base=$1; config=$2; tasks=$3
     now=${4:-$(date +%H%M)}
     mkdir -p "$base/scheduler" 2>/dev/null
     sched_reload "$base" "$config" >/dev/null 2>&1
     token=$(sched_cycle_token)
+    # P4-04：先复查已 WAITING 任务（每个 tick 至多一次；解除→执行并 mark，保持/
+    # rearm 不 mark——与「每窗口至多一次」兼容）
+    w_ok=0; w_err=0
+    for id in $(registry_task_ids); do
+        if [ -d "$tasks/$id" ] && [ "$(cat "$tasks/$id/state.txt" 2>/dev/null)" = "WAITING" ]; then
+            sched_advance_waiting "$base" "$config" "$tasks" "$id" "$now" 0
+            arc=$?
+            case "$arc" in
+                0|4)
+                    sched_cycle_mark "$base" "$id" "$token"
+                    [ "$arc" -eq 0 ] && w_ok=$((w_ok + 1)) || w_err=$((w_err + 1)) ;;
+                1|2|3) : ;;
+                *) : ;;
+            esac
+        fi
+    done
     due=0; execn=0; errn=0
     for id in $(registry_task_ids); do
         if sched_cycle_seen "$base" "$id" "$token"; then
@@ -3131,13 +3348,13 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
         fi
         sched_execute_one "$base" "$config" "$tasks" "$id" "$now" 0
         rc=$?
-        if [ "$rc" -eq 1 ]; then
-            continue   # 未到期：不标记（配置变更后可到期执行一次）
+        if [ "$rc" -eq 1 ] || [ "$rc" -eq 3 ]; then
+            continue   # 未到期不标记；被门控（3）不标记——解除后同窗口仍可执行一次
         fi
         sched_cycle_mark "$base" "$id" "$token"
         [ "$rc" -eq 0 ] && execn=$((execn + 1)) || errn=$((errn + 1))
     done
-    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn"
+    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn|wadv=$w_ok|wfail=$w_err"
     return 0
 }
 # 启动 boot：registry 中 trigger=boot 的任务（RUNTIME_LOADED=1 启动段调用）
@@ -4841,7 +5058,8 @@ runtime_lib_selfcheck() {
               tcfg_new_id tcfg_atomic_write sched_reload sched_snapshot_managed \
               scheduler_tick scheduler_boot sched_execute_one sched_cycle_mark \
               sched_cycle_seen sched_source_mode sched_remove_task sched_prune_ron \
-              sched_task_field sched_audit ipc_server_init ipc_server_poll \
+              sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
+              sched_gate_epoch sched_advance_waiting ipc_server_init ipc_server_poll \
               ipc_parse ipc_params_valid ipc_param ipc_respond ipc_dispatch \
               ipc_allowed_keys ipc_op_get_tasks ipc_op_get_status ipc_op_get_log ipc_op_validate \
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \

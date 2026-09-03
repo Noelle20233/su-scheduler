@@ -82,7 +82,14 @@
   `create`/`delete`）：
   `create config_load time_trigger manual_exec spawn action_success
   action_failure timeout stop_request daemon_restart rearm enable disable
-  supervisor probe recover`
+  supervisor probe recover gate_wait gate_ok gate_fail`
+- `gate_*`（P4-04 依赖门控专用令牌，**只入 RT_EVENTS、不入 TSM_CAUSES**；
+  TSM cause 语义仍为 time_trigger / action_failure / rearm 等规范令牌）：
+  - `gate_wait`：触发匹配但依赖未满足 → 进入 WAITING（`state`=WAITING，msg=原因
+    如 `dep unsat: t_b`）；
+  - `gate_ok`：WAITING 依赖全部满足 → 解除并启动（`state`=STARTING）；
+  - `gate_fail`：WAITING 超过 `WAIT_MAX` 超时 → 失败（`state`=FAILED，msg=
+    `wait timeout > WAIT_MAX=…`）。
 - **校验**：`state` 须通过 `task_state_is_valid`；`event` 须在 `RT_EVENTS`；
   任一非法 → 整体拒绝（rc 1），事件与状态**都不写**（不污染状态源，P1-03
   「非法转换必须被拒绝并记录日志」的持久化对应）。
