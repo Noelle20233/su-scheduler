@@ -1,8 +1,8 @@
 # Su Scheduler — P3 设备矩阵与综合回归（P3-DEVICE-MATRIX）
 
-> **任务**：P3-09 · 设备矩阵与综合回归目标
-> **前置**：P3-01 至 P3-08（本文件由 P3-09 执行产出）
-> **日期**：2026-09-03
+> **任务**：P3-09 · 设备矩阵与综合回归目标；**P4-01 真机复验**（D-IPC 修复项 7/8/14）
+> **前置**：P3-01 至 P3-08（本文件由 P3-09 执行产出）；P4-01 更新
+> **日期**：2026-09-03（P3-09）；2026-09-04（P4-01 复验）
 > **出口标准**：真机安装/卸载、daemon 开机、Runtime 加载、Legacy 执行、Task v2 导入、
 > Registry 调度、WebUI Dashboard、Task Editor、App Action、Process/Port Health、
 > Restart/Retry/Cooldown、Crash Loop、Task 控制、配置损坏回退、旧 CLI 查询、日志轮转、
@@ -15,7 +15,7 @@
 
 | 交付物 | 类型 | 状态 |
 | :--- | :--- | :--- |
-| tests/p3-device/smoke.sh | 真机 L3 综合冒烟（18 项，adb root，自包含缺陷判定 + pre-flight 复位） | ✅ 25 PASS / 0 FAIL / 3 BLOCKED |
+| tests/p3-device/smoke.sh | 真机 L3 综合冒烟（18 项，adb root，自包含缺陷判定 + pre-flight 复位） | ✅ **28 PASS / 0 FAIL / 0 BLOCKED**（P4-01 复验后 D-IPC 项 7/8/14 由 BLOCKED 转 PASS） |
 | tests/p3-integration/test.sh | 宿主侧 P3 综合回归（18 项端到端协同，L2） | ✅ 48 PASS / 0 FAIL |
 | tests/run_tests.sh | 注册 p3-integration（L2）+ p3-device（--with-device） | ✅ |
 | docs/P3-DEVICE-MATRIX.md（本文档） | 设备矩阵 + 每台设备 trace + 性能统计 + 发布限制 | ✅ |
@@ -67,23 +67,25 @@
 | 4 | Legacy 配置继续执行 | ✅ PASS | legacy `add 08:30` 写入 config；旧路径 intact |
 | 5 | Task v2 导入 | ✅ PASS | `task-config import` → managed + .task + mode=managed |
 | 6 | Registry 正式调度 | ✅ PASS | scheduler/audit.log `op=boot mode=managed exec` + boot 任务磁盘产物 |
-| 7 | WebUI Dashboard | ⛔ BLOCKED | `webui GET_SUMMARY` → IPC invalid_request（§3 mksh 缺陷；主机全绿） |
-| 8 | Task Editor 保存和回滚 | ⛔ BLOCKED | `ipc EDIT_TASK` → malformed（§3 mksh 缺陷；主机全绿） |
+| 7 | WebUI Dashboard | ✅ **PASS（P4-01 复验）** | `webui GET_SUMMARY` → `{"ok":true,"daemon":"online","mode":"managed",...}`（P3-10 D-IPC 修复后经 `cut` 切分，IPC 真实可达；不再 BLOCKED） |
+| 8 | Task Editor 保存和回滚 | ✅ **PASS（P4-01 复验）** | `ipc EDIT_TASK id=edit1 payload=…` → rc=0 + `task-config/edit1.task` 落盘（P3-10 修复后 IPC 真实成功；不再 BLOCKED） |
 | 9 | App Action | ✅ PASS | app: 配置下 daemon 稳定存活（真实 am 启动属用户作用域） |
 | 10 | Process Health | ✅ PASS | boot 触发受监督任务 → RUNNING 且 supervisor 探针就绪 |
 | 11 | Port Health | ✅（探针链路） | supervisor 对受监督任务做真实健康探针（完整 UNHEALTHY→恢复主机已测） |
 | 12 | Restart/Retry/Cooldown | ✅ PASS | 含 retry/cooldown 配置下 daemon 稳定（策略钳制主机已测） |
 | 13 | daemon Crash Loop | ✅ PASS | 设备 shell 上真实 crash_guard_enter 计数/降级/优雅重置 |
-| 14 | Task start/stop/restart | ⛔ BLOCKED | `task start` → IPC invalid_request（§3 mksh 缺陷；主机全绿） |
+| 14 | Task start/stop/restart | ✅ **PASS（P4-01 复验）** | `task start edit1` → rc=0 + `tasks/edit1/state.txt=RUNNING`（P3-10 修复后 IPC 真实成功；不再 BLOCKED） |
 | 15 | 配置损坏回退 | ✅ PASS | 控制字符 config → import rc=1 拒 + 原配置逐字节不变 + rollback |
 | 16 | 旧 CLI 查询旧运行任务 | ✅ PASS | task-info/task-output 读旧运行工件 |
 | 17 | 日志轮转 | ✅ PASS | daemon log 存在 + 单任务 log ≤ 1MB（字节上限） |
 | 18 | 重启后状态恢复 | ✅ PASS | 残留 RUNNING(死进程)→FAILED + daemon_restart 事件 + daemon 自愈 |
 
-> **第 7/8/14 项说明**：这三项依赖 IPC 协议解析（`REQ_ID|OP|PARAMS` 以 `|` 分隔）。
-> 本设备 shell 存在 §3 缺陷导致 IPC 全部失效，因此标记 **BLOCKED（发布限制）**，而
-> 非 FAIL——同一链路的主机侧实现（`tests/ipc/*`、`tests/webui/*`、`tests/task-control`、
-> `tests/p3-integration`）全部全绿，证明是设备环境缺陷而非产品逻辑缺陷。修复方案见 §3。
+> **第 7/8/14 项说明（P3-09 → P3-10 → P4-01 演变）**：这三项依赖 IPC 协议解析
+> （`REQ_ID|OP|PARAMS` 以 `|` 分隔）。P3-09 首次真机覆盖时，本设备 shell（mksh R59）
+> 存在 §3 所述 `|`-in-pattern 参数展开缺陷，导致 IPC 全部失效 → 当时标记
+> **BLOCKED（发布限制）**，而非 FAIL——同一链路的主机侧实现全部全绿，证明是设备
+> 环境缺陷而非产品逻辑缺陷。**P3-10 已修复**（§3.3，`|` 字段切分改为可移植 `cut`），
+> **P4-01 已真机复验**：三项全部转 **PASS**（见 §3.5 复验记录），设备矩阵闭合。
 
 ---
 
@@ -140,6 +142,31 @@
 
 `tests/p3-device/smoke.sh` 开头以 `sh -c 'line="a|b|c"; printf "%s" "${line#*|}"'` 探测：
 返回 `b|c` → IPC 可用；返回原串 `a|b|c` → 检测到缺陷，7/8/14 判 BLOCKED 而非 FAIL。
+（P4-01 起该探测仅作**环境记录**，不再用于把 IPC 项判 BLOCKED——产品已用 `cut`，
+IPC 成败由真实响应判定，见 §3.5。）
+
+### 3.5 P4-01 真机复验记录（D-IPC 三项 IPC 用例）
+
+**执行**：2026-09-04，KernelSU × Android 16 真机（`8934ffc4`），模块 v1.6.8
+（Runtime 1.19.0，P3-10 `cut` 修复已包含），`ksud module install` + 重启激活。
+
+**冒烟结果**：`tests/p3-device/smoke.sh` → **28 PASS / 0 FAIL / 0 BLOCKED**（trace：
+`tests/results/device-8934ffc4-20260904-001848.log`）。`mksh ${var#*|}` 探测仍返回原串
+（设备 shell 特性未变），但产品 IPC 三项全部真实 PASS：
+
+| 用例 | 命令 | 期望 | 实测 |
+| :-- | :-- | :-- | :-- |
+| 7 WebUI Dashboard | `su-scheduler webui GET_SUMMARY` | `{"ok":true,"mode":...}` | ✅ `{"ok":true,"daemon":"online","mode":"managed","counts":{...}}` |
+| 8 Task Editor 保存 | `su-scheduler ipc EDIT_TASK id=edit1 payload=<b64>` | rc=0 + edit1.task 落盘 | ✅ rc=0 + `task-config/edit1.task` 存在 |
+| 14 Task start | `su-scheduler task start edit1` | rc=0 + state RUNNING | ✅ rc=0 + `tasks/edit1/state.txt=RUNNING` |
+
+**说明**：`tests/p3-device/smoke.sh` 同步更新——7/8/14 改按真实 IPC 成功判定（rc=0 +
+预期载荷/文件落点），并增加 `ipc_ready()` 有界就绪等待：daemon `restart` 后需数秒
+进入 nap 段逐秒 IPC 轮询，立即请求会命中客户端 5s 超时（operation_timeout），这属
+**测试时序**而非 D-IPC 复发。IPC 就绪后 GET_SUMMARY/EDIT_TASK/START_TASK 全部正常。
+
+**缺陷状态**：D-IPC（mksh `|`-in-pattern）在 P3-10 已修复，P4-01 真机复验确认
+**7/8/14 三项不再 BLOCKED**——设备矩阵中这三格由 ⛔ BLOCKED 变为 ✅ PASS。
 
 ---
 
@@ -147,15 +174,15 @@
 
 | 限制 | 说明 | 处置 |
 | :-- | :-- | :-- |
-| ~~D-IPC 缺陷（阻断）~~ | Android 16 mksh 的 `|`-in-pattern 参数展开失败 → IPC 全断 | **P3-10 已修复**（§3.3，cut 切分 + 4 条回归断言）；真机重验待设备可用 |
+| ~~D-IPC 缺陷（阻断）~~ | Android 16 mksh 的 `|`-in-pattern 参数展开失败 → IPC 全断 | **P3-10 已修复**（§3.3，cut 切分 + 4 条回归断言）；**P4-01 真机复验通过**（§3.5，28 PASS / 0 FAIL / 0 BLOCKED，7/8/14 转 PASS） |
 | Magisk × Android 12–16 | 无真机/模拟器 | 发布前待办，未验证组合须在发布说明明示 |
 | APatch × Android 12–16 | 无真机/模拟器 | 同上 |
 | KernelSU × Android 12–15 | 无真机/模拟器 | 同上（Android 16 已覆盖） |
 | Windows Git-Bash 宿主 | 缺 `zip`/`pgrep`，MSYS dash 解析失败、路径/chmod 语义差异 → `run_tests.sh` 无法全绿 | 以 Linux CI（ubuntu-latest）或 WSL 为宿主门禁（§5） |
 
 **本任务结论**：1/15 设备格子（KernelSU × Android 16）真机覆盖；其余 14 格为 ⏳
-发布限制。设备矩阵不得以主机 mock 结果替代真机结果——本任务真机 15/18 项 PASS、
-3 项 BLOCKED 均由真实设备证据支撑。
+发布限制。设备矩阵不得以主机 mock 结果替代真机结果——P4-01 复验后本设备
+**18/18 项 PASS**（含 D-IPC 三项转 PASS），均由真实设备证据支撑。
 
 ---
 
@@ -176,7 +203,7 @@ bash tests/run_tests.sh --with-device
 # 期望：p1-device 全 PASS；p3-device 24 PASS / 0 FAIL / 3 BLOCKED（D-IPC）
 ```
 
-### 5.1 WSL 全量结果（2026-09-03）
+### 5.1 WSL 全量结果
 
 `tests/results/run_tests-<ts>.log`（tests/results 已被 .gitignore 忽略，经 CI artifact 保留）。
 
@@ -187,25 +214,33 @@ bash tests/run_tests.sh --with-device
 | L4 p1-build + p2-install | 全绿 / 0 FAIL |
 | 合计 | **ALL SUITES GREEN**（含新增 p3-integration 48 断言） |
 
+**P4-01 复验宿主门禁（2026-09-04）**：`tests/results/run_tests-20260904-003557.log` →
+**ALL SUITES GREEN / EXIT=0**（44 suites，1633 PASS / 0 FAIL；p1-build 26 断言含新增
+Runtime 版本检查 A/B，R4 关闭）。真机冒烟 `tests/results/device-8934ffc4-20260904-001848.log`
+→ **28 PASS / 0 FAIL / 0 BLOCKED**（§3.5）。
+
 ---
 
 ## 6. 每台设备 trace 与性能统计
 
 ### 6.1 本设备（KernelSU × Android 16）
 
-- trace 文件：`tests/results/device-8934ffc4-<ts>.log`（多次运行均 **25 PASS / 0 FAIL /
-  3 BLOCKED**，复现稳定）。最新全量门禁运行（`run_tests.sh --with-device`）trace：
+- trace 文件：`tests/results/device-8934ffc4-<ts>.log`。P3-09/10 多次运行
+  **25 PASS / 0 FAIL / 3 BLOCKED**（D-IPC，复现稳定）；**P4-01 复验（2026-09-04）：
+  `tests/results/device-8934ffc4-20260904-001848.log` → 28 PASS / 0 FAIL / 0 BLOCKED**
+  （D-IPC 三项转 PASS）。最新全量门禁运行（`run_tests.sh --with-device`）trace：
   `tests/results/device-8934ffc4-20260903-183656.log` + `run_tests-20260903-182719.log`
   （**ALL SUITES GREEN / EXIT=0**；p1-device 11 PASS / 0 FAIL / 2 SKIP）。
-- 性能统计（独立运行、设备冷启动复位后）：
-  - 安装/daemon/Runtime/Legacy 探测 + Task v2 导入 + Registry 调度（含 daemon 重启 +
-    boot 执行）：~30s
-  - WebUI/Editor/Control 探测（BLOCKED，IPC 缺陷）：~5s
-  - Health 受监督任务拉起（boot + supervisor 探针）：~15s
-  - Crash Loop 设备 shell 验证（自包含 scratch base）：~10s
-  - 配置损坏回退 / 旧 CLI / 日志轮转 / 重启状态恢复：~20s
-  - 预置复位 + 还原基线（pre-flight / restore）：~10s
-  - **合计：~60–90s**（全量门禁内因 daemon 经历多次重启/负载，观测到 3–6 min）
+- 性能统计（P4-01 复验，独立运行、设备冷启动复位后）：
+  - 预置复位 + 安装/daemon/Runtime/Legacy 探测：~5s
+  - Task v2 导入 + Registry 调度（含 daemon 重启 + boot 执行）：~7s
+  - WebUI/Editor/Control IPC 复验（GET_SUMMARY/EDIT_TASK/START_TASK，含 IPC 就绪等待）：~31s
+  - Health 受监督任务拉起（boot + supervisor 探针）：~5s
+  - Crash Loop 设备 shell 验证（自包含 scratch base）：~2s
+  - 配置损坏回退 / 旧 CLI / 日志轮转 / 重启状态恢复：~22s
+  - 还原基线（restore）：~5s
+  - **合计：~70s**（P4-01 复验实测 70s；全量门禁内因 daemon 经历多次重启/负载，
+    观测到 3–6 min）
 - **每次运行记录**：`tests/p3-device/smoke.sh` 以 `echo_t` 逐行写 stdout（供
   `run_suite` 捕获判定）并追加落盘 `tests/results/device-<serial>-<ts>.log`（含逐项
   perf 时间戳）；新增设备只需把结果复制到该路径并回填本节与 §1.1 矩阵。

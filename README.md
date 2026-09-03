@@ -1524,7 +1524,8 @@ P3-01）**——成功回归 trace 亦作为发布门禁证据存档。
 - **交接资料**：`docs/P3-HANDOVER.md`（新成员阅读路径、P3 流程全景、已实现清单、
   P4 接口预留点、安全边界）。
 - **升级与回滚**：`docs/P3-UPGRADE-ROLLBACK.md`（发布候选安装、卸载/回滚、故障排查）。
-- **设备矩阵**：`docs/P3-DEVICE-MATRIX.md`（KernelSU×Android 16 真机 25 PASS /
-  0 FAIL / 3 BLOCKED→D-IPC 已修；其余 14 格为发布限制）。
+- **设备矩阵**：`docs/P3-DEVICE-MATRIX.md`（KernelSU×Android 16 真机 P3-09/10
+  **25 PASS / 0 FAIL / 3 BLOCKED**→D-IPC 修复；**P4-01 复验 28 PASS / 0 FAIL /
+  0 BLOCKED**，7/8/14 转 PASS；其余 14 格为发布限制）。
 - **P4 Dependency 需求输入**：`docs/P4-DEPENDENCY-REQUIREMENTS.md`（WAITING 接线点、
   功能/非功能需求、安全边界、禁止事项）。

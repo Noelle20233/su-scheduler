@@ -3,9 +3,13 @@
 # smoke.sh — P3 设备矩阵综合冒烟（P3-09：真机 18 项，adb root）
 # ═══════════════════════════════════════════════════════════════════════════
 # 预置：一台已授权 adb root 的真机/Google APIs 模拟器；模块已安装并激活。
-# 判定：每项 [PASS]/[FAIL]/[SKIP]；IPC 相关项若检测到设备 shell 缺陷
-#   （mksh ${var#*|}/${var%%|*} 含 `|` 模式匹配失败）→ [BLOCKED]（登记缺陷，
-#   非失败——主机侧 tests/p3-integration 与 tests/ipc 已覆盖该链路）。
+# 判定：每项 [PASS]/[FAIL]/[SKIP]。
+# P3-10（D-IPC 修复）起，产品 Runtime 的 `|` 分隔字段切分已改为可移植 `cut`
+# （不再依赖 mksh 的 `${var#*|}`/`${var%%|*}` 模式展开，见 docs/P3-DEVICE-MATRIX
+# §3）。因此 P4-01 起 IPC 相关项（7/8/14）改按**真实 IPC 响应**判定 [PASS]/[FAIL]：
+#   成功（rc=0 + 预期载荷/文件落点）= PASS；失败 = FAIL（若为 D-IPC 环境缺陷复发
+#   则登记回 T2 流程，不允许冒充 PASS）。本设备 mksh 的 `|`-in-pattern 展开仍失败，
+#   但那已不影响产品路径——探测仅作环境记录，不再用于把 IPC 判 BLOCKED。
 # 覆盖（P3-09「必须覆盖」18 项）：
 #   1) 模块安装和卸载           —— ksud module list 显示 + 文件落点 + 卸载恢复
 #   2) daemon 开机启动          —— service.sh FBE 等待后拉起 + status Alive
@@ -13,14 +17,14 @@
 #   4) Legacy 配置继续执行      —— legacy add/list + daemon 执行（旧路径）
 #   5) Task v2 导入             —— task-config import → managed + .task
 #   6) Registry 正式调度        —— scheduler audit mode=managed reload/tick + boot 任务
-#   7) WebUI Dashboard          —— su-scheduler webui GET_SUMMARY（IPC；缺陷则 BLOCKED）
-#   8) Task Editor 保存和回滚   —— EDIT_TASK/GET_TASK_EDIT（IPC；缺陷则 BLOCKED）
+#   7) WebUI Dashboard          —— su-scheduler webui GET_SUMMARY（P4-01：真实 IPC 成功判定）
+#   8) Task Editor 保存和回滚   —— EDIT_TASK/GET_TASK_EDIT（P4-01：真实 IPC 成功判定）
 #   9) App Action               —— 配置含 app: 任务经 daemon 执行/校验（无真实 app 则 SKIP）
 #  10) Process Health           —— 受监督任务真实探针（daemon 侧 state/events）
 #  11) Port Health              —— nc 监听起停 → HEALTHY/UNHEALTHY（daemon 侧）
 #  12) Restart/Retry/Cooldown   —— 策略钳制 + 恢复动作（daemon 侧）
 #  13) daemon Crash Loop        —— crash guard 计数/降级/优雅重置（真实 daemon kill）
-#  14) Task start/stop/restart  —— tctl_* 经 CLI/IPC（缺陷则 BLOCKED；主机已测）
+#  14) Task start/stop/restart  —— tctl_* 经 CLI/IPC（P4-01：真实 IPC 成功判定）
 #  15) 配置损坏回退             —— 损坏 config → 拒 + 原配置逐字节不变 + rollback
 #  16) 旧 CLI 查询旧运行任务     —— task-info/task-output/task-kill 只读旧工件
 #  17) 日志轮转                 —— 单任务日志字节上限 + daemon log 有界
@@ -79,6 +83,20 @@ mkdir -p tests/results
 T0=$(date +%s)
 tick() { T1=$(date +%s); echo_t "[perf] step: $((T1 - T0))s elapsed"; }
 
+# IPC 就绪等待（P4-01）：daemon 刚 restart 后需数秒才进入 nap 段的逐秒 IPC 轮询；
+# 立即请求会在客户端 5s 超时前得不到响应（operation_timeout）。有界轮询 GET_SUMMARY
+# 直到返回 {"ok":true}（同既有 Alive/boot-marker 轮询语义），避免把"daemon 未就绪"
+# 误判为 IPC 失败。返回 0=就绪 / 1=超时。
+ipc_ready() {
+    local w=0 r=""
+    while [ "$w" -lt 40 ]; do
+        r=$(adb shell "su -c 'timeout 5 su-scheduler webui GET_SUMMARY 2>&1'" 2>/dev/null | tr -d '\r' | tail -1)
+        echo "$r" | grep -q '"ok":true' && return 0
+        sleep 2; w=$((w + 2))
+    done
+    return 1
+}
+
 DATA="/data/adb/su-scheduler"
 CONFIG="/sdcard/Documents/su-scheduler/config.txt"
 TCFG="$DATA/task-config"
@@ -105,17 +123,14 @@ while [ "$W" -lt 40 ]; do
     sleep 2; W=$((W + 2))
 done
 
-# ── 0b) 设备 shell 缺陷探测（mksh ${var#*|}/${var%%|*} 含 `|` 模式失败）──────
-# 这是 P3-09 在 KernelSU/Android16 真机发现的环境缺陷（docs/P3-DEVICE-MATRIX.md
-# 登记 D-IPC）：`|` 作为 IPC 字段分隔符的参数展开在此设备 shell 上匹配失败，
-# 导致 IPC 协议解析（REQ_ID|OP|PARAMS）失效。探测值用于把 IPC 项标记 BLOCKED
-# 而非 FAIL（主机侧链路已被 tests/ipc + tests/p3-integration 全绿覆盖）。
-PIPE_OK=1
+# ── 0b) 设备 shell 特性记录（mksh ${var#*|}/${var%%|*} 含 `|` 模式展开失败）──
+# P3-09 在 KernelSU/Android16 真机发现的 D-IPC 环境缺陷：mksh 对 `|`-in-pattern
+# 的参数展开匹配失败（docs/P3-DEVICE-MATRIX §3）。P3-10 已把产品 Runtime 的
+# `|` 字段切分改为可移植 `cut`，产品路径不再依赖该展开。探测仅作**环境记录**，
+# 不再用于把 IPC 项判 BLOCKED——IPC 项成败改由真实响应判定（P4-01 起）。
 PIPE_PROBE=$(adb shell "sh -c 'line=\"a|b|c\"; printf \"%s\" \"\${line#*|}\"'" 2>/dev/null | tr -d '\r')
-[ "$PIPE_PROBE" = "b|c" ] || PIPE_OK=0
-if [ "$PIPE_OK" -eq 0 ]; then
-    echo_t "[note] device shell defect: \${var#*|}/\${var%%|*} fail (probe=[$PIPE_PROBE]) -> IPC items BLOCKED"
-fi
+[ "$PIPE_PROBE" = "b|c" ] && PIPE_MSKH_OK=1 || PIPE_MSKH_OK=0
+echo_t "[note] device mksh \${var#*|}: probe=[$PIPE_PROBE] -> ${PIPE_MSKH_OK:-0} (product uses cut, IPC judged by real rc)"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 1) 模块安装/卸载（ksud module list + 文件落点；卸载→重装验证可逆）
@@ -195,26 +210,14 @@ echo "$AUDIT" | grep -q "op=boot" && echo "$AUDIT" | grep -q "mode=managed" \
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 7) WebUI Dashboard（GET_SUMMARY；IPC 缺陷则 BLOCKED）
+# 7) WebUI Dashboard（GET_SUMMARY；P4-01：按真实 IPC 成功判定）
 # ═══════════════════════════════════════════════════════════════════════════
-# IPC 缺陷签名统一判定（invalid_request/malformed/daemon_unavailable/
-# permission_denied/operation_timeout 均为此设备 shell `|` 缺陷导致 IPC 不可达）
-IPC_BLOCKED() {
-    case "$1" in
-        *'malformed'*|*'invalid_request'*|*'daemon_unavailable'*|*'permission_denied'*|*'operation_timeout'*) return 0 ;;
-    esac
-    return 1
-}
+# P3-10 D-IPC 修复后产品经 cut 切分（不再依赖设备 mksh 的 `|`-in-pattern 展开）。
+# 此处断言 GET_SUMMARY 真实返回成功 JSON（rc=0 → {"ok":true,...,"mode":...}）。
+# 失败 = FAIL（若 D-IPC 环境缺陷复发则登记回 T2，不允许冒充 PASS）。
+ipc_ready
 SUM=$(adb shell "su -c 'su-scheduler webui GET_SUMMARY 2>&1'" 2>/dev/null | tr -d '\r' | tail -1)
-if [ "$PIPE_OK" -eq 0 ]; then
-    # IPC 链路因设备 shell `|` 缺陷不可达（主机 tests/ipc+p3-integration 已全绿）
-    case "$SUM" in
-        *'"ok":true'*) ok "7-webui: GET_SUMMARY JSON dashboard" ;;
-        *) IPC_BLOCKED "$SUM" \
-            && blocked "7-webui: GET_SUMMARY -> [$SUM] (device shell \`|\` defect; host tests/ipc+p3-integration cover)" \
-            || bad "7-webui: GET_SUMMARY=[$SUM]" ;;
-    esac
-elif echo "$SUM" | grep -q '"total"'; then
+if echo "$SUM" | grep -q '"ok":true' && echo "$SUM" | grep -q '"mode"'; then
     ok "7-webui: GET_SUMMARY JSON dashboard"
 else
     bad "7-webui: GET_SUMMARY=[$SUM]"
@@ -222,17 +225,29 @@ fi
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 8) Task Editor 保存和回滚（EDIT_TASK/GET_TASK_EDIT；IPC 缺陷则 BLOCKED）
+# 8) Task Editor 保存（EDIT_TASK；P4-01：按真实 IPC 成功判定）
 # ═══════════════════════════════════════════════════════════════════════════
-PAY="schema_version=2|id=edit1|name=e|enabled=1|trigger=08:30|action.type=command|action.command=echo editor-device"
-ENC=$(adb shell "su -c 'echo -n \"$PAY\" | base64'" 2>/dev/null | tr -d '\r')
-EDIT_R=$(adb shell "su -c 'su-scheduler ipc EDIT_TASK id=$ENC payload=$ENC 2>&1'" 2>/dev/null | tr -d '\r' | tail -1)
-if [ "$PIPE_OK" -eq 0 ]; then
-    IPC_BLOCKED "$EDIT_R" \
-        && blocked "8-editor: EDIT_TASK -> [$EDIT_R] (device shell \`|\` defect; host tests/webui/editor+integration cover)" \
-        || bad "8-editor: EDIT_TASK=[$EDIT_R]"
+# 用完整合法 Task v2 payload（key=value 多行，与 GET_TASK_EDIT 回显格式一致）
+# 经 `su-scheduler ipc EDIT_TASK` 原子写入（cmd_ipc 内部对每个 k=v 做 base64，
+# 故传原始内容；payload 取自设备临时文件避免引号/换行转义）。成功 = rc=0 且
+# edit1.task 落盘于 task-config（daemon 侧 reload 后 Registry 可见）。
+ipc_ready
+adb shell "su -c 'cat > /data/local/tmp/ss-edit1.pay <<PEOF
+schema_version=2
+id=edit1
+name=e
+enabled=1
+trigger=08:30
+action.type=command
+action.command=sleep 20
+PEOF'" 2>/dev/null
+EDIT_R=$(adb shell "su -c 'su-scheduler ipc EDIT_TASK id=edit1 payload=\"\$(cat /data/local/tmp/ss-edit1.pay)\" 2>&1; echo rc=\$?'" 2>/dev/null | tr -d '\r' | tail -1)
+EDIT_FILE=$(adb shell "su -c 'ls $TCFG/edit1.task 2>/dev/null'" 2>/dev/null | tr -d '\r')
+rm -f /data/local/tmp/ss-edit1.pay 2>/dev/null
+if echo "$EDIT_R" | grep -q 'rc=0' && [ -n "$EDIT_FILE" ]; then
+    ok "8-editor: EDIT_TASK persisted task (rc=0 + edit1.task)"
 else
-    [ -f "$TCFG/edit1.task" ] 2>/dev/null && ok "8-editor: EDIT_TASK persisted task" || bad "8-editor: no task file"
+    bad "8-editor: EDIT_TASK=[$EDIT_R] file=[$EDIT_FILE]"
 fi
 tick
 
@@ -354,16 +369,26 @@ adb shell "su -c 'rm -rf $CGDIR'" 2>/dev/null
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 14) Task start/stop/restart（tctl_* 经 CLI/IPC；缺陷则 BLOCKED；主机已测）
+# 14) Task start/stop/restart（tctl_* 经 CLI/IPC；P4-01：按真实 IPC 成功判定）
 # ═══════════════════════════════════════════════════════════════════════════
-TS=$(adb shell "su -c 'su-scheduler task start edit1 2>&1'" 2>/dev/null | tr -d '\r' | tail -1)
-if [ "$PIPE_OK" -eq 0 ]; then
-    IPC_BLOCKED "$TS" \
-        && blocked "14-control: task start -> [$TS] (device shell \`|\` defect; host tests/task-control+integration cover)" \
-        || bad "14-control: task start=[$TS]"
+# `task start edit1`（item 8 已保存 edit1，命令 sleep 20）经 IPC START_TASK →
+# tctl_start → action_run；成功 = rc=0 且运行目录 state.txt 达 RUNNING。
+ipc_ready
+TS=$(adb shell "su -c 'su-scheduler task start edit1 2>&1; echo rc=\$?'" 2>/dev/null | tr -d '\r' | tail -1)
+TS_RUN=""
+W=0
+while [ "$W" -lt 20 ]; do
+    TS_RUN=$(adb shell "su -c 'cat $DATA/tasks/edit1/state.txt 2>/dev/null'" 2>/dev/null | tr -d '\r')
+    [ "$TS_RUN" = "RUNNING" ] && break
+    sleep 1; W=$((W + 1))
+done
+if echo "$TS" | grep -q 'rc=0' && [ "$TS_RUN" = "RUNNING" ]; then
+    ok "14-control: task start -> RUNNING (tctl+action_run via IPC)"
 else
-    echo "$TS" | grep -qiE "started|running" && ok "14-control: task start works" || bad "14-control: task start=[$TS]"
+    bad "14-control: task start=[$TS] state=[$TS_RUN]"
 fi
+# 停止并清理（start 已把 edit1 置 RUNNING；stop 回收避免残留影响后续用例）
+adb shell "su -c 'su-scheduler task stop edit1 >/dev/null 2>&1; rm -f $TCFG/edit1.task; rm -rf $DATA/tasks/edit1'" 2>/dev/null
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════

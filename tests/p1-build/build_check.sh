@@ -80,6 +80,27 @@ grep -q "releases/download/$BVER/su-scheduler-$BVER.zip" update.json && ok "upda
 grep -q "^# Version: $NVVER" system/bin/.su-scheduler-docs && ok "docs header Version=$NVVER (Q12)" || bad "docs header Version (Q12)"
 grep -q "\"changelog\": \".*v$NVVER" update.json && ok "update.json changelog references v$NVVER (Q12)" || bad "update.json changelog (Q12)"
 
+# ── 4b) Runtime 库版本检查（P4-01，D4 §5.2 / 风险 R4 关闭）───────────────────
+# Runtime 库版本 = 内部实现线（不参与模块 8 处一致性），但必须满足：
+#   A) RUNTIME_LIB_VERSION 存在且为语义化版本 N.N.N（N=数字串）；
+#   B) 打包 zip 内成员的 RUNTIME_LIB_VERSION 与源文件一致（防打包截断/行尾污染）。
+# CRLF 检出下同样归一（tr -d '\r'，与既有 CRLF 语义一致）；zip 缺失时沿用
+# CRLF SKIP（构建执行段跳过），zip 存在则两断言必执行。
+RVER=$(grep '^RUNTIME_LIB_VERSION=' system/bin/su-scheduler-runtime 2>/dev/null | head -1 | cut -d= -f2 | tr -d '\r' | tr -d '"')
+case "$RVER" in
+    [0-9]*\.[0-9]*\.[0-9]*) ok "runtime lib version semantic: $RVER (D4 internal line)" ;;
+    "") bad "runtime lib version missing" ;;
+    *)  bad "runtime lib version malformed: [$RVER]" ;;
+esac
+if [ "$CRLF_TREE" -eq 1 ]; then
+    skip "runtime lib zip consistency (CI/LF gate)"
+else
+    ZRVER=$(unzip -p "$ZIP" system/bin/su-scheduler-runtime 2>/dev/null | grep '^RUNTIME_LIB_VERSION=' | head -1 | cut -d= -f2 | tr -d '\r' | tr -d '"')
+    [ -n "$RVER" ] && [ "$RVER" = "$ZRVER" ] \
+        && ok "runtime lib version consistent in zip ($RVER)" \
+        || bad "runtime lib zip mismatch: src=[$RVER] zip=[$ZRVER]"
+fi
+
 # ── 5) 还原工作树（仅 LF 环境跑过构建时需要；CRLF 下未构建无污染）───────────
 if [ "$CRLF_TREE" -eq 0 ]; then
     rm -f "$ZIP"
