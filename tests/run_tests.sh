@@ -60,6 +60,10 @@
 #       secv_sweep_tmp、未授权写 permission_denied）
 #   L2  tests/resource/stress.sh     P3-08 资源安全（100 Task 单循环无 100 永久循环、
 #       日志/快照/任务目录上限、单任务错误隔离、IPC 频率限制 rc 7、CPU/内存有界）
+#   L2  tests/p3-integration/test.sh P3-09 综合回归（安装契约→Runtime 加载→Legacy 继续
+#       执行→Task v2 导入→Registry 调度→WebUI Dashboard→Task Editor 保存/回滚→App Action
+#       →Process/Port Health→Retry/Cooldown 钳制→Crash Loop→Task 控制→配置损坏回退→
+#       旧 CLI 查询→日志轮转→重启状态恢复 端到端协同，48 断言）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -145,18 +149,20 @@ else
         "tests/security/path-validation.sh" \
         "tests/security/permission.sh" \
         "tests/resource/stress.sh" \
+        "tests/p3-integration/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
     done
     if [ "$WITH_DEVICE" -eq 1 ]; then
         run_suite "tests/p1-device/smoke.sh"
+        run_suite "tests/p3-device/smoke.sh"
     fi
 fi
 
 echo "──────────────────────────────────────────────────────────────────────"
 if [ "$ok" -eq 1 ]; then
-    echo "ALL SUITES GREEN (L1+L2+L4 host regression; device optional: see p1-device)"
+    echo "ALL SUITES GREEN (L1+L2+L4 host regression; device optional: see p1-device/p3-device)"
 else
     echo "FAILURES PRESENT"
 fi

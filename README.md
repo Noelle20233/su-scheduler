@@ -1488,10 +1488,12 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | 安全与资源加固（P3-08 路径安全：路径穿越/符号链接/允许目录约束/Task ID 门/IPC 穿越 id 拒绝零泄露、相对脚本拒） | `tests/security/path-validation.sh` |
 | L2 | 安全与资源加固（P3-08 文件安全：secv_fix_perms 强制 0700/600、原子写 tmp 清理、secv_sweep_tmp、未授权写 permission_denied） | `tests/security/permission.sh` |
 | L2 | 安全与资源加固（P3-08 资源安全：100 Task 单循环无 100 永久循环、日志/快照/任务目录上限、单任务错误隔离、IPC 频率限制 rc 7、CPU/内存有界） | `tests/resource/stress.sh` |
+| L2 | P3 综合回归（P3-09：安装契约→daemon 生命周期/Runtime 加载→Legacy 继续执行→Task v2 导入→Registry 调度→WebUI Dashboard→Task Editor 保存/回滚→App Action→Process/Port Health→Retry/Cooldown 钳制→Crash Loop→Task 控制→配置损坏回退→旧 CLI 查询→日志轮转→重启状态恢复 端到端协同，48 断言） | `tests/p3-integration/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |
-| L3 | 设备冒烟（真实 KernelSU 设备，`adb` 通道） | `tests/p1-device/smoke.sh` |
+| L3 | 设备冒烟（真实 KernelSU 设备，`adb` 通道；P1 legacy 冒烟） | `tests/p1-device/smoke.sh` |
+| L3 | P3 设备矩阵冒烟（P3-09：真机 18 项覆盖 + mksh `\|` 缺陷探测判定，`adb root`；结果见 docs/P3-DEVICE-MATRIX.md） | `tests/p3-device/smoke.sh` |
 
 **判定**：输出不得出现 `[FAIL]`；允许跳过项仅限 L3（`DEVICE_SKIPPED` 明示）与
 CRLF 检出下的构建执行（`[SKIP]` 明示，CI/LF 为构建闸）。**结果可追溯**：每次
