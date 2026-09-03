@@ -147,6 +147,28 @@ for case_name in "empty" "nopipe" "badop" "badrid" "badb64" "oversize"; do
 done
 [ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P3-04 proto: malformed requests had ZERO side effects (no exec)" || bad "P3-04 proto: exec happened on malformed ($(wc -l < "$EXEC_LOG"))"
 
+# ── 3b) P3-10 D-IPC 回归：`|` 字段切分（mksh `${var#*|}`/`${var%%|*}` 失败）
+# 设备 shell（Android mksh）对含 `|` 模式的参数展开失败 → IPC 全断（docs/
+# P3-DEVICE-MATRIX §3）。修复为可移植 cut 切分后，此处断言 `ipc_parse` /
+# `tctl_resolve` / `web_task_log_to_json` 三处 `|` 字段切分在宿主（bash）上
+# 语义与修前一致；mksh 兼容性由 cut 不依赖模式展开保证（真机重验在 P3-10）。
+ipc_parse "req_abc|GET_TASKS|" && [ "$ipcv_req_id" = "req_abc" ] && [ "$ipcv_op" = "GET_TASKS" ] && [ "$ipcv_params" = "" ] \
+    && ok "P3-10 D-IPC: ipc_parse splits req_id/op/params (cut portable, mksh-safe)" \
+    || bad "P3-10 D-IPC: ipc_parse fields=[$ipcv_req_id][$ipcv_op][$ipcv_params]"
+ipc_parse "r2|GET_TASK_STATUS|id=$(ipc_b64enc t1_0830)" && [ "$ipcv_op" = "GET_TASK_STATUS" ] \
+    && printf '%s' "$ipcv_params" | grep -q "^id=" \
+    && ok "P3-10 D-IPC: ipc_parse preserves params after 2nd pipe (base64 intact)" \
+    || bad "P3-10 D-IPC: ipc_parse params=[$ipcv_params]"
+# web_task_log_to_json meta：`#truncated=N|total=M|lines=K` → cut 切分
+WLOG="$TASKS_DIR/t1_0830/output.log"; printf 'l1\nl2\nl3\n' > "$WLOG"
+WEBJSON=$(web_task_log_to_json "#truncated=1|total=3|lines=2
+l1
+l2" 2>/dev/null)
+printf '%s' "$WEBJSON" | grep -q '"truncated":1' && printf '%s' "$WEBJSON" | grep -q '"total":3' \
+    && printf '%s' "$WEBJSON" | grep -q '"returned":2' \
+    && ok "P3-10 D-IPC: web_task_log_to_json meta trunc/total/lines cut-split" \
+    || bad "P3-10 D-IPC: web_task_log_to_json=$WEBJSON"
+
 # ── 4) GET_*（registry 就绪后）─────────────────────────────────────────────
 cat > "$CFG" <<'EOF'
 08:30 echo legacy-task-a
@@ -155,6 +177,15 @@ EOF
 export TCFG_DIR="$BASE/task-config"
 rm -rf "$TCFG_DIR"; mkdir -p "$TCFG_DIR"; rm -f "$TCFG_DIR/MANAGED"
 registry_init "$BASE" "$CFG" >/dev/null 2>&1
+
+# ── 4b) P3-10 D-IPC：tctl_resolve canonical|run_dir → cut 切分 ──────────────
+# （tctl_start/stop/restart 共用 §24 tclv_ 解析；mksh `|`-in-pattern 失败见 docs）
+mkdir -p "$TASKS_DIR/t1_0830"
+tclv_r=$(tctl_resolve "$BASE" "$TASKS_DIR" t1_0830 2>/dev/null)
+tclv_canon=$(printf '%s' "$tclv_r" | cut -d'|' -f1); tclv_rd=$(printf '%s' "$tclv_r" | cut -d'|' -f2-)
+[ "$tclv_canon" = "t1_0830" ] && [ "$tclv_rd" = "$TASKS_DIR/t1_0830" ] \
+    && ok "P3-10 D-IPC: tctl_resolve canonical|run_dir split (canon+rd)" \
+    || bad "P3-10 D-IPC: tctl_resolve=[$tclv_r]"
 
 r=$(send_req "g_tasks" "g_tasks|GET_TASKS|")
 rc=$(resp_rc "$r")

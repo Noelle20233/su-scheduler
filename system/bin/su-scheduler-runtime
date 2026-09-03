@@ -3172,10 +3172,12 @@ ipc_server_init() {   # <base> → 0
 ipc_parse() {   # <line> → 0=ok（ipcv_req_id/ipcv_op/ipcv_params 就绪）1=invalid
     ipcv_line=$1
     [ -n "$ipcv_line" ] || return 1
-    ipcv_req_id=${ipcv_line%%|*}
-    ipcv_rest=${ipcv_line#*|}
-    ipcv_op=${ipcv_rest%%|*}
-    ipcv_params=${ipcv_rest#*|}
+    # P3-10 D-IPC 修复：不用 `${var%%|*}`/`${var#*|}`（mksh 对含 `|` 模式
+    # 的参数展开失败，见 docs/P3-DEVICE-MATRIX §3），改可移植 cut 切分。
+    ipcv_req_id=$(printf '%s' "$ipcv_line" | cut -d'|' -f1)
+    ipcv_rest=$(printf '%s' "$ipcv_line" | cut -d'|' -f2-)
+    ipcv_op=$(printf '%s' "$ipcv_rest" | cut -d'|' -f1)
+    ipcv_params=$(printf '%s' "$ipcv_rest" | cut -d'|' -f2-)
     case "$ipcv_req_id" in
         ""|*[!A-Za-z0-9._-]*) return 1 ;;
     esac
@@ -3852,9 +3854,11 @@ web_task_log_to_json() {   # <payload> → 单行 JSON
     webv_trunc=0; webv_total=0; webv_ret=0
     case "$webv_meta" in
         \#truncated=*)
-            webv_trunc=${webv_meta#*truncated=}; webv_trunc=${webv_trunc%%|*}
-            webv_total=${webv_meta#*total=}; webv_total=${webv_total%%|*}
-            webv_ret=${webv_meta#*lines=}
+            # P3-10 D-IPC 修复：cut 切分（同 §3 注释），meta 为
+            # `#truncated=N|total=M|lines=K` 三字段。
+            webv_trunc=$(printf '%s\n' "$webv_meta" | cut -d'|' -f1 | cut -d= -f2)
+            webv_total=$(printf '%s\n' "$webv_meta" | cut -d'|' -f2 | cut -d= -f2)
+            webv_ret=$(printf '%s\n' "$webv_meta" | cut -d'|' -f3 | cut -d= -f2)
             ;;
     esac
     printf '{"ok":true,"truncated":%s,"total":%s,"returned":%s,"lines":[' \
@@ -4164,7 +4168,8 @@ tctl_start() {
     tclv_base=$1; tclv_tasks=$2; tclv_qid=$3; tclv_force=${4:-0}
     tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
         echo "task_not_found $tclv_qid"; return 1; }
-    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    # P3-10 D-IPC 修复：cut 切分 `canonical|run_dir`（mksh `|`-in-pattern 失败，见 docs/P3-DEVICE-MATRIX §3）
+    tclv_canon=$(printf '%s' "$tclv_res" | cut -d'|' -f1); tclv_rd=$(printf '%s' "$tclv_res" | cut -d'|' -f2-)
     tclv_tf=$(registry_task_file "$tclv_canon" 2>/dev/null) || {
         echo "task_not_found $tclv_canon"; return 1; }
     if [ -z "$tclv_rd" ]; then
@@ -4223,7 +4228,8 @@ tctl_stop() {
     tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
     tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
         echo "task_not_found $tclv_qid"; return 1; }
-    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    # P3-10 D-IPC 修复：cut 切分 `canonical|run_dir`（mksh `|`-in-pattern 失败，见 docs/P3-DEVICE-MATRIX §3）
+    tclv_canon=$(printf '%s' "$tclv_res" | cut -d'|' -f1); tclv_rd=$(printf '%s' "$tclv_res" | cut -d'|' -f2-)
     [ -n "$tclv_rd" ] || { echo "not_running $tclv_canon (no run dir)"; return 0; }
     tclv_cur=$(tctl_state "$tclv_rd")
     case "$tclv_cur" in
@@ -4253,7 +4259,8 @@ tctl_restart() {
     tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
     tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
         echo "task_not_found $tclv_qid"; return 1; }
-    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    # P3-10 D-IPC 修复：cut 切分 `canonical|run_dir`（mksh `|`-in-pattern 失败，见 docs/P3-DEVICE-MATRIX §3）
+    tclv_canon=$(printf '%s' "$tclv_res" | cut -d'|' -f1); tclv_rd=$(printf '%s' "$tclv_res" | cut -d'|' -f2-)
     tclv_cur=$(tctl_state "$tclv_rd")
     case "$tclv_cur" in
         RUNNING|HEALTHY|UNHEALTHY|STARTING|RECOVERING|STOPPING)
@@ -4268,7 +4275,8 @@ tctl_check() {
     tclv_base=$1; tclv_tasks=$2; tclv_qid=$3
     tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
         echo "task_not_found $tclv_qid"; return 1; }
-    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    # P3-10 D-IPC 修复：cut 切分 `canonical|run_dir`（mksh `|`-in-pattern 失败，见 docs/P3-DEVICE-MATRIX §3）
+    tclv_canon=$(printf '%s' "$tclv_res" | cut -d'|' -f1); tclv_rd=$(printf '%s' "$tclv_res" | cut -d'|' -f2-)
     tclv_tf=$(registry_task_file "$tclv_canon" 2>/dev/null) || {
         echo "task_not_found $tclv_canon"; return 1; }
     tclv_spec=$(supervisor_health_spec "$tclv_tf")
@@ -4293,7 +4301,8 @@ tctl_logs() {
     tclv_lines=$(secv_num_clamp "${4:-50}" 1 500 50)
     tclv_res=$(tctl_resolve "$tclv_base" "$tclv_tasks" "$tclv_qid") || {
         echo "task_not_found $tclv_qid"; return 1; }
-    tclv_canon=${tclv_res%%|*}; tclv_rd=${tclv_res#*|}
+    # P3-10 D-IPC 修复：cut 切分 `canonical|run_dir`（mksh `|`-in-pattern 失败，见 docs/P3-DEVICE-MATRIX §3）
+    tclv_canon=$(printf '%s' "$tclv_res" | cut -d'|' -f1); tclv_rd=$(printf '%s' "$tclv_res" | cut -d'|' -f2-)
     [ -n "$tclv_rd" ] && [ -d "$tclv_rd" ] || { echo "(no run dir yet)"; return 0; }
     if [ -f "$tclv_rd/output.log" ]; then
         tail -n "$tclv_lines" "$tclv_rd/output.log" 2>/dev/null

@@ -1514,3 +1514,17 @@ P3-01）**——成功回归 trace 亦作为发布门禁证据存档。
 - `tests/_run_all.sh` 已由 `tests/run_tests.sh` 取代（不再作为推荐入口）。
 - Q1–Q4/Q9/Q11/Q12 处理与 Q10（`--boot`）决策记录见 `docs/P2-01.md`；基线文档
   `docs/phase-1-baseline.md` §6.1 有逐项状态表。
+
+### 📄 P3 出口与发布文档（P3-10 追加）
+
+> 本章节为 P3-10 追加，不改动本文件既有任何章节。
+
+- **出口评审**：`docs/P3-EXIT-REPORT.md`（P3 出口标准 11 项覆盖矩阵、功能/兼容/安全/
+  发布分类核验、D-IPC 修复说明、约束审计）。
+- **交接资料**：`docs/P3-HANDOVER.md`（新成员阅读路径、P3 流程全景、已实现清单、
+  P4 接口预留点、安全边界）。
+- **升级与回滚**：`docs/P3-UPGRADE-ROLLBACK.md`（发布候选安装、卸载/回滚、故障排查）。
+- **设备矩阵**：`docs/P3-DEVICE-MATRIX.md`（KernelSU×Android 16 真机 25 PASS /
+  0 FAIL / 3 BLOCKED→D-IPC 已修；其余 14 格为发布限制）。
+- **P4 Dependency 需求输入**：`docs/P4-DEPENDENCY-REQUIREMENTS.md`（WAITING 接线点、
+  功能/非功能需求、安全边界、禁止事项）。

@@ -123,12 +123,18 @@
 调度（legacy 解析、boot 执行、supervisor、crash_guard、state_rehydrate）与旧 CLI 查询
 （task-info/output）**不受影响**——本设备 18 项中的 15 项真机 PASS 证实了这一点。
 
-### 3.3 建议修复（P3-09 仅登记，不擅自实现——符合「设备冒烟发现缺陷→登记→回 T2 流程」）
+### 3.3 修复（P3-10 已实施）
 
 将 11 处 `|` 分隔字段切分改为**可移植 POSIX 等价写法**（不依赖 `|` 模式的参数展开）：
-`cut -d'|' -f1` / `sed 's/^[^|]*|//'` / `awk -F'|'` 等（C3 合规，均为 Android 标准工具）。
-需同步更新 `tests/ipc/*`、`tests/webui/*`、`tests/task-control/*` 中对应的字段断言（如有
-硬编码依赖），并在修后全量回归 + 真机重跑。**此项列为发布前阻断缺陷**（见 §4）。
+统一为 `cut -d'|' -fN`（`cut` 已在本库 82 处使用，C3 合规）。`system/bin/su-scheduler-runtime`：
+- `ipc_parse`：`${line%%|*}`/`${line#*|}` → `cut -d'|' -f1`/`-f2-`；
+- `web_task_log_to_json` meta：`cut -d'|' -f1..3 | cut -d= -f2`；
+- `tctl_*` 响应解析（5 处）：`cut -d'|' -f1`/`-f2-`。
+
+`tests/ipc/test.sh` 新增 **4 条 D-IPC 回归断言**（`ipc_parse` 字段切分、params 保真、
+`tctl_resolve` canonical|run_dir、`web_task_log_to_json` meta 三字段），宿主（bash）语义
+与修前一致且证明 cut 路径；mksh 兼容性由 cut 不依赖模式展开保证。修复后主机全量回归
+**ALL SUITES GREEN**（含 ipc 64 断言）。**真机重验（7/8/14）待设备可用时执行**（见 §4）。
 
 ### 3.4 探测方式
 
@@ -141,7 +147,7 @@
 
 | 限制 | 说明 | 处置 |
 | :-- | :-- | :-- |
-| **D-IPC 缺陷（阻断）** | Android 16 设备 mksh 的 `|`-in-pattern 参数展开失败 → IPC 全断 | 发布前必须修复（§3.3）并在设备矩阵重验 7/8/14 |
+| ~~D-IPC 缺陷（阻断）~~ | Android 16 mksh 的 `|`-in-pattern 参数展开失败 → IPC 全断 | **P3-10 已修复**（§3.3，cut 切分 + 4 条回归断言）；真机重验待设备可用 |
 | Magisk × Android 12–16 | 无真机/模拟器 | 发布前待办，未验证组合须在发布说明明示 |
 | APatch × Android 12–16 | 无真机/模拟器 | 同上 |
 | KernelSU × Android 12–15 | 无真机/模拟器 | 同上（Android 16 已覆盖） |
