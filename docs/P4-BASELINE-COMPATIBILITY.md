@@ -27,7 +27,7 @@
 | B2 | 解析语义 | `parse_modifiers` / `extract_command` / heredoc（`<<EOF`）/ modifiers（--run-once-now/--delete/--notify*/--msg/--interactive/--termux）语义锁定，不做「应该怎样」式主观修正 | `tests/legacy/*`、`tests/parsing/*` | [PASS]；无生产解析函数改动 |
 | B3 | Legacy 执行路径 | 旧 daemon 主循环时间匹配、boot 扫描、`execute_task`（SYSTEM/TERMUX/INTERACTIVE）**持续可运行**（C2），不得替换为第二执行器 | `tests/execution/action-run/test.sh`、`tests/trigger/test.sh`、`tests/p3-integration` item 4/6 | [PASS]；legacy 模式任务真实执行 |
 | B4 | 模块版本一致性 | 模块 v1.6.8 的 8 处一致性（module.prop / build.sh / 两 bin / README / update.json / .su-scheduler-docs） | `tests/p1-build/build_check.sh` | PASS=26 FAIL=0 |
-| B5 | Runtime 库 | `RUNTIME_LIB_VERSION`（现 1.20.0，P4-02 §26 递增）存在且语义化版本格式；模块发布时打包的库版本与文档记录一致 | `tests/p3-integration`（dash -n + selfcheck）+ `docs/P4-RUNTIME-VERSION-CHECK.md` 方案 | [PASS]；daemon log `Runtime library loaded (v1.20.0)` |
+| B5 | Runtime 库 | `RUNTIME_LIB_VERSION`（现 1.21.0，P4-03 §26 依赖图校验递增）存在且语义化版本格式；模块发布时打包的库版本与文档记录一致 | `tests/p3-integration`（dash -n + selfcheck）+ `docs/P4-RUNTIME-VERSION-CHECK.md` 方案 | [PASS]；daemon log `Runtime library loaded (v1.21.0)` |
 | B6 | 单实例与生命周期 | daemon 单实例锁（/dev/.su_scheduler.lock）、crash-guard 降级/节流/优雅重置、重启残留 state_rehydrate | `tests/crashguard/test.sh`（41）、`tests/lifecycle-prod/test.sh`（27）、`tests/p2-integration` | [PASS]；无第二常驻循环（C5） |
 | B7 | IPC 协议 | `REQ_ID\|OP\|PARAMS` 固定格式 + IPC_WHITELIST（19 op）+ base64 值 + 原子响应 + 6 类错误码；**`\|` 字段切分必须用 `cut`**（P3-10 D-IPC，mksh 兼容），禁止 `${var#*\|}`/`${var%%\|*}` | `tests/ipc/test.sh`（64）+ `tests/ipc/security.sh`（17）+ `tests/p3-integration` item 7/8/14 | [PASS]；真机 7/8/14 PASS（P4-01 复验） |
 | B8 | WebUI 数据面 | 只读 Reader 输出统一 JSON、JSON 转义防注入、三态、有界日志；WebUI 不直执 Root | `tests/webui/read-only.test.sh`（24）+ `tests/webui/security.test.sh`（15） | [PASS] |

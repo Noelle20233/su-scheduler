@@ -138,7 +138,57 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 - 回退：§26 为纯增量（新 § + 既有 §19/§23 key 分支扩展），移除不影响既有
   解析/执行路径；无破坏性结构变更。
 
+---
+
+## 7. P4-03 增补裁决：依赖图校验与循环检测（ADR D6–D10）
+
+> **状态**：已接受（P4-03 冻结）。在 D1–D5 之上叠加图级引用完整性校验。
+
+### D6 未知依赖拒绝；前向引用允许
+
+- `dependency` 引用的 task-id 在 task-config 目录（含自身）中不存在 → 校验
+  拒绝（rc 非 0）。**前向引用（引用后续才定义的任务）允许**，只要最终图无环
+  且全部存在——引用完整性按「目录全集」判定，不按文件顺序判定。
+
+### D7 自依赖与环检测（简单 DFS，无通用 DAG）
+
+- 自依赖（任务 dependency 含自身 id）→ 拒绝（属环特例，单独报
+  `self-dependency in '<id>'`）。
+- 直接环（a→b→a）与间接环（a→b→c→a）均拒绝。检测算法 = 简单 DFS/迭代
+  （N≤32×任务数，POSIX sh 可实现），**不引入通用 DAG 调度器**（P4 明确禁止）。
+- 环错误消息含完整环路径（`cycle: a->b->c->a`），便于定位。
+
+### D8 Optional（`?`）不豁免环/未知校验
+
+- Optional 的语义是「依赖失败时不阻断执行」（P4-05 消费），但**引用完整性仍
+  必须成立**：`?` 条目同样参与未知 id 与环检测（引用关系即边），未知/环在
+  P4-03 一律拒绝。环中任一环即拒绝（简单策略）。
+
+### D9 图校验接入点（全部落盘写路径，后端权威）
+
+| 接线点 | 行为 |
+| :-- | :-- |
+| `tcfg_apply_task`（经 `tcfg_editor_validate_payload`） | 以「当前目录 + 该 payload 替换原文件后的有效集合」校验（新建/编辑一视同仁）；失败不写盘 |
+| `tcfg_set_field`（dependency 键） | 写改后同样以「当前目录 + 写改后的有效集合」校验 |
+| `tcfg_import` | 整体导入校验「最终有效集合」= 既有 task-config + staging 提升后；失败 config 逐字节不变 |
+| `sched_snapshot_managed` | 快照构建时过滤：源目录图非法 → KEPT（不写 current、维持旧快照） |
+| `dep_validate_graph <dir> [<id>] [<content>] [<prefix>]` | 新图函数；遍历 `<dir>/*.task` 构建 id 集合 + 依赖边；`<content>` 为覆盖节点新内容；错误写 stderr |
+
+### D10 错误码与消息约定（沿用 D5 / task-editor-schema §5.3）
+
+- 失败 → rc 非 0 + 具体原因（`unknown dependency 'x' in 't_a'` /
+  `self-dependency in 't_a'` / `cycle: a->b->c->a`）。
+- 前缀：editor 路径 `[editor] ERROR:`（`tcfg_editor_validate_payload`）；
+  set/import/snapshot 路径 `[task-config] ERROR:`。
+- IPC 信封统一 `configuration_invalid`（rc 4）+ `task invalid (config unchanged)`；
+  底层明细在 stderr。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
   运行期消费由 P4-05 承接；D3 求值文法由 P4-06 承接；上限常量供 P4-10 复用。
+- 2026-09-04：P4-03 增补 D6–D10（依赖图校验与循环检测）。环策略 = 简单 DFS、
+  Optional 参与环校验、前向引用允许、图校验接入 apply/set/import/snapshot。
+  运行时门控（P4-04）、Required/Optional 失败传播（P4-05）不在本 ADR 范围。

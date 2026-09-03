@@ -15,12 +15,12 @@
   `tests/p1-build/build_check.sh` 强制 8 处一致（module.prop / build.sh / 两 bin /
   README badge / update.json / .su-scheduler-docs）。
 - **Runtime 库版本 = 内部实现线**（D4 §5.2）：`system/bin/su-scheduler-runtime`
-  头部 `RUNTIME_LIB_VERSION="1.20.0"`，随 § 功能集合递增，**不参与**模块 8 处一致
+   头部 `RUNTIME_LIB_VERSION="1.21.0"`，随 § 功能集合递增，**不参与**模块 8 处一致
   性校验（模块可不变、库递增；破坏性变更才要求模块 major 同步）。
 - **现状缺口（R4）**：`RUNTIME_LIB_VERSION` **未纳入任何构建期断言**。当前守护仅
   靠 `runtime_lib_selfcheck`（运行期、缺失即拦）+ zip 成员存在性 + 文档人工维护
   （§9 版本表）。一旦 `RUNTIME_LIB_VERSION` 被误改/丢失/格式破坏，主机门禁无法在
-  构建期发现，可能打包出「文档宣称 1.20.0、实际 1.19.0」的发布。
+   构建期发现，可能打包出「文档宣称 1.21.0、实际 1.20.0」的发布。
 
 ---
 
@@ -92,7 +92,7 @@ unzip -p "$ZIP" system/bin/su-scheduler-runtime 2>/dev/null | tr -d '\r' \
 
 ```bash
 bash tests/p1-build/build_check.sh
-# 期望：输出含 "runtime lib version semantic: 1.20.0" 等 Runtime 断言，且全部 [PASS]
+# 期望：输出含 "runtime lib version semantic: 1.21.0" 等 Runtime 断言，且全部 [PASS]
 
 bash tests/run_tests.sh
 # 期望：ALL SUITES GREEN（含 L4 build_check 新增断言），0 FAIL

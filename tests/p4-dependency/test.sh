@@ -123,6 +123,14 @@ cond_validate "$(printf '\x01\x02')" && bad "P4-02 cond: low control chars allow
 cond_validate "$(printf 'a\xc3\xa9')" && bad "P4-02 cond: non-ASCII UTF-8 allowed" || ok "P4-02 cond: non-ASCII rejected"
 
 # ── §editor：tcfg_editor_validate_payload 接受/拒绝 dependency/condition ──
+# P4-03 适配：editor 校验现含依赖图校验——DEP_GOOD 引用的 t_boot/t_daily 先建
+# 立为合法任务（新语义要求「引用必须最终存在」，非掩盖失败）
+min_task() {   # <dir> <id> [dependency] → 最小合法 Task v2 文件
+    mkdir -p "$1"
+    printf 'schema_version=2\nid=%s\ntrigger=08:30\ndependency=%s\n' "$2" "${3:-}" > "$1/$2.task"
+}
+min_task "$TCFG_DIR" t_boot
+min_task "$TCFG_DIR" t_daily
 GOOD1=$(ok_task t_dep | sed 's#^id=.*#id=t_dep#')
 DEP_GOOD=$(printf '%s\n' "dependency=?t_boot:FAILED,?t_daily" "$GOOD1")
 if tcfg_editor_validate_payload "$DEP_GOOD"; then ok "P4-02 editor: legal dependency payload accepted"; else bad "P4-02 editor: legal dependency rejected"; fi
@@ -187,6 +195,127 @@ cli_run cmd_task_config set "$C_ID" dependency "t_x:IDLE"
 [ "$CLI_RC" -eq 0 ] && bad "P4-02 cli: set illegal dependency accepted" || ok "P4-02 cli: set illegal dependency rejected"
 [ "$(md5sum "$TCFG_DIR/$C_ID.task" | cut -d' ' -f1)" = "$MD5B" ] \
     && ok "P4-02 cli: failed set left task byte-identical" || bad "P4-02 cli: task mutated on failed set"
+
+# ── §graph：依赖图校验（未知依赖/自依赖/环/前向引用/Optional）（P4-03）────
+# dep_validate_graph 直接语义验证（独立目录隔离）
+G1="$T/g-direct"; rm -rf "$G1"; mkdir -p "$G1"
+min_task "$G1" t_a ""
+min_task "$G1" t_b "t_a"
+min_task "$G1" t_c "ghost"
+dep_validate_graph "$G1" && bad "P4-03 graph: unknown dependency allowed" || ok "P4-03 graph: unknown dependency rejected"
+G1ERR=$(dep_validate_graph "$G1" 2>&1 >/dev/null)
+echo "$G1ERR" | grep -q "unknown dependency 'ghost' in 't_c'" \
+    && ok "P4-03 graph: unknown-dep error names dep+owner" || bad "P4-03 graph: unknown-dep err=[$G1ERR]"
+
+G2="$T/g-self"; rm -rf "$G2"; mkdir -p "$G2"
+min_task "$G2" t_a "t_a"
+dep_validate_graph "$G2" && bad "P4-03 graph: self-dependency allowed" || ok "P4-03 graph: self-dependency rejected"
+G2ERR=$(dep_validate_graph "$G2" 2>&1 >/dev/null)
+echo "$G2ERR" | grep -q "self-dependency in 't_a'" \
+    && ok "P4-03 graph: self-dependency error names task" || bad "P4-03 graph: self-dep err=[$G2ERR]"
+
+G3="$T/g-cycle2"; rm -rf "$G3"; mkdir -p "$G3"
+min_task "$G3" t_a "t_b"
+min_task "$G3" t_b "t_a"
+dep_validate_graph "$G3" && bad "P4-03 graph: direct cycle allowed" || ok "P4-03 graph: direct cycle rejected"
+G3ERR=$(dep_validate_graph "$G3" 2>&1 >/dev/null)
+echo "$G3ERR" | grep -q "cycle: t_a->t_b->t_a" \
+    && ok "P4-03 graph: direct cycle path reported (a->b->a)" || bad "P4-03 graph: direct cycle err=[$G3ERR]"
+
+G4="$T/g-cycle3"; rm -rf "$G4"; mkdir -p "$G4"
+min_task "$G4" t_a "t_b"
+min_task "$G4" t_b "t_c"
+min_task "$G4" t_c "t_a"
+dep_validate_graph "$G4" && bad "P4-03 graph: indirect cycle allowed" || ok "P4-03 graph: indirect cycle rejected"
+G4ERR=$(dep_validate_graph "$G4" 2>&1 >/dev/null)
+echo "$G4ERR" | grep -q "cycle: t_a->t_b->t_c->t_a" \
+    && ok "P4-03 graph: indirect cycle path reported" || bad "P4-03 graph: indirect cycle err=[$G4ERR]"
+
+G5="$T/g-fwd"; rm -rf "$G5"; mkdir -p "$G5"
+min_task "$G5" t_b "t_z"
+min_task "$G5" t_z ""
+dep_validate_graph "$G5" && ok "P4-03 graph: forward reference allowed (acyclic, all exist)" || bad "P4-03 graph: forward reference rejected"
+
+G6="$T/g-opt"; rm -rf "$G6"; mkdir -p "$G6"
+min_task "$G6" t_a "?t_b"
+min_task "$G6" t_b "?t_a"
+dep_validate_graph "$G6" && bad "P4-03 graph: Optional cycle allowed" || ok "P4-03 graph: Optional cycle rejected (cycle in '?' edges)"
+G7="$T/g-optu"; rm -rf "$G7"; mkdir -p "$G7"
+min_task "$G7" t_a "?ghost"
+dep_validate_graph "$G7" && bad "P4-03 graph: Optional unknown allowed" || ok "P4-03 graph: Optional unknown rejected"
+
+# ── §apply：tcfg_apply_task 图校验 + 原子性（旧文件逐字节不变）───────────
+GA="$T/g-apply"; rm -rf "$GA"; mkdir -p "$GA"; echo managed > "$GA/MANAGED"
+export TCFG_DIR="$GA"
+tcfg_apply_task t_a "$(ok_task t_a)"   # 新建无依赖
+MD5A=$(md5sum "$GA/t_a.task" | cut -d' ' -f1)
+tcfg_apply_task t_a "$(printf '%s\n' "dependency=ghost" "$(ok_task t_a)")" >/dev/null 2>&1 \
+    && bad "P4-03 apply: unknown dep on edit accepted" || ok "P4-03 apply: unknown dep on edit rejected"
+[ "$(md5sum "$GA/t_a.task" | cut -d' ' -f1)" = "$MD5A" ] \
+    && ok "P4-03 apply: old file byte-identical after unknown-dep rejection" || bad "P4-03 apply: file mutated"
+tcfg_apply_task t_new "$(printf '%s\n' "dependency=ghost" "$(ok_task t_new)")" >/dev/null 2>&1 \
+    && bad "P4-03 apply: new task with unknown dep persisted" || ok "P4-03 apply: new task with unknown dep rejected (not persisted)"
+[ ! -f "$GA/t_new.task" ] && ok "P4-03 apply: rejected new task left no file" || bad "P4-03 apply: t_new.task exists"
+# 直接环：t_b 依赖 t_a（前向/反向引用合法）→ 再令 t_a 依赖 t_b → 成环拒绝
+tcfg_apply_task t_b "$(printf '%s\n' "dependency=t_a" "$(ok_task t_b)")" >/dev/null 2>&1 \
+    && ok "P4-03 apply: adding dep t_a on t_b accepted (acyclic)" || bad "P4-03 apply: acyclic edit rejected"
+tcfg_apply_task t_a "$(printf '%s\n' "dependency=t_b" "$(ok_task t_a)")" >/dev/null 2>&1 \
+    && bad "P4-03 apply: cycle introduced by edit accepted" || ok "P4-03 apply: cycle introduced by edit rejected"
+[ "$(md5sum "$GA/t_a.task" | cut -d' ' -f1)" = "$MD5A" ] \
+    && ok "P4-03 apply: old file byte-identical after cycle rejection" || bad "P4-03 apply: file mutated on cycle"
+# 前向引用（引用后续才创建的任务）无环时允许
+tcfg_apply_task t_z "$(ok_task t_z)"
+tcfg_apply_task t_fwd "$(printf '%s\n' "dependency=t_z" "$(ok_task t_fwd)")" >/dev/null 2>&1 \
+    && [ -f "$GA/t_fwd.task" ] && ok "P4-03 apply: forward reference accepted (acyclic)" || bad "P4-03 apply: forward reference rejected"
+
+# ── §set：tcfg_set_field 写 dependency 图校验 + 原子性 ───────────────────
+GS="$T/g-set"; rm -rf "$GS"; mkdir -p "$GS"; echo managed > "$GS/MANAGED"
+export TCFG_DIR="$GS"
+tcfg_apply_task s_a "$(ok_task s_a)"
+tcfg_apply_task s_b "$(printf '%s\n' "dependency=s_a" "$(ok_task s_b)")"
+MD5S=$(md5sum "$GS/s_a.task" | cut -d' ' -f1)
+tcfg_set_field s_a dependency s_b >/dev/null 2>&1 \
+    && bad "P4-03 set: dependency write introducing cycle accepted" || ok "P4-03 set: dependency write introducing cycle rejected"
+[ "$(md5sum "$GS/s_a.task" | cut -d' ' -f1)" = "$MD5S" ] \
+    && ok "P4-03 set: file byte-identical after rejected set" || bad "P4-03 set: file mutated"
+tcfg_set_field s_a dependency "" >/dev/null 2>&1 \
+    && ok "P4-03 set: clearing dependency accepted" || bad "P4-03 set: clearing dependency rejected"
+SERR=$(tcfg_set_field s_a dependency s_b 2>&1 >/dev/null)
+echo "$SERR" | grep -q "cycle:" && ok "P4-03 set: error message contains concrete reason (cycle:)" || bad "P4-03 set: err=[$SERR]"
+
+# ── §import：整体导入图校验 + config 逐字节不变（B9）─────────────────────
+IM="$T/g-import"; rm -rf "$IM"; mkdir -p "$IM"
+export TCFG_DIR="$IM/task-config"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+min_task "$TCFG_DIR" i_a "i_b"
+min_task "$TCFG_DIR" i_b "i_a"
+printf '08:00 echo x\n' > "$IM/import.cfg"
+IM_MD5=$(md5sum "$IM/import.cfg" | cut -d' ' -f1)
+tcfg_import "$IM/import.cfg" >/dev/null 2>&1 \
+    && bad "P4-03 import: bad existing graph did not block import" || ok "P4-03 import: bad graph blocks import (rc non-0)"
+[ "$(md5sum "$IM/import.cfg" | cut -d' ' -f1)" = "$IM_MD5" ] \
+    && ok "P4-03 import: config byte-identical after rejected import" || bad "P4-03 import: config mutated"
+IT="$T/g-import-ok"; rm -rf "$IT"; mkdir -p "$IT"
+export TCFG_DIR="$IT/task-config"; mkdir -p "$TCFG_DIR"
+printf '08:00 echo x\n' > "$IT/ok.cfg"
+tcfg_import "$IT/ok.cfg" >/dev/null 2>&1 \
+    && ok "P4-03 import: valid legacy config imports fine (graph intact)" || bad "P4-03 import: valid import failed"
+
+# ── §snapshot：快照构建图过滤（KEPT：坏图 → 不替换 current）─────────────
+SN="$T/g-snap"; rm -rf "$SN"; mkdir -p "$SN"; echo managed > "$SN/MANAGED"
+BASE_S="$T/g-snap-base"; rm -rf "$BASE_S"; mkdir -p "$BASE_S/snapshots"
+export TCFG_DIR="$SN"
+export TR_BASE="$BASE_S"
+min_task "$SN" k_a ""
+sched_snapshot_managed "$BASE_S" >/dev/null 2>&1
+CUR1=$(cat "$BASE_S/current" 2>/dev/null)
+[ -n "$CUR1" ] && ok "P4-03 snapshot: valid graph snapshots ok" || bad "P4-03 snapshot: initial snapshot failed"
+min_task "$SN" k_b "k_a"
+min_task "$SN" k_a "k_b"
+sched_snapshot_managed "$BASE_S" >/dev/null 2>&1
+[ "$?" -eq 1 ] && ok "P4-03 snapshot: bad graph -> KEPT (rc=1)" || bad "P4-03 snapshot: KEPT rc=$?"
+[ "$(cat "$BASE_S/current" 2>/dev/null)" = "$CUR1" ] \
+    && ok "P4-03 snapshot: current unchanged (old snapshot kept)" || bad "P4-03 snapshot: current replaced"
+export TCFG_DIR="$T/task-config"
 
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────
 # legacy 解析/执行路径无 dependency/condition 新接线（C2/C4 零改动）

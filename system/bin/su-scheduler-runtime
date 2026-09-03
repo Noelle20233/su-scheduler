@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.20.0"
+RUNTIME_LIB_VERSION="1.21.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2701,6 +2701,24 @@ tcfg_import() {   # <config>
     legacy_adapter_parse "$cfg" "$stage" >/dev/null 2>&1
     arc=$?
 
+    # P4-03：导入整体依赖图校验（未知/自依赖/环）——校验「最终有效集合」=
+    # 既有 task-config + staging 新任务（幂等提升后）。非法 → 拒绝，config 逐字节不变
+    merge="$d/.merge.$$"
+    rm -rf "$merge" 2>/dev/null
+    mkdir -p "$merge" 2>/dev/null || { rm -rf "$stage" "$merge" 2>/dev/null; return 2; }
+    for f in "$d"/*.task; do
+        [ -f "$f" ] && cp "$f" "$merge/" 2>/dev/null
+    done
+    for f in "$stage"/*.task; do
+        [ -f "$f" ] && cp "$f" "$merge/" 2>/dev/null
+    done
+    if ! dep_validate_graph "$merge" "" "" "[task-config] ERROR:"; then
+        rm -rf "$stage" "$merge" 2>/dev/null
+        echo "[task-config] ERROR: import rejected (dependency graph invalid); config unchanged" >&2
+        return 1
+    fi
+    rm -rf "$merge" 2>/dev/null
+
     # ③ 统计并校验 staging 内任务
     n=0; invalid=0
     for f in "$stage"/*.task; do
@@ -2816,6 +2834,19 @@ tcfg_set_field() {   # <id> <key> <value> → 0/1/2
         dependency) dep_validate "$value" || { echo "[task-config] ERROR: invalid dependency '$value' (expect '[?]<task-id>[:STATE]', <= $DEP_MAX entries)" >&2; return 1; } ;;
         condition)  cond_validate "$value" || { echo "[task-config] ERROR: invalid condition (printable ASCII, <= $COND_MAX_LEN chars)" >&2; return 1; } ;;
     esac
+    # P4-03：写 dependency 键后做依赖图校验（未知/自依赖/环）——「当前目录 +
+    # 本字段写改后的有效集合」判定；失败 → 拒绝且原文件逐字节不变
+    if [ "$key" = "dependency" ]; then
+        depg_cfg=""
+        if grep -q "^dependency=" "$f"; then
+            depg_cfg=$(grep -v '^dependency=' "$f")
+        else
+            depg_cfg=$(cat "$f")
+        fi
+        depg_cfg="${depg_cfg}
+dependency=$value"
+        dep_validate_graph "$(tcfg_dir)" "$id" "$depg_cfg" || return 1
+    fi
     tmp="$f.tmp.$$"
     if grep -q "^$key=" "$f"; then
         grep -v "^$key=" "$f" > "$tmp" 2>/dev/null
@@ -2944,6 +2975,13 @@ sched_snapshot_managed() {   # <base> → 0=ok 1=无有效任务(KEPT) 2=硬错�
         fi
     done
     if [ "$n" -eq 0 ]; then
+        rm -rf "$sdir" 2>/dev/null
+        return 1
+    fi
+    # P4-03：快照构建时依赖图过滤——源目录图非法（未知/自依赖/环）→ KEPT：
+    # 不写 current，维持旧快照（config 自愈语义：宁可沿用旧快照不引入坏图）
+    if ! dep_validate_graph "$src" "" "" "[task-config] ERROR:"; then
+        sched_audit "$base" "op=snapshot-managed|rc=1|reason=dependency-graph-invalid|kept=1"
         rm -rf "$sdir" 2>/dev/null
         return 1
     fi
@@ -4070,6 +4108,13 @@ tcfg_editor_validate_payload() {   # <content>
     [ -z "$tedv_advlog" ] && tedv_advlog=0
     tcfg_editor_num "$tedv_advlog" 0 1000000 || { echo "[editor] ERROR: advanced.logging must be 0-1000000" >&2; tedv_err=1; }
     [ "$tedv_err" -eq 0 ] || return 1
+    # P4-03：依赖图校验（未知/自依赖/环）——以「当前目录 + 该 payload 替换原
+    # 文件后的有效集合」判定（apply 前目录是旧内容；payload 本身是新内容）。
+    # 校验失败绝不写盘（调用方 tcfg_apply_task 只在 0 时原子写）。
+    if [ -n "$tedv_id" ]; then
+        dep_validate_graph "$(tcfg_dir)" "$tedv_id" "$tedv_content" "[editor] ERROR:" || tedv_err=1
+    fi
+    [ "$tedv_err" -eq 0 ] || return 1
     return 0
 }
 # 原子应用：<id> <content> → 0=成功 1=校验失败（不写盘） 2=硬错误
@@ -4610,6 +4655,171 @@ cond_validate() {
     printf '%s' "$condv_raw" | grep -q '[^ -~]' && return 1   # 非可打印 ASCII / 控制符
     return 0
 }
+
+# 依赖图校验（P4-03）：遍历 <dir> 全部 .task 构建 id 集合 + 依赖边，执行
+# 未知依赖 / 自依赖 / 环检测。返回 0=无环且引用完整；非 0=拒绝（错误消息
+# 写 stderr，含具体原因：unknown dependency 'x' in 't_a' / self-dependency /
+# cycle: a->b->c->a）。
+# 参数：
+#   <dir>       task-config 目录（覆盖文件 = 目录内该 id 的替身，见 <content>）
+#   [<id>]      （可选）本次待写任务 id；提供 <content> 时覆盖该 id 的内容
+#   [<content>] （可选）<id> 的新内容（字面内容，非文件路径），用于「替换后有效
+#               集合」校验（tcfg_apply_task / tcfg_set_field）；缺省 = 按目录
+#               现状校验
+#   [<prefix>]  （可选）错误消息前缀，缺省 "[task-config] ERROR:"
+# 语义（P4-03 ADR，见 docs/architecture/dependency-schema.md）：
+#   - 前向引用允许：只要求最终 id 集合全部存在且图无环；
+#   - Optional（`?`）条目同样参与未知/环校验（引用关系即边）；
+#   - 自依赖 = 环特例，单独报 self-dependency；
+#   - 检测算法 = 简单 DFS（N≤32×任务数，POSIX sh 可实现），不引入通用 DAG
+#     调度器（P4 明确禁止）。
+# 命名空间：dep_ 前缀函数、内部全局 depg_ 前缀（防覆盖调用方全局，同 §26）。
+# ═══════════════════════════════════════════════════════════════════════════
+dep_validate_graph() {   # <dir> [<id>] [<content>] [<prefix>]
+    depg_dir=$1
+    depg_oid=${2:-}
+    depg_ocontent=${3:-}
+    depg_prefix=${4:-[task-config] ERROR:}
+    [ -d "$depg_dir" ] || { echo "${depg_prefix} dependency graph: directory not found: $depg_dir" >&2; return 1; }
+    depg_nodes=""
+    depg_adj=""
+    depg_ofile=""
+    if [ -n "$depg_ocontent" ]; then
+        depg_ofile=$(mktemp "/tmp/depg.XXXXXX" 2>/dev/null) || { echo "${depg_prefix} dependency graph: temp file failed" >&2; return 1; }
+        printf '%s\n' "$depg_ocontent" > "$depg_ofile" 2>/dev/null || { rm -f "$depg_ofile" 2>/dev/null; echo "${depg_prefix} dependency graph: temp write failed" >&2; return 1; }
+    fi
+    depg_fp=""
+    for depg_fp in "$depg_dir"/*.task; do
+        [ -f "$depg_fp" ] || continue
+        depg_node=$(basename "$depg_fp" .task)
+        case " $depg_nodes " in
+            *" $depg_node "*) continue ;;
+        esac
+        # 覆盖节点（本次待写）从 <content> 读取，不读磁盘旧文件
+        if [ -n "$depg_ofile" ] && [ "$depg_node" = "$depg_oid" ]; then
+            continue
+        fi
+        depg_eff="$depg_fp"
+        depg_sv=$(grep '^schema_version=' "$depg_eff" 2>/dev/null | head -1 | cut -d= -f2-)
+        depg_id=$(grep '^id=' "$depg_eff" 2>/dev/null | head -1 | cut -d= -f2-)
+        depg_tr=$(grep '^trigger=' "$depg_eff" 2>/dev/null | head -1 | cut -d= -f2-)
+        [ "$depg_sv" = "2" ] && [ "$depg_id" = "$depg_node" ] && [ -n "$depg_tr" ] || continue
+        depg_dep=$(grep '^dependency=' "$depg_eff" 2>/dev/null | head -1 | cut -d= -f2-)
+        depg_norm=$(dep_normalize "$depg_dep")
+        depg_edges=""
+        depg_t=""
+        if [ -n "$depg_norm" ]; then
+            depv_tokens=$(printf '%s' "$depg_norm" | sed 's/,/ /g')
+            for depg_t in $depv_tokens; do
+                depg_tgt=$depg_t
+                case "$depg_tgt" in
+                    "?"*) depg_tgt=${depg_tgt#\?} ;;
+                esac
+                case "$depg_tgt" in
+                    *:*) depg_tgt=${depg_tgt%%:*} ;;
+                esac
+                case " $depg_edges " in
+                    *" $depg_tgt "*) continue ;;
+                esac
+                depg_edges="$depg_edges $depg_tgt"
+            done
+        fi
+        depg_nodes="$depg_nodes $depg_node"
+        depg_adj="$depg_adj
+$depg_node|$depg_edges"
+    done
+    # 覆盖节点（存在与否都要参与图校验——新建/编辑任务的依赖边来自 payload）
+    if [ -n "$depg_ofile" ] && [ -n "$depg_oid" ]; then
+        depg_sv=$(grep '^schema_version=' "$depg_ofile" 2>/dev/null | head -1 | cut -d= -f2-)
+        depg_id=$(grep '^id=' "$depg_ofile" 2>/dev/null | head -1 | cut -d= -f2-)
+        depg_tr=$(grep '^trigger=' "$depg_ofile" 2>/dev/null | head -1 | cut -d= -f2-)
+        if [ "$depg_sv" = "2" ] && [ "$depg_id" = "$depg_oid" ] && [ -n "$depg_tr" ]; then
+            depg_dep=$(grep '^dependency=' "$depg_ofile" 2>/dev/null | head -1 | cut -d= -f2-)
+            depg_norm=$(dep_normalize "$depg_dep")
+            depg_edges=""
+            depg_t=""
+            if [ -n "$depg_norm" ]; then
+                depv_tokens=$(printf '%s' "$depg_norm" | sed 's/,/ /g')
+                for depg_t in $depv_tokens; do
+                    depg_tgt=$depg_t
+                    case "$depg_tgt" in
+                        "?"*) depg_tgt=${depg_tgt#\?} ;;
+                    esac
+                    case "$depg_tgt" in
+                        *:*) depg_tgt=${depg_tgt%%:*} ;;
+                    esac
+                    case " $depg_edges " in
+                        *" $depg_tgt "*) continue ;;
+                    esac
+                    depg_edges="$depg_edges $depg_tgt"
+                done
+            fi
+            depg_nodes="$depg_nodes $depg_oid"
+            depg_adj="$depg_adj
+$depg_oid|$depg_edges"
+        fi
+    fi
+    [ -n "$depg_ofile" ] && rm -f "$depg_ofile" 2>/dev/null
+
+    depg_ok=1
+    depg_n=""
+    depg_adjline=""
+    for depg_n in $depg_nodes; do
+        depg_adjline=$(printf '%s\n' "$depg_adj" | grep "^$depg_n|" | head -1)
+        depg_targets=${depg_adjline#*|}
+        depg_target=""
+        for depg_target in $depg_targets; do
+            case " $depg_nodes " in
+                *" $depg_target "*) ;;
+                *) depg_ok=0; echo "${depg_prefix} unknown dependency '$depg_target' in '$depg_n'" >&2 ;;
+            esac
+            [ "$depg_target" = "$depg_n" ] && { depg_ok=0; echo "${depg_prefix} self-dependency in '$depg_n'" >&2; }
+        done
+    done
+
+    depg_visited=""
+    depg_done=""
+    depg_cyc=""
+    depg_start=""
+    for depg_start in $depg_nodes; do
+        case " $depg_done " in
+            *" $depg_start "*) continue ;;
+        esac
+        depg_dfs "$depg_start" "->$depg_start"
+    done
+    [ "$depg_ok" -eq 0 ] && return 1
+    return 0
+}
+
+# DFS 助手（dep_validate_graph 内部）：<node> <curpath>；全局 depg_* 复用
+depg_dfs() {
+    depg_x=$1
+    depg_curpath=$2
+    case " $depg_visited " in
+        *" $depg_x "*) return 0 ;;
+    esac
+    depg_visited="$depg_visited $depg_x"
+    depg_adjline=$(printf '%s\n' "$depg_adj" | grep "^$depg_x|" | head -1)
+    depg_targets=${depg_adjline#*|}
+    depg_t=""
+    for depg_t in $depg_targets; do
+        [ "$depg_t" = "$depg_x" ] && continue
+        case "$depg_curpath" in
+            *"->$depg_t->"*)
+                depg_ok=0
+                depg_cyc=$(printf '%s' "$depg_curpath" | sed 's/^->//')
+                depg_cyc="${depg_cyc}->${depg_t}"
+                echo "${depg_prefix} cycle: $depg_cyc" >&2
+                ;;
+        esac
+        case " $depg_visited " in
+            *" $depg_t "*) continue ;;
+        esac
+        depg_dfs "$depg_t" "$depg_curpath->$depg_t"
+    done
+    depg_done="$depg_done $depg_x"
+    return 0
+}
 # ────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
@@ -4647,7 +4857,8 @@ runtime_lib_selfcheck() {
               secv_id_ok secv_num_clamp secv_inside secv_nosymlink \
                secv_guard_task_dir secv_ipc_ratelimit secv_sweep_tmp \
                secv_fix_perms secv_effective_timeout runtime_limit_task_log \
-               dep_normalize dep_entry_ok dep_validate cond_validate; do
+               dep_normalize dep_entry_ok dep_validate cond_validate \
+               dep_validate_graph; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
