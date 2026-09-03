@@ -64,6 +64,10 @@
 #       执行→Task v2 导入→Registry 调度→WebUI Dashboard→Task Editor 保存/回滚→App Action
 #       →Process/Port Health→Retry/Cooldown 钳制→Crash Loop→Task 控制→配置损坏回退→
 #       旧 CLI 查询→日志轮转→重启状态恢复 端到端协同，48 断言）
+#   L2  tests/p4-dependency/test.sh P4-02 Dependency/Condition Schema 与持久化
+#       （逗号规范写回/空格容错规范化、[?]id[:STATE] 解析、condition 可打印 ASCII 上限、
+#       DEP_MAX/COND_MAX_LEN、editor/store/CLI 后端权威校验、非法拒绝且原文件逐字节不变、
+#       Legacy 零影响、POSIX）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -150,6 +154,7 @@ else
         "tests/security/permission.sh" \
         "tests/resource/stress.sh" \
         "tests/p3-integration/test.sh" \
+        "tests/p4-dependency/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

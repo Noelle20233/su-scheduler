@@ -13,7 +13,7 @@
 # 覆盖（P3-09「必须覆盖」18 项）：
 #   1) 模块安装和卸载           —— ksud module list 显示 + 文件落点 + 卸载恢复
 #   2) daemon 开机启动          —— service.sh FBE 等待后拉起 + status Alive
-#   3) Runtime Library 加载     —— daemon log 记录 Runtime v1.19.0 loaded
+#   3) Runtime Library 加载     —— daemon log 记录 Runtime v1.20.0 loaded
 #   4) Legacy 配置继续执行      —— legacy add/list + daemon 执行（旧路径）
 #   5) Task v2 导入             —— task-config import → managed + .task
 #   6) Registry 正式调度        —— scheduler audit mode=managed reload/tick + boot 任务
@@ -152,10 +152,10 @@ echo "$DS" | grep -qi "Alive" && ok "2-boot: daemon alive via service.sh (boot-s
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3) Runtime Library 加载（daemon log 记录 Runtime v1.19.0 loaded）
+# 3) Runtime Library 加载（daemon log 记录 Runtime v1.20.0 loaded）
 # ═══════════════════════════════════════════════════════════════════════════
 RL=$(adb shell "su -c 'tail -200 $DATA/su-scheduler.log'" 2>/dev/null | grep -m1 "Runtime library loaded" | tr -d '\r')
-echo "$RL" | grep -q "v1.19.0" && ok "3-runtime: daemon loaded Runtime v1.19.0" || bad "3-runtime: load line=[$RL]"
+echo "$RL" | grep -q "v1.20.0" && ok "3-runtime: daemon loaded Runtime v1.20.0" || bad "3-runtime: load line=[$RL]"
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════

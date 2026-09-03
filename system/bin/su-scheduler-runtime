@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.19.0"
+RUNTIME_LIB_VERSION="1.20.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2651,6 +2651,12 @@ tcfg_validate_task() {   # <file> → 0 合法 / 1 非法（绝不清空、绝�
     [ -n "$tcfgv_id" ] && [ "$tcfgv_id" = "$tcfgv_base" ] || return 1
     tcfgv_tr=$(tcfg_get "$tcfgv_f" trigger)
     [ -n "$tcfgv_tr" ] || return 1
+    # P4-02：dependency/condition 字段做存储层语法 sanity（缺省/空即合法；
+    # 非法 → 该条目非法，绝不清空/退出，B9 原子性由调用方保证）
+    tcfgv_dep=$(tcfg_get "$tcfgv_f" dependency)
+    dep_validate "$tcfgv_dep" || return 1
+    tcfgv_cond=$(tcfg_get "$tcfgv_f" condition)
+    cond_validate "$tcfgv_cond" || return 1
     return 0
 }
 
@@ -2805,6 +2811,11 @@ tcfg_set_field() {   # <id> <key> <value> → 0/1/2
     tcfg_is_managed || { echo "[task-config] ERROR: not managed (import first)" >&2; return 1; }
     f=$(tcfg_task_file "$id")
     [ -f "$f" ] || { echo "[task-config] ERROR: task not found: $id" >&2; return 1; }
+    # P4-02：dependency/condition 走后端权威校验；非法 → 拒绝且原文件逐字节不变
+    case "$key" in
+        dependency) dep_validate "$value" || { echo "[task-config] ERROR: invalid dependency '$value' (expect '[?]<task-id>[:STATE]', <= $DEP_MAX entries)" >&2; return 1; } ;;
+        condition)  cond_validate "$value" || { echo "[task-config] ERROR: invalid condition (printable ASCII, <= $COND_MAX_LEN chars)" >&2; return 1; } ;;
+    esac
     tmp="$f.tmp.$$"
     if grep -q "^$key=" "$f"; then
         grep -v "^$key=" "$f" > "$tmp" 2>/dev/null
@@ -4018,6 +4029,10 @@ tcfg_editor_validate_payload() {   # <content>
             advanced.environment) tedv_advenv=$tedv_val ;;
             advanced.concurrency) tedv_advconc=$tedv_val ;;
             advanced.logging) tedv_advlog=$tedv_val ;;
+            dependency)
+                dep_validate "$tedv_val" || { echo "[editor] ERROR: dependency syntax invalid (got '$tedv_val'; expect '[?]<task-id>[:STATE]', ',' or space separated, <= $DEP_MAX entries)" >&2; tedv_err=1; } ;;
+            condition)
+                cond_validate "$tedv_val" || { echo "[editor] ERROR: condition invalid (got '$tedv_val'; printable ASCII, <= $COND_MAX_LEN chars)" >&2; tedv_err=1; } ;;
             source.*|runtime.*) : ;;   # 只读保留字段（编辑器不可改）
             *) echo "[editor] ERROR: unknown key '$tedv_key' (editor schema)" >&2; tedv_err=1 ;;
         esac
@@ -4514,6 +4529,88 @@ runtime_limit_task_log() {
     return 0
 }
 # ────────────────────────────────────────────────────────────────────────
+# §26 Dependency & Condition Schema（P4-02）
+# ────────────────────────────────────────────────────────────────────────
+# Task v2 `dependency=`/`condition=` 字段的解析语义 + 后端权威校验（managed
+# 域；Legacy config.txt 零改动，C4）。本层只做**存储层安全校验与规范化**，
+# 不做求值/门控（P4-06）与存在性/环检测（P4-03）。
+# 语法（ADR D1/D2，见 docs/architecture/dependency-schema.md）：
+#   dependency  = <entry>[, <entry> ...]         规范保存=逗号分隔（D1）；
+#                解析同时容忍空格/制表符作分隔（兼容早期 schema 描述）。
+#   <entry>     = [?]<task-id>[:<STATE>]
+#                 ?          前缀 = Optional（缺省 Required）
+#                 :<STATE>   指定期望终态；STATE ∈ {STOPPED, FAILED}（TSM 两
+#                            终态）；缺省 = STOPPED（「已执行成功」）
+#                 <task-id>  须过既有 id 字符集（tcfg_editor_id_ok 规则
+#                            [A-Za-z0-9_.-]、无 `..`/`/`/`*`、非空）
+#   上限：单任务依赖条数 ≤ DEP_MAX；超则拒绝（常量供 P4-10 复用）。
+#   condition = <expr>：单行可打印 ASCII（拒绝换行/控制符）、长度 ≤ COND_MAX_LEN、
+#                空/缺省 = 无条件（恒真占位）。完整表达式文法白名单归 P4-06。
+# 命名空间：dep_/cond_ 前缀函数，内部全局 depv_/condv_ 前缀（防覆盖调用方）。
+# ═══════════════════════════════════════════════════════════════════════════
+DEP_MAX=${DEP_MAX:-32}
+COND_MAX_LEN=${COND_MAX_LEN:-256}
+
+# 规范化 dependency 值：<raw> → 逗号分隔规范串（空格/制表符→逗号、去空段、去首尾逗号）。
+# 仅应在 dep_validate 通过后用于写回/回显。
+dep_normalize() {
+    depv_raw=$1
+    printf '%s' "$depv_raw" | tr ', ' ',' | tr -s ',' | sed 's/^,//; s/,$//'
+}
+
+# 校验单条 entry：<entry> → 0=合法 1=非法（语法/保留符号/id 字符集/STATE 枚举）
+dep_entry_ok() {
+    depv_e=$1
+    [ -n "$depv_e" ] || return 1
+    case "$depv_e" in
+        "?"*) depv_e=${depv_e#\?} ;;
+    esac
+    [ -n "$depv_e" ] || return 1          # 仅 "?"（无 id）
+    case "$depv_e" in
+        *:*)
+            depv_id=${depv_e%%:*}
+            depv_state=${depv_e#*:}
+            [ -n "$depv_id" ] || return 1 # 空 id（:STATE）
+            case "$depv_state" in
+                STOPPED|FAILED) ;;
+                *) return 1 ;;            # STATE 枚举外
+            esac
+            ;;
+        *)
+            depv_id=$depv_e
+            ;;
+    esac
+    tcfg_editor_id_ok "$depv_id" || return 1   # id 字符集 + 无路径穿越
+    return 0
+}
+
+# 校验整串 dependency 值：<raw> → 0=合法 1=非法（含控制符拒绝、条数上限、逐条语法）
+dep_validate() {
+    depv_raw=$1
+    printf '%s' "$depv_raw" | awk 'END { if (NR > 1) exit 1; exit 0 }' || return 1   # 嵌入换行
+    printf '%s' "$depv_raw" | grep -q '[^ -~]' && return 1    # 非可打印 ASCII / 控制符
+    [ -z "$depv_raw" ] && return 0                            # 空 = 无依赖，合法
+    depv_tokens=$(printf '%s' "$depv_raw" | sed 's/,/ /g')    # 逗号→空格，与空白容错统一
+    depv_i=0
+    for depv_t in $depv_tokens; do                            # IFS 默认分词（空格/制表/换行）
+        depv_i=$((depv_i + 1))
+        [ "$depv_i" -le "$DEP_MAX" ] || return 1              # 超上限
+        dep_entry_ok "$depv_t" || return 1
+    done
+    [ "$depv_i" -ge 1 ] || return 1                           # 全分隔符（空依赖）
+    return 0
+}
+
+# 校验 condition 值：<raw> → 0=合法 1=非法（可打印 ASCII、长度上限、空=无条件）
+cond_validate() {
+    condv_raw=$1
+    [ ${#condv_raw} -le "$COND_MAX_LEN" ] || return 1
+    [ -z "$condv_raw" ] && return 0                           # 空/缺省 = 无条件（恒真）
+    printf '%s' "$condv_raw" | awk 'END { if (NR > 1) exit 1; exit 0 }' || return 1   # 嵌入换行
+    printf '%s' "$condv_raw" | grep -q '[^ -~]' && return 1   # 非可打印 ASCII / 控制符
+    return 0
+}
+# ────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -4548,8 +4645,9 @@ runtime_lib_selfcheck() {
               tctl_resolve tctl_state tctl_start tctl_stop tctl_restart \
               tctl_check tctl_logs tctl_set_enabled ipc_op_check \
               secv_id_ok secv_num_clamp secv_inside secv_nosymlink \
-              secv_guard_task_dir secv_ipc_ratelimit secv_sweep_tmp \
-              secv_fix_perms secv_effective_timeout runtime_limit_task_log; do
+               secv_guard_task_dir secv_ipc_ratelimit secv_sweep_tmp \
+               secv_fix_perms secv_effective_timeout runtime_limit_task_log \
+               dep_normalize dep_entry_ok dep_validate cond_validate; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

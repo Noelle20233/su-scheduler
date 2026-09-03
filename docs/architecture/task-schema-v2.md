@@ -77,7 +77,7 @@
 | `action.run_once_now` | bool | C | 0 | 立即执行并修剪（`--run-once-now`） |
 | `action.boot` | bool | C | 0 | **保留标志**：文档化 `--boot`，daemon 尚未实现（P1-01 Q10/D5） |
 | `action.msg` | string | C | 空 | 自定义通知文案（`--msg="…"`，仅双引号形式） |
-| `dependency` | list(string) | D | 空 | 依赖任务 id 列表；P1 保留 |
+| `dependency` | list(string) | D | 空 | 依赖 entry 列表（P4-02：逗号分隔 `[?]id[:STATE]`，见 §5） |
 | `health.type` | string | D | `none` | 健康策略类型；P1 保留 |
 | `recovery.type` | string | D | `none` | 失败恢复策略；P1 保留 |
 | `retry.max` | int | D | 0 | 重试上限；0 = 不重试 |
@@ -128,9 +128,13 @@
 - **trigger**：legacy 触发原文（`boot` / `HHMM` / `HH:MM` / `weekly:…` / `nweekly:…` /
   `monthly:…` / `nmonthly:…` / `yearly:…`）。**不做任何归一化**（去冒号只在匹配比较
   时由 daemon 现算，见 P1-01 §4.2；yearly 文档/实现格式差异 Q9 原样保留）。
-- **condition / dependency / health.type / recovery.type**：P1 策略占位。
-  - `condition` 空 = 恒真；非空值语法上合法但 P1 **不解释、不执行**；
-  - `dependency` 空列表；存 id 列表（空格分隔；id charset 无空格，可安全切分）；
+- **condition / dependency / health.type / recovery.type**：
+  - `condition` 空 = 恒真；非空值语法上合法但 **P1 不解释、不执行**。P4-02 起
+    存储层约束：可打印 ASCII、≤256、空=无条件（求值文法归 P4-06）；
+  - `dependency` 空列表；P4-02 起语法 = 逗号分隔的 `[?]<task-id>[:<STATE>]`
+    entry 列表（规范写回用逗号；解析容忍空格/制表符），每项 id 过 id charset、
+    STATE ∈ {STOPPED, FAILED}（缺省 STOPPED）、条数 ≤ DEP_MAX。详见
+    `docs/architecture/dependency-schema.md`（ADR D1/D2/D4）；
   - `health.type`/`recovery.type` = `none` 为唯一缺省；其他字符串 P1 接受但无行为
     （未来任务定义枚举）。
 - **retry.max / retry.interval**：`0` 表示不重试；非法（负值/非数字）→ 回退缺省并告警。

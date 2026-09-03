@@ -42,11 +42,11 @@
 | `name` | string | 可打印、≤64 字符 | 含控制符/超长 | 回退：截断 40；空 → `task` | 超长截断属宽容处理 |
 | `enabled` | bool | `0` 或 `1` | `yes`/`true`/`2`/空 | 回退：`1` | **不**接受模糊真值（避免语义漂移） |
 | `trigger` | string | 非空、可打印、无控制符；**其余任意**（C4 原样） | 空/控制符 | 回退：条目隔离（无触发器 = 无调度依据） | 不做格式白名单——legacy 触发器格式由 daemon 匹配层决定（P1-01 §4.2），模型不收紧 |
-| `condition` | string | 可打印、≤256 | 控制符 | 回退：空 | P1 不解释内容；仅存 |
+| `condition` | string | 可打印、≤256 | 控制符/换行/超长 | 回退：空 | P4-02：可打印 ASCII、空=无条件恒真；求值文法归 P4-06 |
 | `action.command` | string | 可打印（允许 `\n` 转义与 `\\` 转义） | 未转义的原始控制符 | 回退：空字符串（空命令 = legacy `sh -c ""` 语义，exit 0） | 命令原样保留（含怪癖残留） |
 | `action.notify_start` 等 6 个 bool | bool | `0` 或 `1` | 其他 | 回退：`0` | `action.boot` 同上 |
 | `action.msg` | string | 可打印、≤256 | 控制符/超长 | 回退：空 | 双引号形式为 legacy 语义（Q11） |
-| `dependency` | list | id 列表（空格分隔），每项须过 id charset | 含非法 id 字符 | 忽略非法项 + 告警，保留合法项 | 空列表合法 |
+| `dependency` | list | `[?]<task-id>[:<STATE>]` 逗号分隔（解析容忍空格/制表符），每项 id 过 charset、STATE ∈ {STOPPED,FAILED}、条数 ≤32 | 非法 id 字符/`..`/`/`/`*`/STATE 枚举外/超上限 | 忽略非法项 + 告警，保留合法项（P4-02 起 editor/store 为拒绝） | 空列表合法；详见 `docs/architecture/dependency-schema.md` |
 | `health.type` / `recovery.type` | string | `none`（P1 唯一缺省；其他接受） | 控制符 | 回退：`none` | P1 不定义其他枚举语义 |
 | `retry.max` | int | ≥0 | 负值/非数字 | 回退：`0` | |
 | `retry.interval` | int | ≥1 | ≤0/非数字 | 回退：`60` | |

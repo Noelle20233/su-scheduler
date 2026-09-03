@@ -86,8 +86,14 @@ out=$(TRIGGER_TODAY="$MON" trigger_decide "$BASE" t20_weekly10800 0800 0 "$SF")
 cp "$SF" "$T/sf.after"
 cmp -s "$T/sf.before" "$T/sf.after" && ok "P2-05 dedup: advanced decision read-only (state file unchanged)" || bad "P2-05 dedup: state file written by decision layer (forbidden)"
 
-# ── 6) 不引入 Dependency / Condition / 新 Trigger ────────────────────────
-sed 's/^[ \t]*#.*$//' "$RTLIB" | grep -E 'dependency|condition' | grep -vE '(dependency|condition)=' | grep -q . && bad "P2-05 constraint: dependency/condition logic in lib (beyond reserved empty schema keys)" || ok "P2-05 constraint: no dependency/condition logic in lib §10 (only reserved empty schema keys condition=/dependency=)"
+# ── 6) 不引入 Dependency / Condition 门控 / 新 Trigger ────────────────────
+# P2-05 原断言守卫「lib 零 dependency/condition 判定」；P4-02 契约变更后在 §19/§23/
+# §26 引入 dependency/condition **存储 schema 校验**（Task v2 字段校验，非触发决策
+# 层）。故把断言**收窄到触发决策层 §10**（trigger_decide/provider_dispatch 范围）：
+# 决策层不得对 dependency/condition 做门控判定（P4-04 才接线 WAITING 门控）；
+# §19/§23/§26 的存储校验与 `dependency=`/`condition=` schema 键除外。
+S10=$(sed -n '/^# §10 Trigger Decision Layer/,/^# §11 Action Execution Layer/p' "$RTLIB")
+printf '%s\n' "$S10" | sed 's/^[ \t]*#.*$//' | grep -E 'dependency|condition' | grep -vE '(dependency|condition)=' | grep -q . && bad "P2-05 constraint: dependency/condition gating logic in trigger decision layer (§10)" || ok "P2-05 constraint: trigger decision layer (§10) has no dependency/condition gating (P2-05 §10 only)"
 grep -qE 'weekly:|nweekly:|monthly:|nmonthly:|yearly:' "$RTLIB" && ok "P2-05 constraint: advanced family only boot/time/advanced families (no new triggers)" || bad "P2-05 constraint: advanced families missing"
 
 # ── 7) 新旧触发结果一致（registry trigger_decide vs legacy 行镜像，同 Provider）──

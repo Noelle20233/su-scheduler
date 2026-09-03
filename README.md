@@ -1489,6 +1489,7 @@ bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检�
 | L2 | 安全与资源加固（P3-08 文件安全：secv_fix_perms 强制 0700/600、原子写 tmp 清理、secv_sweep_tmp、未授权写 permission_denied） | `tests/security/permission.sh` |
 | L2 | 安全与资源加固（P3-08 资源安全：100 Task 单循环无 100 永久循环、日志/快照/任务目录上限、单任务错误隔离、IPC 频率限制 rc 7、CPU/内存有界） | `tests/resource/stress.sh` |
 | L2 | P3 综合回归（P3-09：安装契约→daemon 生命周期/Runtime 加载→Legacy 继续执行→Task v2 导入→Registry 调度→WebUI Dashboard→Task Editor 保存/回滚→App Action→Process/Port Health→Retry/Cooldown 钳制→Crash Loop→Task 控制→配置损坏回退→旧 CLI 查询→日志轮转→重启状态恢复 端到端协同，48 断言） | `tests/p3-integration/test.sh` |
+| L2 | Dependency/Condition Schema 与持久化（P4-02：`dependency=a,b,c` 逗号规范写回/空格容错规范化、`[?]<task-id>[:<STATE>]` 单条语法、STATE ∈ {STOPPED,FAILED}、condition 可打印 ASCII ≤256、DEP_MAX=32/COND_MAX_LEN=256、editor/store/CLI 后端权威校验、非法拒绝且原文件逐字节不变、Legacy 零影响） | `tests/p4-dependency/test.sh` |
 | L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
 | L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
 | L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |
