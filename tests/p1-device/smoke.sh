@@ -46,15 +46,39 @@ adb devices | grep -qw "device" || {
 CONFIG="/sdcard/Documents/su-scheduler/config.txt"
 DATA="/data/adb/su-scheduler"
 
+# ── 预置：确保 legacy 模式（p1-device 是 legacy 配置冒烟）─────────────────
+# P3-09：若设备处于 managed 模式（上一轮 p3-device 或手工导入残留），daemon 会
+# 以 Registry 为权威、忽略 config.txt，导致本套件基于 config.txt 的用例误 FAIL。
+# 开始前移除 MANAGED 标记 + 测试 .task 并重启 daemon，回到确定性的 legacy 基线。
+adb shell "su -c 'rm -f $DATA/task-config/MANAGED 2>/dev/null
+rm -f $DATA/task-config/t1_boot.task $DATA/task-config/t2_0830.task $DATA/task-config/hproc.task $DATA/task-config/hport.task $DATA/task-config/edit1.task 2>/dev/null
+rm -rf $DATA/task-config.bak 2>/dev/null
+sed -i \"/legacy-device-ok/d; /ss-import/d\" $CONFIG 2>/dev/null
+# 清除 crash guard：中断残留会让 daemon 处于降级窗口（fast-exit 不跑 boot 任务）
+rm -f $DATA/runtime/daemon.guard 2>/dev/null
+su-scheduler restart >/dev/null 2>&1'" 2>/dev/null
+W=0
+while [ "$W" -lt 40 ]; do
+    PR=$(adb shell "su -c 'su-scheduler status 2>/dev/null'" 2>/dev/null | tr -d '\r')
+    echo "$PR" | grep -qi "Alive" && break
+    sleep 2; W=$((W + 2))
+done
+
 # 1) daemon 存活
 adb shell "su -c 'su-scheduler status'" 2>/dev/null | grep -qi "Alive" && ok "daemon alive" || bad "daemon status"
 
 # 2) boot 任务：临时配置 boot 行
+# P3-09：固定 sleep 3 在慢启动设备（daemon 重启 + boot 执行可 >3s）上过早判定 → 改有界轮询
 TMPCFG=$(adb shell "mktemp /data/local/tmp/ss-smoke.XXXXXX" 2>/dev/null | tr -d '\r')
 adb shell "printf 'boot echo boot-smoke-ok > /data/local/tmp/ss-boot-marker\\n' > '$TMPCFG'" 2>/dev/null
 adb shell "su -c 'cp $CONFIG \$CONFIG.bak; cp $TMPCFG $CONFIG; su-scheduler restart'" >/dev/null 2>&1
-sleep 3
-adb shell "cat /data/local/tmp/ss-boot-marker 2>/dev/null" | grep -q "boot-smoke-ok" && ok "boot task ran after restart" || bad "boot marker"
+W=0; BM=""
+while [ "$W" -lt 30 ]; do
+    BM=$(adb shell "cat /data/local/tmp/ss-boot-marker 2>/dev/null" 2>/dev/null | tr -d '\r')
+    [ "$BM" = "boot-smoke-ok" ] && break
+    sleep 2; W=$((W + 2))
+done
+echo "$BM" | grep -q "boot-smoke-ok" && ok "boot task ran after restart" || bad "boot marker"
 adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
 
 # 3) 时间任务（+2min）
@@ -70,11 +94,23 @@ adb shell "cat /data/local/tmp/ss-time-marker 2>/dev/null" | grep -q "time-smoke
 adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
 
 # 4) --run-once-now：立即执行 + 配置修剪
+# P3-09：固定 sleep 3 在慢启动设备上过早判定（同 boot 用例）→ 改有界轮询 marker + 修剪
 adb shell "printf '$HHMM echo ron-ok > /data/local/tmp/ss-ron-marker; : --run-once-now\\n' > /data/local/tmp/ss-ron.cfg" 2>/dev/null
 adb shell "su -c 'cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-ron.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
-sleep 3
-adb shell "cat /data/local/tmp/ss-ron-marker 2>/dev/null" | grep -q "ron-ok" && ok "run-once-now executed immediately" || bad "run-once-now"
-adb shell "su -c 'grep -c -- --run-once-now $CONFIG'" 2>/dev/null | grep -q "0" && ok "run-once-now pruned from config" || bad "prune"
+W=0; RON=""
+while [ "$W" -lt 30 ]; do
+    RON=$(adb shell "cat /data/local/tmp/ss-ron-marker 2>/dev/null" 2>/dev/null | tr -d '\r')
+    [ "$RON" = "ron-ok" ] && break
+    sleep 2; W=$((W + 2))
+done
+echo "$RON" | grep -q "ron-ok" && ok "run-once-now executed immediately" || bad "run-once-now"
+W=0; PRUNE=""
+while [ "$W" -lt 30 ]; do
+    PRUNE=$(adb shell "su -c 'grep -c -- --run-once-now $CONFIG'" 2>/dev/null | tr -d '\r')
+    [ "$PRUNE" = "0" ] && break
+    sleep 2; W=$((W + 2))
+done
+echo "$PRUNE" | grep -q "0" && ok "run-once-now pruned from config" || bad "prune"
 adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
 
 # 5) --delete：行移除（P2-01 修正 ×2：① daemon 侧 Q13 修复——单激活行时
