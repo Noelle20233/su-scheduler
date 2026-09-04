@@ -764,10 +764,10 @@ rtick() {   # <now> → 单次调度周期 + 终态对账
 }
 rexec_count() { grep -c "$1" "$R_EXEC" 2>/dev/null || echo 0; }
 
-# 版本一致性：RUNTIME_LIB_VERSION = 1.27.0（P4-09 递增，B5 版本线同步）
-[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.27.0" ] \
-    && ok "P4-09 version: RUNTIME_LIB_VERSION=1.27.0 (P4-09 observability surface)" \
-    || bad "P4-09 version: RUNTIME_LIB_VERSION=$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')"
+# 版本一致性：RUNTIME_LIB_VERSION = 1.28.0（P4-10 递增，B5 版本线同步）
+[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.28.0" ] \
+    && ok "P4-10 version: RUNTIME_LIB_VERSION=1.28.0 (P4-10 security/resource/compat hardening)" \
+    || bad "P4-10 version: RUNTIME_LIB_VERSION=$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')"
 
 # R1) FAILED>WAITING 退避接线：retry.max=1 任务执行失败 → FAILED → 下一 tick 接
 #     FAILED>WAITING（retry.until 落盘 + rearm 事件 + 退避期间不执行）
@@ -1039,6 +1039,73 @@ printf '%s\n' "$OST" | grep -q '^Gate: WAITING (retry backoff' \
     && ok "P4-09 O4: task status Gate line reports retry backoff" \
     || bad "P4-09 O4: Gate=[$(printf '%s\n' "$OST" | grep '^Gate:')]"
 rm -f "$O_REQ"/*.req "$O_BASE/ipc/responses"/*.resp 2>/dev/null
+
+# ── §hard-p4-10：安全/资源/兼容性加固复核（P4-10 出口）────────────────────
+# 语义（docs/P4-10.md / dependency-schema.md ADR D34–D35）：
+#   - mksh `|`-in-pattern 展开（`${var#*|}`/`${var%%|*}`）在 Android 16 失败
+#     （P3-10 D-IPC，B7/NF-7）——dep_validate_graph/depg_dfs 曾用
+#     `depg_targets=${depg_adjline#*|}` 切分邻接表 → 本任务改为可移植 cut，
+#     以下静态断言证明全仓生产脚本零残留（修前 FAIL，修后 PASS）。
+#   - DEP_MAX=32 / COND_MAX_LEN=256 覆盖全部写路径（editor/apply/set/import/
+#     snapshot），非法拒绝且原文件逐字节不变（B9 原子性）。
+#   - WAIT_MAX=86400 有界终态（WAITING 不失控，D35）；retry.max ≤100 钳制
+#     （rty_policy）。WAITING 任务数量不设显式上限——WAIT_MAX 保证每个 WAITING
+#     任务 86400s 内终态，且 WAITING 目录数 ≤ registry 任务数（有界，见 ADR D35）。
+# ── mksh 兼容（B7/NF-7）：生产脚本零 `|`-in-pattern 参数展开 ──────────────
+PIPE_PAT=0
+for pf in "$RTLIB" "$DAEMON" "$CLI"; do
+    grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*#*\|' "$pf" 2>/dev/null | grep -v '^[0-9]*: *#'
+    grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*%\|' "$pf" 2>/dev/null | grep -v '^[0-9]*: *#'
+done | grep -q . && PIPE_PAT=1
+[ "$PIPE_PAT" -eq 0 ] && ok "P4-10 mksh: zero '|'-in-pattern param expansions (\${var#*|}/\${var%%|*}) in production scripts (B7/NF-7)" \
+    || bad "P4-10 mksh: '|'-in-pattern param expansion present (mksh-unsafe, D-IPC regress)"
+# IPC 字段切分仍走可移植 cut（ipc_parse 首行；同 §3697 P3-10 修复）
+IPCCUT=$(grep -c "cut -d'|' -f2-" "$RTLIB")
+[ "$IPCCUT" -ge 3 ] && ok "P4-10 mksh: IPC/adjacency fields split via cut -d'|' (>=3 call sites, portable)" \
+    || bad "P4-10 mksh: cut -d'|' -f2- call sites=$IPCCUT (expect >=3)"
+# ── DEP_MAX 覆盖全部写路径 + 原子性（editor/apply/set）────────────────────
+H="$T/hard"; rm -rf "$H"; mkdir -p "$H"
+export TCFG_DIR="$H/task-config"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+HGOOD=$(ok_task h_base | sed 's#^id=.*#id=h_base#')
+min_task "$TCFG_DIR" t_depx
+# 32 个依赖 stub（使 DEP_MAX 条目的依赖图引用完整，P4-03 图校验要求引用必须存在）
+i=0; while [ "$i" -lt 32 ]; do min_task "$TCFG_DIR" "depx$i"; i=$((i+1)); done
+H33=""; i=0; while [ "$i" -lt 33 ]; do H33="${H33}depx$i,"; i=$((i+1)); done; H33="${H33%?}"
+# editor（apply）路径：33 依赖 payload → 拒绝；目录内任务文件未被写
+tcfg_editor_validate_payload "$(printf '%s\n' "dependency=$H33" "$HGOOD")" >/dev/null 2>&1 \
+    && bad "P4-10 dep-max: over-DEP_MAX payload accepted by editor (apply path)" \
+    || ok "P4-10 dep-max: editor rejects dependency > DEP_MAX (33 entries, apply path)"
+[ -f "$TCFG_DIR/h_base.task" ] \
+    && bad "P4-10 dep-max: rejected apply wrote h_base.task" \
+    || ok "P4-10 dep-max: rejected apply left no task file (atomic, B9)"
+# set 路径：写入 32 合法后 over 上限 → 拒绝且文件逐字节不变
+tcfg_new_task h_set "08:30" "echo h" >/dev/null 2>&1
+DEP32=""; i=0; while [ "$i" -lt 32 ]; do DEP32="${DEP32}depx$i,"; i=$((i+1)); done; DEP32="${DEP32%?}"
+tcfg_set_field h_set dependency "$DEP32" >/dev/null 2>&1 && ok "P4-10 dep-max: set dependency=32 entries accepted" || bad "P4-10 dep-max: set 32 rejected"
+HSET_MD5=$(md5sum "$TCFG_DIR/h_set.task" | cut -d' ' -f1)
+tcfg_set_field h_set dependency "$H33" >/dev/null 2>&1 \
+    && bad "P4-10 dep-max: set dependency > DEP_MAX accepted (set path)" \
+    || ok "P4-10 dep-max: set rejects dependency > DEP_MAX (33 entries)"
+[ "$(md5sum "$TCFG_DIR/h_set.task" | cut -d' ' -f1)" = "$HSET_MD5" ] \
+    && ok "P4-10 dep-max: failed set left task byte-identical (atomicity)" \
+    || bad "P4-10 dep-max: task mutated on failed set"
+# ── COND_MAX_LEN 存储层与文法层一致 + 原子性（set 路径）───────────────────
+HLONG=""; i=0; while [ "$i" -lt 257 ]; do HLONG="${HLONG}a"; i=$((i+1)); done
+HCOND_MD5=$(md5sum "$TCFG_DIR/h_set.task" | cut -d' ' -f1)
+tcfg_set_field h_set condition "$HLONG" >/dev/null 2>&1 \
+    && bad "P4-10 cond-max: condition > COND_MAX_LEN accepted (set path)" \
+    || ok "P4-10 cond-max: set rejects condition > COND_MAX_LEN (257 chars)"
+[ "$(md5sum "$TCFG_DIR/h_set.task" | cut -d' ' -f1)" = "$HCOND_MD5" ] \
+    && ok "P4-10 cond-max: failed set left task byte-identical (atomicity)" \
+    || bad "P4-10 cond-max: task mutated on failed set"
+# ── WAIT_MAX 有界常量 + retry.max ≤100 钳制 ──────────────────────────────
+[ "$WAIT_MAX" = "86400" ] && ok "P4-10 waiting: WAIT_MAX=$WAIT_MAX (bounded, env-overridable, D17/D35)" || bad "P4-10 waiting: WAIT_MAX=$WAIT_MAX"
+R999="$T/r999"; rm -rf "$R999"; mkdir -p "$R999"
+printf 'schema_version=2\nid=r999\ntrigger=08:00\nretry.max=999\nretry.interval=60\n' > "$R999/r999.task"
+rty_policy "$R999/r999.task"
+[ "$retry_max" -le 100 ] && ok "P4-10 retry: rty_policy clamps retry.max=999 -> $retry_max (<=100)" || bad "P4-10 retry: retry_max=$retry_max not clamped (want <=100)"
+# 恢复 TCFG_DIR 指向（后续 §legacy/§POSIX 不依赖具体 TCFG_DIR）
+export TCFG_DIR="$T/task-config"
 
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────
 # legacy 解析/执行路径无 dependency/condition 新接线（C2/C4 零改动）

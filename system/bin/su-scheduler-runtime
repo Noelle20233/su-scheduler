@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.27.0"
+RUNTIME_LIB_VERSION="1.28.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -5515,7 +5515,9 @@ $depg_oid|$depg_edges"
     depg_adjline=""
     for depg_n in $depg_nodes; do
         depg_adjline=$(printf '%s\n' "$depg_adj" | grep "^$depg_n|" | head -1)
-        depg_targets=${depg_adjline#*|}
+        # P4-10：`${var#*|}` 为 mksh `|`-in-pattern 展开（Android 16 失败，
+        # B7/NF-7，P3-10 D-IPC 修复同源）→ 改可移植 cut 切分
+        depg_targets=$(printf '%s' "$depg_adjline" | cut -d'|' -f2-)
         depg_target=""
         for depg_target in $depg_targets; do
             case " $depg_nodes " in
@@ -5549,7 +5551,8 @@ depg_dfs() {
     esac
     depg_visited="$depg_visited $depg_x"
     depg_adjline=$(printf '%s\n' "$depg_adj" | grep "^$depg_x|" | head -1)
-    depg_targets=${depg_adjline#*|}
+    # P4-10：同 §5518 修法——`${var#*|}` 为 mksh `|`-in-pattern 展开 → cut 切分
+    depg_targets=$(printf '%s' "$depg_adjline" | cut -d'|' -f2-)
     depg_t=""
     for depg_t in $depg_targets; do
         [ "$depg_t" = "$depg_x" ] && continue

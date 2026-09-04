@@ -483,6 +483,53 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 14. P4-10 增补裁决：安全、资源与兼容性加固复核（ADR D34–D35）
+
+> **状态**：已接受（P4-10 冻结）。本任务是 P4 出口加固，在 D1–D33 之上做**资源/安全/
+> 兼容性复核**。复核发现 **1 处生产缺陷**（D34）并最小修复；其余 7 项复核通过，
+> 由既有实现 + 既有/新增断言共同锁定。详见 docs/P4-10.md 与 docs/P4-EXIT-REPORT.md。
+> **配套实现**：Runtime §26 `dep_validate_graph`/`depg_dfs` 邻接表切分改 `cut`
+> （D34）；版本 1.27.0 → 1.28.0。
+
+### D34 依赖图邻接表切分改可移植 `cut`（B7/NF-7 回归修复）
+
+- **缺陷**：P4-03 引入的 `dep_validate_graph`/`depg_dfs` 用
+  `depg_targets=${depg_adjline#*|}` 切分邻接表（`<node>|<targets>`）。该 `|`-in-pattern
+  参数展开正是 P3-10 D-IPC 修复在 Android 16 mksh 上确认失败的构造（B7/NF-7 已禁
+  `${var#*|}`/`${var%%|*}`），会导致依赖图校验在 mksh 设备上失效（图校验拒绝失效
+  → 未知/环依赖可能被放行）。属 P4-03 引入的 mksh 兼容回归，P4-10 复核发现。
+- **修复**：两处（`dep_validate_graph` 主遍历 + `depg_dfs` DFS）改为
+  `depg_targets=$(printf '%s' "$depg_adjline" | cut -d'|' -f2-)`——与 §21/§24
+  P3-10 D-IPC 修法同源（`cut` 已为库内既有工具，C3 合规）。行为不变：邻接行恒含
+  `|`（由 `grep "^$depg_n|"` 保证），`cut -f2-` 与 `${var#*|}` 产出等价。
+- **守护测试**：`tests/p4-dependency/test.sh` §hard-p4-10 静态断言
+  「生产脚本（runtime/schedulerd/CLI）零 `${var#*|}`/`${var%%|*}` 残留」+
+  「`cut -d'|' -f2-` ≥3 调用点」。修前（HEAD 1.27.0）该断言 FAIL（5518/5552 命中），
+  修后（1.28.0）PASS——FAIL→PASS 证据见 docs/P4-10.md §3。
+- **版本**：1.27.0 → 1.28.0（同一 § 内缺陷修复，无 API 变更）。
+
+### D35 WAITING 任务数量不设显式上限（WATING_MAX 取舍，D26 深化）
+
+- **复核结论**：**不新增** `WATING_MAX`/`WAITING_MAX` 显式常量，理由：
+  1. **有界终态**：每个 WAITING 任务在进入后 ≤ `WAIT_MAX`（86400s，D13/D17）即
+     `WAITING>FAILED`/rearm，**无永久悬挂**（需求 5 硬性）——WAITING 数量不可能
+     无限累积（单任务不重复计）。
+  2. **registry 有界**：WAITING 任务目录数 ≤ 注册任务数（每任务至多一个运行目录），
+     registry 规模由用户管理的 task-config 决定（managed 域），非攻击面增长。
+  3. **prune 交互**：WAITING 目录在 `runtime_prune_tasks` 豁免（D26）是为「活任务
+     不误删」，但豁免对象本身被 1/2 双门有界——不会形成「无限 WAITING 目录」的
+     资源失控（非活跃 FAILED/STOPPED 目录仍受 TASK_DIRS_MAX=200 修剪）。
+  4. **与 TASK_DIRS_MAX 语义区别**：TASK_DIRS_MAX 管「非活跃历史目录」上限（磁盘
+     回收）；WAITING 是**有终态保证的活跃目录**，其上限由 WAIT_MAX + registry 规模
+     隐式约束。若未来引入「注册任务数无上限 + 大量任务同时 WAITING」场景，再评估
+     显式上限（复用 TASK_DIRS_MAX 语义即可，届时新增常量并接 runtime_dir_active）。
+- **守护测试**：`§retry-p4-07` R5（WAITING prune 豁免，TASK_DIRS_MAX 下不误删）
+  + `§gate-p4-04` D（WAIT_MAX 超时 FAILED）+ `§hard-p4-10`（WAIT_MAX=86400 常量断言）
+  + `§obs-p4-09` O（summary waiting 计数有界）。取舍记录见 docs/P4-10.md §5 与
+  docs/P4-EXIT-REPORT.md §2 item 3。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -518,3 +565,10 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   只读消费、gate_state 读运行目录状态/事件；JSON 只增键不删改（B8）；CLI 旧输出
   兼容（新行附加、空值输出空、legacy task-info 不显示新字段、task-output/log 语义
   零改动）；WAITING 控制行为固化引用 D17（不改实现）。版本 1.26.0 → 1.27.0。
+- 2026-09-04：P4-10 增补 D34–D35（安全/资源/兼容性加固复核）。D34：`dep_validate_
+  graph`/`depg_dfs` 邻接表切分从 `${var#*|}` 改为可移植 `cut -d'|' -f2-`（mksh
+  `|`-in-pattern 回归，B7/NF-7，P3-10 D-IPC 同源）——P4-10 复核发现的唯一生产缺陷，
+  最小修复 + FAIL→PASS 测试。D35：WAITING 任务数量**不设显式上限**（WAIT_MAX
+  有界终态 + registry 有界 + prune 豁免对象有终态保证，理由与取舍成文）。其余 7 项
+  复核通过（DEP_MAX/COND_MAX_LEN 写路径全覆盖、注入/穿越零 exec 零写、POSIX 语法、
+  单 daemon 循环、Legacy 零改、无新依赖、无 eval）。版本 1.27.0 → 1.28.0。
