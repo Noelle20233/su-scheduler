@@ -157,6 +157,85 @@ poll
 [ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P4-06 sec: ZERO Root actions executed by condition injection edit" \
     || bad "P4-06 sec: condition edit executed ($(wc -l < "$EXEC_LOG"))"
 
+# ── P4-08 Dependency/Condition 注入：EDIT_TASK/VALIDATE_TASK 校验期拒绝 ──
+# dependency/condition 编辑器开放后（P4-08），恶意依赖/条件注入 → 后端权威拒绝
+# （rc 4），零 exec、零 config 写（B9 原子性）。前端校验不是安全边界。
+SNAP_D=$(tc_snap)
+dep_inj_cases=(
+  'task_a; rm -rf /'
+  '$(id)'
+  '../etc/passwd'
+  'a/x:b:FAILED'
+)
+did=0
+for de in "${dep_inj_cases[@]}"; do
+    did=$((did + 1))
+    dep_payload=$(printf 'schema_version=2\nid=tsec\ntrigger=08:30\naction.type=command\naction.command=echo safe\ndependency=%s\n' "$de")
+    drop_req "d$did" "d$did|VALIDATE_TASK|payload=$(ipc_b64enc "$dep_payload")"
+done
+# 循环依赖：tsec 依赖自身 → 图校验拒绝
+selfdep="schema_version=2
+id=tsec
+trigger=08:30
+action.type=command
+action.command=echo safe
+dependency=tsec
+"
+drop_req "d5" "d5|VALIDATE_TASK|payload=$(ipc_b64enc "$selfdep")"
+poll
+dbad=0
+for rid in d1 d2 d3 d4 d5; do
+    rc=$(req_rc "$rid")
+    [ "$rc" = "4" ] || dbad=$((dbad + 1))
+done
+[ "$dbad" -eq 0 ] && ok "P4-08 sec: dependency injection forms all rejected by VALIDATE_TASK (rc 4)" \
+    || bad "P4-08 sec: $dbad dependency injections not rejected"
+[ "$(tc_snap)" = "$SNAP_D" ] && ok "P4-08 sec: task-config byte-identical after dependency injection validate" \
+    || bad "P4-08 sec: task-config mutated by dependency validate"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P4-08 sec: ZERO Root actions executed by dependency injection validate" \
+    || bad "P4-08 sec: dependency validate executed ($(wc -l < "$EXEC_LOG"))"
+
+# EDIT_TASK 注入 dependency/condition（路径穿越 + 命令串 + 未授权 env 谓词）
+dep_edit="schema_version=2
+id=tsec
+trigger=08:30
+action.type=command
+action.command=echo safe
+dependency=../etc/passwd; rm -rf /
+"
+cond_edit2="schema_version=2
+id=tsec
+trigger=08:30
+action.type=command
+action.command=echo safe
+condition={{ env.HOME == /root }}
+"
+SNAP_D2=$(tc_snap)
+drop_req "d6" "d6|EDIT_TASK|id=$(ipc_b64enc tsec)&payload=$(ipc_b64enc "$dep_edit")"
+drop_req "d7" "d7|EDIT_TASK|id=$(ipc_b64enc tsec)&payload=$(ipc_b64enc "$cond_edit2")"
+poll
+[ "$(req_rc d6)" = "4" ] && ok "P4-08 sec: EDIT_TASK dependency injection -> configuration_invalid (rc 4)" \
+    || bad "P4-08 sec: EDIT_TASK dependency injection rc=$(req_rc d6)"
+[ "$(req_rc d7)" = "4" ] && ok "P4-08 sec: EDIT_TASK unauthorized-env condition -> configuration_invalid (rc 4)" \
+    || bad "P4-08 sec: EDIT_TASK condition rc=$(req_rc d7)"
+[ "$(tc_snap)" = "$SNAP_D2" ] && ok "P4-08 sec: task-config byte-identical after dep/cond injection edits" \
+    || bad "P4-08 sec: task-config mutated by dep/cond edit"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P4-08 sec: ZERO Root actions executed by dep/cond injection edits" \
+    || bad "P4-08 sec: dep/cond edit executed ($(wc -l < "$EXEC_LOG"))"
+
+# 前端安全：新字段渲染复用 textContent 输入路径（无 innerHTML / 无 Root 直执）
+if grep -q 'inp.value = editorState.form\[k\]' webroot/app.js; then
+    ok "P4-08 sec: editor inputs set via .value (no innerHTML)"
+else
+    bad "P4-08 sec: editor input rendering not .value-based"
+fi
+badpat2=0
+for pat in 'su -c' 'sh -c' 'eval(' 'new Function' 'document.write' 'innerHTML'; do
+    if grep -q "$pat" webroot/app.js; then badpat2=1; fi
+done
+[ "$badpat2" -eq 0 ] && ok "P4-08 sec: app.js still free of Root-exec / eval / innerHTML" \
+    || bad "P4-08 sec: app.js forbidden pattern detected"
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "webui security tests: PASS=$PASS FAIL=$FAIL"

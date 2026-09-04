@@ -40,6 +40,15 @@ grep -q 'EDIT_TASK' webroot/app.js && grep -q 'VALIDATE_TASK' webroot/app.js && 
 grep -q 'r.view === "editor"' webroot/app.js && ok "P3-06 static: editor route wired" || bad "P3-06 static: editor route missing"
 grep -q '\.editor-steps' webroot/style.css && ok "P3-06 static: editor css present" || bad "P3-06 static: editor css missing"
 grep -q 'function validateForm' webroot/app.js && ok "P3-06 static: frontend validateForm present" || bad "P3-06 static: validateForm missing"
+# P4-08：Advanced 步骤开放 dependency/condition 编辑字段（Task v2 managed 域）
+grep -q 'dependency:{ step: "Advanced"' webroot/app.js && grep -q 'condition:{ step: "Advanced"' webroot/app.js \
+    && ok "P4-08 static: TASK_FORM_SCHEMA has dependency/condition in Advanced step" || bad "P4-08 static: dependency/condition schema fields missing"
+grep -q '"dependency=" + (v.dependency' webroot/app.js && grep -q '"condition=" + (v.condition' webroot/app.js \
+    && ok "P4-08 static: formToContent serializes dependency/condition keys" || bad "P4-08 static: formToContent dep/cond missing"
+grep -q 'v.dependency = map.dependency' webroot/app.js && grep -q 'v.condition = map.condition' webroot/app.js \
+    && ok "P4-08 static: taskContentToForm reads dependency/condition" || bad "P4-08 static: taskContentToForm dep/cond missing"
+grep -q 'Dependency 格式非法' webroot/app.js && grep -q 'Condition 应形如' webroot/app.js \
+    && ok "P4-08 static: validateForm frontend hints for dependency/condition" || bad "P4-08 static: validateForm dep/cond hints missing"
 
 # ── daemon 上下文 shim（同 tests/ipc）───────────────────────────────────
 TASKS_DIR="$T/tasks"
@@ -174,6 +183,47 @@ for evil in \
 done
 [ "$badcount" -eq 0 ] && [ ! -f "$TCFG_DIR/task_inj.task" ] \
     && ok "P3-06 app: App Action injection all rejected, task not persisted" || bad "P3-06 app: injection not rejected ($badcount)"
+
+# ── P4-08 §depcond：Dependency/Condition 经既有 EDIT_TASK/VALIDATE_TASK 生效 ──
+# 后端权威校验已在 P4-02/03/06 就绪（tcfg_editor_validate_payload：dep 语法 +
+# 图校验 + condition 文法）；P4-08 只验证「编辑器开放 → 经既有 IPC payload 路径
+# 保存/预览」全链路 + 非法回滚原子性（B9）。
+# 先建被依赖任务（task_dep1）——图校验要求依赖引用必须存在（P4-03 D6）。
+DEPPAYLOAD=$(printf '%s\n' "$PAYLOAD" | sed 's/^id=.*/id=task_dep1/')
+r=$(send_req "dp0" "dp0|EDIT_TASK|id=$(ipc_b64enc task_dep1)&payload=$(ipc_b64enc "$DEPPAYLOAD")")
+[ "$(resp_rc "$r")" = "0" ] && ok "P4-08 depcond: seed dependency target task_dep1" || bad "P4-08 depcond: seed rc=$(resp_rc "$r")"
+
+# 合法 payload（dependency 引用已存在任务 + condition 白名单文法）→ 预览合法、保存成功
+DC=$(printf '%s\n' "$PAYLOAD" | sed 's/^id=.*/id=task_dc/; s/^advanced.logging=.*/dependency=task_dep1/; s/^description=.*/condition={{ time.hour == 8 }}/')
+r=$(send_req "dp1" "dp1|VALIDATE_TASK|payload=$(ipc_b64enc "$DC")")
+[ "$(resp_rc "$r")" = "0" ] && ok "P4-08 depcond: VALIDATE_TASK legal dep+cond payload -> rc 0" || bad "P4-08 depcond: validate rc=$(resp_rc "$r")"
+r=$(send_req "dp2" "dp2|EDIT_TASK|id=$(ipc_b64enc task_dc)&payload=$(ipc_b64enc "$DC")")
+[ "$(resp_rc "$r")" = "0" ] && ok "P4-08 depcond: EDIT_TASK legal dep+cond -> saved" || bad "P4-08 depcond: save rc=$(resp_rc "$r")"
+grep -q '^dependency=task_dep1$' "$TCFG_DIR/task_dc.task" && grep -q '^condition={{ time.hour == 8 }}$' "$TCFG_DIR/task_dc.task" \
+    && ok "P4-08 depcond: dependency/condition persisted to task-config" || bad "P4-08 depcond: persisted fields missing"
+r=$(send_req "dp3" "dp3|GET_TASK_EDIT|id=$(ipc_b64enc task_dc)")
+backdc=$(printf '%s\n' "$r" | tail -n +2)
+printf '%s\n' "$(ipc_b64dec "$backdc")" | grep -q '^dependency=task_dep1$' \
+    && printf '%s\n' "$(ipc_b64dec "$backdc")" | grep -q '^condition={{ time.hour == 8 }}$' \
+    && ok "P4-08 depcond: GET_TASK_EDIT round-trips dependency/condition" || bad "P4-08 depcond: round-trip missing dep/cond"
+
+# 非法 payload → rc 4 + task-config 逐字节不变（原子性 B9）
+SNAP_DC=$(find "$TCFG_DIR" -type f ! -name 'MANAGED' 2>/dev/null | sort | xargs -r md5sum 2>/dev/null | md5sum | cut -d' ' -f1)
+# 1) 未知依赖 id
+UNK=$(printf '%s\n' "$DC" | sed 's/^dependency=.*/dependency=ghost_dep/')
+r=$(send_req "dp4" "dp4|EDIT_TASK|id=$(ipc_b64enc task_dc)&payload=$(ipc_b64enc "$UNK")")
+[ "$(resp_rc "$r")" = "4" ] && ok "P4-08 depcond: unknown dependency -> configuration_invalid (rc 4)" || bad "P4-08 depcond: unknown-dep rc=$(resp_rc "$r")"
+# 2) 依赖环（task_dep1 → task_dc → task_dep1）
+CYC=$(printf '%s\n' "$DEPPAYLOAD" | sed 's/^advanced.logging=.*/dependency=task_dc/')
+r=$(send_req "dp5" "dp5|EDIT_TASK|id=$(ipc_b64enc task_dep1)&payload=$(ipc_b64enc "$CYC")")
+[ "$(resp_rc "$r")" = "4" ] && ok "P4-08 depcond: dependency cycle -> configuration_invalid (rc 4)" || bad "P4-08 depcond: cycle rc=$(resp_rc "$r")"
+# 3) 非法 condition 文法（>= 运算符不在白名单）
+CONDBAD=$(printf '%s\n' "$DC" | sed 's/^condition=.*/condition={{ time.hour >= 8 }}/')
+r=$(send_req "dp6" "dp6|EDIT_TASK|id=$(ipc_b64enc task_dc)&payload=$(ipc_b64enc "$CONDBAD")")
+[ "$(resp_rc "$r")" = "4" ] && ok "P4-08 depcond: illegal condition grammar -> configuration_invalid (rc 4)" || bad "P4-08 depcond: cond rc=$(resp_rc "$r")"
+# 原子性：全部失败编辑后 task-config 快照逐字节一致
+[ "$(find "$TCFG_DIR" -type f ! -name 'MANAGED' 2>/dev/null | sort | xargs -r md5sum 2>/dev/null | md5sum | cut -d' ' -f1)" = "$SNAP_DC" ] \
+    && ok "P4-08 depcond: task-config byte-identical after failed dep/cond edits (B9)" || bad "P4-08 depcond: task-config mutated"
 
 # ── §supervisor：Health/Recovery 可被 Supervisor 真实读取 ───────────────
 spec=$(supervisor_health_spec "$TCFG_DIR/task_edit1.task")

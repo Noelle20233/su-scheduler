@@ -392,6 +392,49 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 12. P4-08 增补裁决：IPC 与 WebUI 依赖编辑器（ADR D27–D29）
+
+> **状态**：已接受（P4-08 冻结）。通过既有 IPC 白名单开放 Dependency/Condition
+> 配置，在 WebUI Task Editor Advanced 步骤开放两字段输入，**不新增 IPC op**。
+> **配套实现**：webroot/app.js（TASK_FORM_SCHEMA + formToContent + validateForm）；
+> Runtime 零逻辑改动（P4-02/03/06 后端权威已就绪，仅确认接线 + 版本 1.26.0）。
+> 详见 docs/P4-08.md。
+
+### D27 复用既有 IPC 路径（不新增 op）
+
+- Dependency/Condition 编辑器开放**不新增** IPC op。前端「校验预览」仍走
+  `VALIDATE_TASK`（payload 分支，P3-06 既有）；保存走 `EDIT_TASK`（payload 分支）。
+- 后端权威校验已在 `tcfg_editor_validate_payload` 就绪：dependency 键 →
+  `dep_validate`（语法/DEP_MAX/路径穿越）+ `dep_validate_graph`（未知 id/自依赖/环，
+  P4-03）；condition 键 → `cond_validate`（可打印 ASCII/长度）+ `cond_grammar_ok`
+  （谓词白名单/运算符 ==、!=，P4-06）。编辑器只把两键随 payload 传入。
+- 错误信封沿用既有约定：`configuration_invalid`（rc 4）+ `task invalid (config
+  unchanged)`（task-editor-schema.md §5.1）。**理由**：VALIDATE_TASK/EDIT_TASK 的
+  payload 本就是「完整 Task v2 内容」通道，新增键只需在 §23 校验函数与表单 schema
+  各加一处，无需协议扩展；新增 op 反而引入白名单/版本/文档多源维护成本。
+
+### D28 前端校验非安全边界
+
+- WebUI 对 dependency/condition 提供即时前端提示（validateForm）：dependency 条目
+  `[?]<id>[:STATE]` 基础语法 + id 字符集；condition 形如 `{{ 谓词 }}` 且拒绝
+  `;`/`$`/反引号/`|`/`>`/`<` 注入字符。
+- **前端提示不构成安全边界**——最终以后端 `tcfg_editor_validate_payload` 为准
+  （含图校验/文法白名单）；前端仅避免明显笔误、不拦截合法表达式。前端渲染经
+  `input.value`/`textContent`（无 innerHTML / 无 Root 直执 / 无 eval）。
+- 与 NF-5（WebUI 不直执 Root，配置经 IPC 白名单路径）一致：保存仍
+  `write("EDIT_TASK", {id, payload})`，无新增直执通道。
+
+### D29 失败原子性重申（B9）
+
+- 编辑失败（依赖环 / 未知依赖 id / 非法 condition 文法 / 注入串）→
+  `tcfg_apply_task` 校验不通过 → **不写盘**，task-config **逐字节不变**（既有
+  tmp+mv 原子写 + 图校验在写前拒绝）。前端显示后端错误消息（「保存失败（旧配置
+  未变）：rc=4 …」）。
+- 该原子性与 P4-02 D5 / P4-03 D9 的「校验失败不写盘」契约一致，此处针对编辑器
+  开放后新增的注入面重申并由 webui/editor、webui/security、fuzz 三套件锁定。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -417,3 +460,8 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   退避先于依赖满足判定、到点强制可执行；gate.fail 标记 → supervisor 不 auto-
   recovery 且不接退避（依赖失败 ≠ 进程崩溃）；WAITING 目录 prune 豁免。WebUI 开放
   编辑留 P4-08，CLI 查询展示留 P4-09。
+- 2026-09-04：P4-08 增补 D27–D29（IPC 与 WebUI 依赖编辑器）。Dependency/Condition
+  编辑器开放**不新增 IPC op**——复用 VALIDATE_TASK/EDIT_TASK payload 路径，后端
+  权威校验（语法+图+文法）已在 P4-02/03/06 就绪；前端校验非安全边界（仅即时提示，
+  textContent 渲染、无 Root 直执/eval）；失败编辑 task-config 逐字节不变（B9 重申）。
+  版本 1.25.0 → 1.26.0。CLI 查询展示留 P4-09。

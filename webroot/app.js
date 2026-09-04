@@ -381,7 +381,9 @@
       timeout:{ step: "Advanced", type: "text", label: "Timeout sec (0-86400, 0=unlimited)", def: "0", pattern: "^[0-9]+$", min: 0, max: 86400 },
       environment:{ step: "Advanced", type: "text", label: "Environment (K=V,K=V)", max: 512 },
       concurrency:{ step: "Advanced", type: "text", label: "Concurrency (0-100, 0=unlimited)", def: "0", pattern: "^[0-9]+$", min: 0, max: 100 },
-      logging:{ step: "Advanced", type: "text", label: "Logging lines (0-1000000)", def: "0", pattern: "^[0-9]+$", min: 0, max: 1000000 }
+      logging:{ step: "Advanced", type: "text", label: "Logging lines (0-1000000)", def: "0", pattern: "^[0-9]+$", min: 0, max: 1000000 },
+      dependency:{ step: "Advanced", type: "text", label: "Dependency ([?]<task-id>[:STATE], 逗号分隔)", placeholder: "?task_boot:STOPPED, task_daily", max: 512 },
+      condition:{ step: "Advanced", type: "text", label: "Condition ({{ 谓词 }})", placeholder: "{{ time.hour == 8 }}", max: 512 }
     }
   };
 
@@ -436,6 +438,8 @@
     v.environment = map["advanced.environment"] || "";
     v.concurrency = map["advanced.concurrency"] || "0";
     v.logging = map["advanced.logging"] || "0";
+    v.dependency = map.dependency || "";
+    v.condition = map.condition || "";
     return v;
   }
 
@@ -487,7 +491,9 @@
       "advanced.timeout=" + (v.timeout || "0"),
       "advanced.environment=" + (v.environment || ""),
       "advanced.concurrency=" + (v.concurrency || "0"),
-      "advanced.logging=" + (v.logging || "0")
+      "advanced.logging=" + (v.logging || "0"),
+      "dependency=" + (v.dependency || ""),
+      "condition=" + (v.condition || "")
     ];
     return lines.join("\n");
   }
@@ -500,6 +506,26 @@
     if (v.actionType === "app" && !v.appTarget) { errs.push("App Target 必填"); }
     if (v.actionType !== "app" && !v.command) { errs.push("Command 必填"); }
     if (v.recoveryType === "script" && v.recoveryScript.charAt(0) !== "/") { errs.push("Recovery Script 必须为绝对路径"); }
+    if (v.dependency) {
+      var depParts = String(v.dependency).split(/[, ]+/).filter(function (s) { return s; });
+      if (!depParts.length) { errs.push("Dependency 格式非法（[?]<task-id>[:STATE]，逗号/空格分隔）"); }
+      depParts.forEach(function (e) {
+        var d = e;
+        if (d.charAt(0) === "?") { d = d.slice(1); }
+        if (d.indexOf(":") >= 0) { d = d.slice(0, d.indexOf(":")); }
+        if (!/^[A-Za-z0-9_.-]+$/.test(d) || /(\.\.)|\//.test(d)) {
+          errs.push("Dependency 含非法 task-id（仅 [A-Za-z0-9_.-]，禁路径穿越）：" + e);
+        }
+      });
+    }
+    if (v.condition) {
+      var c = String(v.condition);
+      if (/[\u0000-\u001f\u007f]/.test(c) || /[$`;]/.test(c) || /[|><]/.test(c)) {
+        errs.push("Condition 含非法字符（仅可打印 ASCII，无 ; $ \u0060 | > < 注入）");
+      } else if (c.indexOf("{{") !== 0 || c.indexOf("}}") < 2) {
+        errs.push("Condition 应形如 {{ 谓词 }}（白名单谓词，如 {{ time.hour == 8 }}）");
+      }
+    }
     Object.keys(TASK_FORM_SCHEMA.fields).forEach(function (k) {
       var f = TASK_FORM_SCHEMA.fields[k];
       if (!f.pattern) { return; }

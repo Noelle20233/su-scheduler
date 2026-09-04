@@ -203,6 +203,36 @@ done
 [ "$(tc_snap)" = "$SNAP_C" ] && ok "P4-06 fuzz: task-config byte-identical after condition injection" \
     || bad "P4-06 fuzz: task-config mutated by condition injection"
 
+# ── P4-08 Dependency 注入：VALIDATE_TASK/EDIT_TASK 校验期拒绝，零 exec ────
+# 编辑器开放 dependency 后（P4-08）：恶意依赖（路径穿越/元字符/环）→ 后端权威
+# 拒绝（rc 4），绝不写盘、绝不执行。走既有 VALIDATE_TASK/EDIT_TASK payload 路径。
+dep_inj_cases=(
+  '../etc/passwd'
+  'a/b:c'
+  'task_x; rm -rf /'
+  '$(id)'
+  'task_y:IDLE'
+)
+didx=0
+for dexpr in "${dep_inj_cases[@]}"; do
+    didx=$((didx + 1))
+    dep_payload=$(printf 'schema_version=2\nid=dep_inj_%d\ntrigger=09:00\ncondition= dependency=%s\naction.command=echo ok\n' "$didx" "$dexpr")
+    drop_req "dinj$didx" "dinj$didx|VALIDATE_TASK|payload=$(b64 "$dep_payload")"
+done
+SNAP_DEP=$(tc_snap)
+poll
+depbad=0
+for didx in $(seq 1 ${#dep_inj_cases[@]}); do
+    rc=$(req_rc "dinj$didx")
+    [ "$rc" = "4" ] || depbad=$((depbad + 1))
+done
+[ "$depbad" -eq 0 ] && ok "P4-08 fuzz: ${#dep_inj_cases[@]} dependency injection forms rejected (rc 4)" \
+    || bad "P4-08 fuzz: $depbad dependency injection forms NOT rejected"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P4-08 fuzz: ZERO Root actions executed by dependency injection" \
+    || bad "P4-08 fuzz: dependency injection executed ($(wc -l < "$EXEC_LOG"))"
+[ "$(tc_snap)" = "$SNAP_DEP" ] && ok "P4-08 fuzz: task-config byte-identical after dependency injection" \
+    || bad "P4-08 fuzz: task-config mutated by dependency injection"
+
 # ── 副作用：task-config 逐字节不变；EXEC_LOG 仅安全启动那一次（如有）───
 # 前面所有恶意请求不应改 task-config（除 UPDATE 合法更新 command 外）
 grep -q '^action.command=echo ok; rm -rf /$' "$TCFG_DIR/$mkid.task" 2>/dev/null \
