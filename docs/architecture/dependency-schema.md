@@ -245,6 +245,54 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 9. P4-05 增补裁决：Required/Optional 失败传播（ADR D15–D17）
+
+> **状态**：已接受（P4-05 冻结）。在 D11–D14 之上定义依赖任务终态/缺失/禁用后的
+> 传播策略，保证**无永久 WAITING、终态稳定**。
+> **配套实现**：Runtime §20 `sched_dep_satisfied` 细分返回码（0=满足 / 1=可等待
+> 的未满足 / 2=终态不匹配立即失败）、`sched_advance_waiting` 的 dep-failed 分支、
+> `tctl_start` force 跳过门控。详见 docs/P4-05.md。
+
+### D15 Required 失败传播矩阵（门控 → 本任务终态）
+
+| 依赖运行期事实 | entry `:STATE` | 本任务行为 | 事件/原因 |
+| :-- | :-- | :-- | :-- |
+| 终态 = 指定 `:STATE`（含 dep FAILED 且 `:FAILED`） | 任意 | 满足 → 执行 | `gate_ok` |
+| 终态 ≠ 指定（如 dep FAILED 且缺省 `:STOPPED`） | STOPPED/FAILED | **立即** `WAITING>FAILED`（不等 WAIT_MAX） | `gate_fail` msg=`dep failed: t_b` |
+| 缺失（registry 无此任务） | 任意 | 有界等待 → 超时 `WAITING>FAILED` | `gate_fail` msg=`wait timeout …; dep missing: t_b` |
+| DISABLED（enabled=0，含曾 STOPPED/FAILED 后被禁用） | 任意 | 有界等待 → 超时 `WAITING>FAILED` | `gate_fail` msg=`wait timeout …; dep disabled: t_b` |
+| 非终态（PENDING/RUNNING/WAITING…） | 任意 | 有界等待 → 超时 `WAITING>FAILED` | `gate_fail` msg=`wait timeout …; dep unsat: t_b` |
+
+- **判定优先序**：终态不匹配（立即失败）> 缺失 > 禁用 > 非终态等待。同一判定
+  函数内单次遍历即可分类（`sched_dep_satisfied` 返回 0/1/2 + stdout 原因）。
+- `:FAILED` 语义 = 「依赖失败才执行」：依赖 FAILED 反而**满足门控**，本任务照常
+  执行；依赖 STOPPED（成功）才是终态不匹配 → 失败。既有 entry 按条检查的语义
+  自然延伸，无新增配置语法（C4 零改动）。
+- 判定读 registry 任务文件（缺失检测 `registry_task_file`）+ 运行目录实时态
+  （`runtime_current_state`），无副作用（需求 §4 边界延续）。
+
+### D16 Optional 不参与失败传播
+
+- `?` Optional 依赖任何终态（FAILED/STOPPED）或缺失/禁用均**不阻断**、**不导致
+  本任务 FAILED**，仅记 `opt-unsat:` 原因；门控按其余 Required 依赖继续判定。
+- Optional 依赖缺失/禁用与 Required 同走 registry 检测路径，但结果仅作原因记录。
+
+### D17 手动 start / WAIT_MAX / 重试衔接
+
+- **手动 start**：`tctl_start` 非 force 对 WAITING → 非法拒绝（rc 3，状态不变）；
+  force=1（含 `tctl_restart` = stop + force start）对 WAITING → **跳过依赖门控**
+  直接 `WAITING>STARTING`（TSM 允许边 manual_exec），并清除 `gate.wait_start`。
+  `tctl_check` 仅健康探测，不改状态。
+- **WAIT_MAX 语义**：默认 `86400` 秒，语义 = 「进入 WAITING 起（`sched_gate_start`
+  落桩）超过仍不满足则 `WAITING>FAILED`」。经环境覆盖（测试短超时）。超时与
+  dep-failed 均落 FAILED 终态，事件原因可区分（`dep failed` / `dep missing` /
+  `dep disabled` / `wait timeout`），无永久 WAITING（需求 5 硬性）。
+- **重试衔接**：WAITING>FAILED 到达终态后，后续 rearm（FAILED>PENDING）与既有
+  语义一致；FAILED>WAITING 重试退避边**不在本任务接线**（P4-07），本任务只保证
+  因依赖失败而 FAILED 的任务不悬挂、下一窗口可 rearm。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -256,3 +304,7 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   `sched_execute_one` due=Y 分支 + `scheduler_tick` WAITING 复查通道；`gate_*`
   事件令牌入 RT_EVENTS 不入 TSM_CAUSES；重启 WAITING 保留为合法语义变更。
   失败传播（P4-05）、Condition 求值（P4-06）不在本 ADR 范围。
+- 2026-09-04：P4-05 增补 D15–D17（Required/Optional 失败传播）。Required 依赖
+  终态不匹配 → 立即 WAITING>FAILED；缺失/禁用 → 有界等待超时 FAILED；Optional
+  不参与失败传播；force start/restart 跳过门控；WAIT_MAX 有界语义成文。重试退避
+  （FAILED>WAITING）留 P4-07，Condition 求值留 P4-06。

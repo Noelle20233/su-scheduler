@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.22.0"
+RUNTIME_LIB_VERSION="1.23.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -3097,27 +3097,32 @@ sched_prune_ron() {   # <base> <config> <id>
     return 0
 }
 # ────────────────────────────────────────────────────────────────────────
-# §20 P4-04 依赖门控（WAITING 状态接线）：把 TSM reserved 边（PENDING>WAITING /
-# WAITING>STARTING / WAITING>PENDING / WAITING>FAILED）接入调度层。门控插入点 =
-# sched_execute_one 的 due=Y 分支内、trigger_decide 之后、action_run 之前；另在
-# scheduler_tick 首部对已 WAITING 任务逐周期复查（sched_advance_waiting）。
-# 语义（docs/P4-04.md / dependency-schema.md ADR D11–D14）：
+# §20 P4-04/P4-05 依赖门控（WAITING 状态接线 + Required/Optional 失败传播）：
+# 把 TSM reserved 边（PENDING>WAITING / WAITING>STARTING / WAITING>PENDING /
+# WAITING>FAILED）接入调度层。门控插入点 = sched_execute_one 的 due=Y 分支内、
+# trigger_decide 之后、action_run 之前；另在 scheduler_tick 首部对已 WAITING
+# 任务逐周期复查（sched_advance_waiting）。
+# 语义（docs/P4-04.md / docs/P4-05.md / dependency-schema.md ADR D11–D17）：
 #   - 依赖满足判定：读运行目录实时态 `runtime_current_state <tasks>/<dep_id>`（
-#     缺省 PENDING）；Required 须达到该 entry 指定 `:STATE`（缺省 STOPPED）；
-#     `?` Optional 未满足不阻断（只记原因，P4-05 传播细节后接）；依赖处于
-#     WAITING 视为未满足（等待其先解除）。
+#     缺省 PENDING）；Required 须达到该 entry 指定 `:STATE`（缺省 STOPPED，含
+#     `:FAILED` + dep FAILED → 满足）；`?` Optional 未满足不阻断（只记原因）。
+#   - P4-05 失败传播：Required 依赖已终态（STOPPED|FAILED）但 != 指定 :STATE →
+#     `sched_dep_satisfied` 返回 2（dep failed）→ sched_advance_waiting **立即**
+#     WAITING>FAILED（不等 WAIT_MAX）；依赖缺失（dep missing）/ 禁用（dep
+#     disabled）/ 非终态（dep unsat）→ 返回 1（可等待）→ 有界等待，超时 FAILED。
 #   - 进入 WAITING：触发匹配 + 依赖未满足 → PENDING>WAITING（gate_wait 事件，
 #     msg=原因如 `dep unsat: t_b`）；终态（STOPPED/FAILED）先 rearm 回 PENDING
 #     再门控（TSM 无 STOPPED>WAITING 边）。
 #   - 解除：WAITING 任务依赖全部满足 + 触发仍匹配 → WAITING>STARTING（gate_ok）
 #     → action_run；依赖仍不满足 → 保持 WAITING（等待）；触发不再匹配 →
 #     WAITING>PENDING（rearm，避免永久挂起）；超过 WAIT_MAX 秒 → WAITING>FAILED
-#     （gate_fail，硬性有界；P4-05 细化传播）。
+#     （gate_fail，硬性有界；msg 附依赖原因）。
 #   - 每触发窗口至多执行一次：门控不改 cycle 去重——进入 WAITING 不 mark cycle，
 #     解除后同一窗口至多执行一次（执行时 mark）；未解除不误标为已执行。
 #   - 重启保留：state_rehydrate_residual 不再把 WAITING→FAILED（P4-04 合法语义
 #     变更）；重启后下个 tick 复查依赖，gate.wait_start 重新计时（有界）。
-# 常量：WAIT_MAX=86400 秒（依赖 P4-05 细化），可经环境覆盖（测试用短超时）。
+# 常量：WAIT_MAX=86400 秒（P4-05 语义：进入 WAITING 起超过仍不满足则 FAILED；
+# 终态不匹配立即 FAILED 不受其限），可经环境覆盖（测试用短超时）。
 # 命名空间：函数 sched_gate_/sched_dep_/sched_advance_ 前缀，内部全局 gdv_ 前缀。
 # ═══════════════════════════════════════════════════════════════════════════
 WAIT_MAX=${WAIT_MAX:-86400}
@@ -3147,8 +3152,15 @@ sched_gate_elapsed() {   # <run_dir> → echo 已等待秒数（无起点 → 0�
     fi
 }
 
-# 依赖满足判定：<tasks_dir> <id> → 0=满足 1=未满足；stdout=原因（仅供审计/msg）
+# 依赖满足判定：<tasks_dir> <id> → 0=满足 1=未满足（等待中/缺失/禁用——可等待，
+# 至 WAIT_MAX 超时判失败） 2=未满足且 Required 依赖已终态但不匹配（立即判失败，
+# P4-05 dep failed 传播）；stdout=原因（仅供审计/msg）。
 # 解析复用 §26 dep_normalize（D1 容错）+ 单条 entry 切分（D2 `[?]id[:STATE]`）。
+# P4-05 语义：Required 依赖达到 entry 指定 `:STATE`（缺省 STOPPED）即满足；依赖
+# 已终态（STOPPED|FAILED）但 != 指定 → dep failed（WAITING>FAILED，不等超时）；
+# 依赖缺失（registry 无此任务）→ dep missing（有界等待）；依赖 DISABLED（enabled=0）
+# → dep disabled（非终态、不可作为满足依据，有界等待）；依赖尚在非终态 → dep unsat
+# （有界等待）。`?` Optional 依赖任何未满足均不阻断（只记 opt-unsat）。
 sched_dep_satisfied() {
     gdv_tasks=$1; gdv_id=$2
     gdv_tf=$(registry_task_file "$gdv_id" 2>/dev/null) || { echo "no task file"; return 1; }
@@ -3156,7 +3168,11 @@ sched_dep_satisfied() {
     [ -n "$gdv_dep" ] || { echo "deps ok (none)"; return 0; }
     gdv_norm=$(dep_normalize "$gdv_dep")
     [ -n "$gdv_norm" ] || { echo "deps ok (none)"; return 0; }
-    gdv_unsat=""
+    gdv_optunsat=""   # 累积 opt-unsat（Optional 未满足，不阻断）
+    gdv_fail=""   # P4-05：终态不匹配的 Required 依赖（立即失败）
+    gdv_missing=""   # P4-05：registry 缺失的 Required 依赖（有界等待）
+    gdv_disabled=""  # P4-05：enabled=0 的 Required 依赖（有界等待）
+    gdv_unsat=""   # 首个非终态未满足的 Required 依赖（有界等待）
     gdv_e=""
     gdv_tokens=$(printf '%s' "$gdv_norm" | sed 's/,/ /g')
     for gdv_e in $gdv_tokens; do
@@ -3176,25 +3192,61 @@ sched_dep_satisfied() {
             continue
         fi
         if [ "$gdv_opt" -eq 1 ]; then
-            gdv_unsat="$gdv_unsat opt-unsat:$gdv_depid"
+            gdv_optunsat="$gdv_optunsat opt-unsat:$gdv_depid"
             continue
         fi
-        echo "dep unsat: $gdv_depid (want $gdv_want, got $gdv_cur)"
-        return 1
+        # P4-05：Required 未满足 → 细分原因。终态不匹配最高优先级（dep failed，
+        # 立即 WAITING>FAILED）；缺失/禁用次之（有界等待，超时 FAILED）；其余
+        # 非终态（含 PENDING/RUNNING/WAITING）→ 等待。
+        gdv_dtf=$(registry_task_file "$gdv_depid" 2>/dev/null)
+        if [ -z "$gdv_dtf" ]; then
+            [ -z "$gdv_missing" ] && gdv_missing="$gdv_depid"
+            continue
+        fi
+        # 禁用优先于终态判定：DISABLED（enabled=0）视为非终态、不可作为满足依据
+        # （P4-05 需求 3）——即使曾 STOPPED/FAILED 也不计入终态匹配。
+        if [ "$gdv_cur" = "DISABLED" ] || [ "$(sched_task_field "$gdv_dtf" enabled 2>/dev/null)" = "0" ]; then
+            [ -z "$gdv_disabled" ] && gdv_disabled="$gdv_depid"
+            continue
+        fi
+        case "$gdv_cur" in
+            STOPPED|FAILED)
+                [ -z "$gdv_fail" ] && gdv_fail="$gdv_depid"
+                continue ;;
+        esac
+        [ -z "$gdv_unsat" ] && gdv_unsat="$gdv_depid"
     done
-    [ -z "$gdv_unsat" ] && echo "deps ok" || echo "deps ok (opt ignored: $gdv_unsat)"
+    if [ -n "$gdv_fail" ]; then
+        echo "dep failed: $gdv_fail (want STOPPED/FAILED, dep terminal mismatch)"
+        return 2
+    fi
+    if [ -n "$gdv_missing" ]; then
+        echo "dep missing: $gdv_missing (no such task)"
+        return 1
+    fi
+    if [ -n "$gdv_disabled" ]; then
+        echo "dep disabled: $gdv_disabled (enabled=0)"
+        return 1
+    fi
+    if [ -n "$gdv_unsat" ]; then
+        echo "dep unsat: $gdv_unsat (not yet terminal)"
+        return 1
+    fi
+    [ -z "$gdv_optunsat" ] && echo "deps ok" || echo "deps ok (opt ignored:$gdv_optunsat)"
     return 0
 }
 
 # 门控判定（P4-04 决策层；P4-06 在此叠加 condition 求值）：<tasks_dir> <id>
-# → 0=通过 1=未通过（stdout=原因）。当前仅依赖维度。
+# → 0=通过 1=未通过（可等待：缺失/禁用/非终态） 2=未通过（Required 终态不匹配，
+#   立即失败）。当前仅依赖维度。
 sched_gate_check() {
     sched_dep_satisfied "$1" "$2"
 }
 
 # 已 WAITING 任务复查（每个 tick 一次）：<base> <config> <tasks_dir> <id> <now> <boot>
 # → 0=解除并执行（cycle 由调用方 mark） 1=非 WAITING（跳过） 2=保持 WAITING
-#   3=rearm 回 PENDING（触发窗口已过） 4=超时→FAILED（gate_fail）
+#   3=rearm 回 PENDING（触发窗口已过） 4=FAILED（gate_fail：dep failed 立即失败
+#   / 超时兜底）
 sched_advance_waiting() {
     base=$1; config=$2; tasks=$3; id=$4
     now=${5:-$(date +%H%M)}; boot=${6:-0}
@@ -3239,14 +3291,25 @@ sched_advance_waiting() {
         sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=rearm|reason=window-closed|mode=$(sched_source_mode "$base")"
         return 3
     fi
-    # 依赖仍不满足：触发仍匹配且等待超 WAIT_MAX → WAITING>FAILED（reserved 边，
-    # cause 语义 action_failure；事件令牌 gate_fail；P4-05 细化传播）
+    # 依赖仍不满足。P4-05 传播：Required 依赖已终态但不匹配（grc=2，dep failed）
+    # → 立即 WAITING>FAILED（不等 WAIT_MAX；门控永久失败 reserved 边）。无论触发
+    # 窗口是否关闭都判失败——终态不匹配是永久条件，rearm 无意义（下一窗口触发时
+    # 由 sched_execute_one 重新门控）。
+    if [ "$grc" -eq 2 ]; then
+        sched_gate_clear "$run_dir"
+        state_log_event "$run_dir" "$id" gate_fail FAILED "" "" "$gres" >/dev/null 2>&1
+        sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=fail-dep|reason=$gres|mode=$(sched_source_mode "$base")"
+        return 4
+    fi
+    # 其余未满足（grc=1：dep missing / dep disabled / dep unsat）→ 有界等待：
+    # 触发仍匹配且等待超 WAIT_MAX → WAITING>FAILED（reserved 边，cause 语义
+    # action_failure；事件令牌 gate_fail；msg 附依赖原因）
     if [ "$due" -eq 1 ] && [ "$WAIT_MAX" -gt 0 ] 2>/dev/null; then
         gdv_el=$(sched_gate_elapsed "$run_dir")
         if [ "$gdv_el" -gt "$WAIT_MAX" ] 2>/dev/null; then
             sched_gate_clear "$run_dir"
-            state_log_event "$run_dir" "$id" gate_fail FAILED "" "" "wait timeout > WAIT_MAX=${WAIT_MAX}s" >/dev/null 2>&1
-            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=fail-timeout|mode=$(sched_source_mode "$base")"
+            state_log_event "$run_dir" "$id" gate_fail FAILED "" "" "wait timeout > WAIT_MAX=${WAIT_MAX}s; $gres" >/dev/null 2>&1
+            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=fail-timeout|reason=$gres|mode=$(sched_source_mode "$base")"
             return 4
         fi
     fi
@@ -4389,7 +4452,9 @@ ipc_op_edit_task() {   # <base> <config> <req_id> <id> <payload>
 #   - 稳定 Task ID 与旧运行 ID 双向解析（§13 task_cli_resolve_id + §9 idmap）；
 #   - start：终态重武装（FAILED/STOPPED/DISABLED → PENDING）→ PENDING→STARTING
 #     （manual_exec）→ action_run（STARTING→RUNNING，spawn）；已 RUNNING/STARTING
-#     → **skip 策略**（不重复启动）；STOPPING/RECOVERING/WAITING → 非法拒绝；
+#     → **skip 策略**（不重复启动）；非 force 下 STOPPING/RECOVERING/WAITING →
+#     非法拒绝；force=1（restart 亦走此）时 WAITING → **手动跳过依赖门控**直接
+#     STARTING（TSM 允许边 WAITING>STARTING manual_exec，P4-05）；
 #   - stop：RUNNING/HEALTHY/UNHEALTHY/STARTING/RECOVERING → STOPPING
 #     （stop_request）→ supervisor_stop_task（**只杀本运行目录 pid**，不误杀
 #     其他任务）→ 等进程退出 → STOPPING→STOPPED；PENDING/STOPPED/FAILED/
@@ -4472,6 +4537,10 @@ tctl_start() {
     tclv_cur=$(tctl_state "$tclv_rd")
     case "$tclv_cur" in
         PENDING|WAITING)
+            # P4-05：force start 对 WAITING 任务 = 手动跳过依赖门控（TSM 允许边
+            # WAITING>STARTING manual_exec）。清除等待时钟（残留会导致下次进入
+            # WAITING 时误判超时）。
+            [ "$tclv_cur" = "WAITING" ] && sched_gate_clear "$tclv_rd"
             state_log_event "$tclv_rd" "$tclv_canon" manual_exec STARTING "" "" "manual start" >/dev/null 2>&1 || {
                 echo "illegal transition $tclv_cur->STARTING ($tclv_canon)"; return 3; }
             ;;

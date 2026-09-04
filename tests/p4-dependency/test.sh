@@ -18,6 +18,10 @@
 #   §legacy  Legacy config.txt 零影响（legacy 路径无新解析接线）。
 #   §gate    P4-04 依赖门控 + WAITING 接线（scheduler-prod 式 execute_task shim +
 #            SCHED_CYCLE_NOW/GATE_NOW 确定性时钟）。
+#   §gate-p4-05  P4-05 Required/Optional 失败传播：依赖终态 FAILED(:STOPPED 语义)
+#            → 立即 WAITING>FAILED；:FAILED + dep FAILED → 满足执行；Optional
+#            FAILED/缺失 → 不阻断；缺失/禁用 → 有界等待超时 FAILED；force start/
+#            restart 跳过门控、非 force 非法拒绝；无永久 WAITING。
 # 加载：`. ./$RTLIB`（TCFG_DIR 先 export 隔离）。
 # ═══════════════════════════════════════════════════════════════════════════
 set -u
@@ -453,6 +457,131 @@ grep -q '|daemon_restart|FAILED|' "$G_TASKS/t_f/events.log" 2>/dev/null \
     && bad "P4-04 F: WAITING wrongly forced to FAILED on restart" || ok "P4-04 F: no daemon_restart forced on WAITING"
 SCHED_CYCLE_NOW=202609040900 GATE_NOW=8000 gtick 0900
 grep -q 'echo F-task' "$G_EXEC" && ok "P4-04 F: after restart, WAITING rechecked → released+executed (dep satisfied)" || bad "P4-04 F: t_f not released after restart"
+
+# ── §gate-p4-05：Required/Optional 失败传播（P4-05）─────────────────────────
+# 语义（docs/P4-05.md / dependency-schema.md ADR D15–D17）：
+#   - Required 依赖已终态（STOPPED|FAILED）但 != entry 指定 `:STATE` → 立即
+#     WAITING>FAILED（gate_fail，原因 `dep failed: <id>`，不等 WAIT_MAX）；
+#   - Required 依赖 :FAILED 且依赖 FAILED → 满足门控，照常执行；
+#   - `?` Optional 依赖 FAILED / 缺失 → 不阻断执行；
+#   - Required 依赖缺失（registry 无任务）→ dep missing：有界等待 → 超时 FAILED；
+#   - Required 依赖 DISABLED → dep disabled：非终态、不可作为满足依据，超时 FAILED；
+#   - 手动 start（force=1）/ restart 对 WAITING → 跳过依赖门控直接执行（manual_exec）；
+#     非 force start 对 WAITING → 非法拒绝（rc 3，状态不变）。
+
+# G) Required 依赖终态 FAILED（缺省 :STOPPED）→ WAITING>FAILED（不等超时）
+gate_task dep_g 23:59 "" "echo G-dep"
+gate_task t_g 09:30 "dep_g" "echo G-task"
+mkdir -p "$G_TASKS/dep_g"; echo FAILED > "$G_TASKS/dep_g/state.txt"
+SCHED_CYCLE_NOW=202609040930 GATE_NOW=9000 gtick 0930
+[ "$(cat "$G_TASKS/t_g/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-05 G: required dep FAILED (:STOPPED) → enters WAITING first" || bad "P4-05 G: t_g state=$(cat "$G_TASKS/t_g/state.txt" 2>/dev/null)"
+SCHED_CYCLE_NOW=202609040930 GATE_NOW=9001 gtick 0930
+[ "$(cat "$G_TASKS/t_g/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-05 G: dep terminal mismatch → immediate WAITING>FAILED (no WAIT_MAX wait)" || bad "P4-05 G: t_g state=$(cat "$G_TASKS/t_g/state.txt" 2>/dev/null)"
+grep -q '|gate_fail|FAILED|' "$G_TASKS/t_g/events.log" 2>/dev/null \
+    && grep -q 'dep failed: dep_g' "$G_TASKS/t_g/events.log" 2>/dev/null \
+    && ok "P4-05 G: gate_fail event records 'dep failed: dep_g'" || bad "P4-05 G: gate_fail/dep-failed reason missing"
+grep -q 'echo G-task' "$G_EXEC" && bad "P4-05 G: dep-failed task executed (forbidden)" || ok "P4-05 G: dep-failed task NOT executed"
+
+# H) Required 依赖指定 :FAILED 且依赖 FAILED → 满足门控，执行
+gate_task dep_h 23:59 "" "echo H-dep"
+gate_task t_h 09:31 "dep_h:FAILED" "echo H-task"
+mkdir -p "$G_TASKS/dep_h"; echo FAILED > "$G_TASKS/dep_h/state.txt"
+SCHED_CYCLE_NOW=202609040931 GATE_NOW=10000 gtick 0931
+grep -q 'echo H-task' "$G_EXEC" && [ "$(cat "$G_TASKS/t_h/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-05 H: required dep :FAILED + dep FAILED → gate satisfied, executed" || bad "P4-05 H: t_h state=$(cat "$G_TASKS/t_h/state.txt" 2>/dev/null) exec=$(grep -c 'echo H-task' "$G_EXEC")"
+
+# I) Optional（?）依赖 FAILED → 不阻断，照常执行
+gate_task dep_i 23:59 "" "echo I-dep"
+gate_task t_i 09:32 "?dep_i" "echo I-task"
+mkdir -p "$G_TASKS/dep_i"; echo FAILED > "$G_TASKS/dep_i/state.txt"
+SCHED_CYCLE_NOW=202609040932 GATE_NOW=11000 gtick 0932
+grep -q 'echo I-task' "$G_EXEC" && [ "$(cat "$G_TASKS/t_i/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-05 I: optional dep FAILED does NOT block (executed)" || bad "P4-05 I: t_i state=$(cat "$G_TASKS/t_i/state.txt" 2>/dev/null) exec=$(grep -c 'echo I-task' "$G_EXEC")"
+
+# J) Required 依赖 WAITING 期间缺失（registry 无任务）→ 有界等待 → 超时 FAILED
+gate_task dep_j 23:59 "" "echo J-dep"
+gate_task t_j 09:33 "dep_j" "echo J-task"
+SCHED_CYCLE_NOW=202609040933 GATE_NOW=12000 gtick 0933
+[ "$(cat "$G_TASKS/t_j/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-05 J: t_j enters WAITING (dep present pre-delete)" || bad "P4-05 J: t_j state=$(cat "$G_TASKS/t_j/state.txt" 2>/dev/null)"
+rm -f "$(registry_snapshot_dir 2>/dev/null)/dep_j.task"
+WAIT_MAX=5 SCHED_CYCLE_NOW=202609040933 GATE_NOW=12010 gtick 0933
+[ "$(cat "$G_TASKS/t_j/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-05 J: required dep missing → WAIT_MAX timeout → FAILED" || bad "P4-05 J: t_j state=$(cat "$G_TASKS/t_j/state.txt" 2>/dev/null)"
+grep -q 'dep missing: dep_j' "$G_TASKS/t_j/events.log" 2>/dev/null \
+    && ok "P4-05 J: timeout reason records 'dep missing: dep_j'" || bad "P4-05 J: dep missing reason missing"
+
+# J2) Optional 依赖缺失 → 不阻断，照常执行
+gate_task dep_k 23:59 "" "echo K-dep"
+gate_task t_k 09:34 "?dep_k" "echo K-task"
+SCHED_CYCLE_NOW=202609040934 GATE_NOW=13000 gtick 0934
+rm -f "$(registry_snapshot_dir 2>/dev/null)/dep_k.task"
+SCHED_CYCLE_NOW=202609040934 GATE_NOW=13010 gtick 0934
+grep -q 'echo K-task' "$G_EXEC" && [ "$(cat "$G_TASKS/t_k/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-05 J2: optional dep missing does NOT block (executed)" || bad "P4-05 J2: t_k state=$(cat "$G_TASKS/t_k/state.txt" 2>/dev/null) exec=$(grep -c 'echo K-task' "$G_EXEC")"
+
+# K) Required 依赖 DISABLED → 非终态不可满足 → 有界等待 → 超时 FAILED
+gate_task dep_l 23:59 "" "echo L-dep"
+gate_task t_l 09:35 "dep_l" "echo L-task"
+SCHED_CYCLE_NOW=202609040935 GATE_NOW=14000 gtick 0935
+[ "$(cat "$G_TASKS/t_l/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-05 K: t_l enters WAITING (pre-disable dep)" || bad "P4-05 K: t_l state=$(cat "$G_TASKS/t_l/state.txt" 2>/dev/null)"
+mkdir -p "$G_TASKS/dep_l"; echo DISABLED > "$G_TASKS/dep_l/state.txt"
+WAIT_MAX=5 SCHED_CYCLE_NOW=202609040935 GATE_NOW=14010 gtick 0935
+[ "$(cat "$G_TASKS/t_l/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-05 K: required dep DISABLED → WAIT_MAX timeout → FAILED" || bad "P4-05 K: t_l state=$(cat "$G_TASKS/t_l/state.txt" 2>/dev/null)"
+grep -q 'dep disabled: dep_l' "$G_TASKS/t_l/events.log" 2>/dev/null \
+    && ok "P4-05 K: timeout reason records 'dep disabled: dep_l'" || bad "P4-05 K: dep disabled reason missing"
+
+# L) 手动 start（force=1）对 WAITING → 跳过依赖门控直接执行
+gate_task dep_m 23:59 "" "echo M-dep"
+gate_task t_m 09:36 "dep_m" "echo M-task"
+SCHED_CYCLE_NOW=202609040936 GATE_NOW=15000 gtick 0936
+[ "$(cat "$G_TASKS/t_m/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-05 L: t_m enters WAITING (pre force-start)" || bad "P4-05 L: t_m state=$(cat "$G_TASKS/t_m/state.txt" 2>/dev/null)"
+M_OUT=$(tctl_start "$G_BASE" "$G_TASKS" t_m 1 2>/dev/null); M_RC=$?
+[ "$M_RC" -eq 0 ] && echo "$M_OUT" | grep -q 'started t_m' \
+    && grep -q 'echo M-task' "$G_EXEC" \
+    && ok "P4-05 L: force start on WAITING skips gate → executed" || bad "P4-05 L: rc=$M_RC out=$M_OUT exec=$(grep -c 'echo M-task' "$G_EXEC")"
+[ "$(cat "$G_TASKS/t_m/state.txt" 2>/dev/null)" = "RUNNING" ] \
+    && ok "P4-05 L: WAITING>STARTING manual_exec → RUNNING (spawn)" || bad "P4-05 L: t_m state=$(cat "$G_TASKS/t_m/state.txt" 2>/dev/null)"
+[ ! -f "$G_TASKS/t_m/gate.wait_start" ] \
+    && ok "P4-05 L: wait clock cleared on force start" || bad "P4-05 L: gate.wait_start not cleared"
+
+# M) 非 force start 对 WAITING → 非法拒绝（rc 3），状态不变
+gate_task dep_n 23:59 "" "echo N-dep"
+gate_task t_n 09:37 "dep_n" "echo N-task"
+SCHED_CYCLE_NOW=202609040937 GATE_NOW=16000 gtick 0937
+[ "$(cat "$G_TASKS/t_n/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-05 M: t_n enters WAITING (pre non-force start)" || bad "P4-05 M: t_n state=$(cat "$G_TASKS/t_n/state.txt" 2>/dev/null)"
+N_OUT=$(tctl_start "$G_BASE" "$G_TASKS" t_n 0 2>/dev/null); N_RC=$?
+[ "$N_RC" -eq 3 ] && echo "$N_OUT" | grep -q 'illegal' \
+    && ok "P4-05 M: non-force start on WAITING → illegal (rc 3)" || bad "P4-05 M: rc=$N_RC out=$N_OUT"
+[ "$(cat "$G_TASKS/t_n/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && grep -q 'echo N-task' "$G_EXEC" && bad "P4-05 M: non-force start executed task" || ok "P4-05 M: state unchanged (still WAITING), NOT executed"
+# 收尾：让 t_n 经超时落终态（无永久 WAITING）
+WAIT_MAX=5 SCHED_CYCLE_NOW=202609040937 GATE_NOW=16010 gtick 0937
+[ "$(cat "$G_TASKS/t_n/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-05 M: t_n later times out → FAILED (WAITING has an exit)" || bad "P4-05 M: t_n state=$(cat "$G_TASKS/t_n/state.txt" 2>/dev/null)"
+
+# N) restart（stop + force start）对 WAITING → 跳过门控
+gate_task dep_o 23:59 "" "echo O-dep"
+gate_task t_o 09:38 "dep_o" "echo O-task"
+SCHED_CYCLE_NOW=202609040938 GATE_NOW=17000 gtick 0938
+[ "$(cat "$G_TASKS/t_o/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-05 N: t_o enters WAITING (pre restart)" || bad "P4-05 N: t_o state=$(cat "$G_TASKS/t_o/state.txt" 2>/dev/null)"
+O_OUT=$(tctl_restart "$G_BASE" "$G_TASKS" t_o 2>/dev/null); O_RC=$?
+[ "$O_RC" -eq 0 ] && grep -q 'echo O-task' "$G_EXEC" \
+    && ok "P4-05 N: restart on WAITING skips gate → executed" || bad "P4-05 N: rc=$O_RC out=$O_OUT exec=$(grep -c 'echo O-task' "$G_EXEC")"
+
+# O) 无永久 WAITING：全部场景结束时无任务残留 WAITING（终态可达）
+if [ -z "$(grep -l '^WAITING$' "$G_TASKS"/*/state.txt 2>/dev/null)" ]; then
+    ok "P4-05 O: no task left in WAITING (terminal reachable in every scenario)"
+else
+    bad "P4-05 O: WAITING residual: $(grep -l '^WAITING$' "$G_TASKS"/*/state.txt 2>/dev/null | tr '\n' ' ')"
+fi
 
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────
 # legacy 解析/执行路径无 dependency/condition 新接线（C2/C4 零改动）
