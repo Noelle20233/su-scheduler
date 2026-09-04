@@ -140,8 +140,12 @@ TRIGGER_TODAY=$WED TRIGGER_DECISION_NOW=0900 TRIGGER_DECISION_LINE='weekly:1:080
     && bad "advanced weekly should not match on Wednesday" || ok "advanced weekly no match on Wednesday"
 rm -f "$SF2"
 # nweekly 语法可识别并接受（格式形状；实际周差在决策层测试）
-TPR_LOG=0 provider_dispatch trigger advanced matches 'nweekly:2:5:1400' >/dev/null 2>&1 \
-    && bad "nweekly no-context should not match" || ok "nweekly no-context rejected"
+# 注（2026-09-04 修复）：原用例不设 TRIGGER_TODAY/NOW → 回退真实时钟，周五（dow=5）
+# 且过 14:00 时 nweekly:2:5:1400 会真实匹配 → 测试自身日期/时间敏感缺陷（P4-06 门禁
+# 13:10 跑时 now<1400 才通过）。固定为周一上下文（dow=1≠5）使判定确定性。
+TRIGGER_TODAY=$MON TRIGGER_DECISION_NOW=0900 TPR_LOG=0 \
+    provider_dispatch trigger advanced matches 'nweekly:2:5:1400' >/dev/null 2>&1 \
+    && bad "nweekly non-matching context should not match" || ok "nweekly non-matching context rejected"
 
 # ── 5) Action：CommandActionProvider 生命周期与全模式（P1-08）───────────────
 # 引擎式调用约定：start/restart 的 stdout=PID，**引擎用文件接收后读取**（镜像
