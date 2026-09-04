@@ -25,8 +25,8 @@ P5 规划。**
   影响，daemon 主循环结构未动（`while true` 恰 1），service.sh 零改动。
 - **P4 范围边界（§4）**：DAG / 云同步 / 多设备 / 第二常驻循环 / 通用 Condition
   求值器零实现；无新增运行期外部依赖；无 `eval`/`sh -c` 拼接执行用户输入。
-- **全量 WSL 门禁最终数字由队长补跑后回填（§5 标注「待队长填」）**；MINGW 本地
-  专项套件结果已记录。
+- **全量 WSL 门禁最终数字已回填（§5.1）**：**1900 PASS / 0 FAIL**（WSL 权威宿主，
+  `ALL SUITES GREEN`，exit 0）；MINGW 本地专项套件结果已记录。
 
 ---
 
@@ -107,14 +107,14 @@ WAITING 数量上限经 D35 裁决「不设显式上限」（理由见 ADR D35 �
 
 ### 5.1 全量 WSL 门禁（权威宿主）
 
-> ⏳ **待队长填**：`bash tests/run_tests.sh`（L1+L2+L4）在 WSL 权威宿主的最终
-> PASS/FAIL 数字与 exit code。P4-01 基线为 1631 PASS / 0 FAIL；P4-09 出口时为
-> p4-dependency 207/0 等专项全绿。P4-10 仅含 1 处 `cut` 替换 + 新增 13 断言，
-> 预期全绿。
+> **已回填（队长复核，2026-09-04）**：`bash tests/run_tests.sh`（L1+L2+L4）在
+> WSL 权威宿主（~/su-scheduler 原生文件系统）最终结果为 **ALL SUITES GREEN**，
+> **PASS=1900 / FAIL=0**，exit 0。P4-01 基线 1631 → P4-10 出口 1900（P4 全期净增
+> 269 断言，0 失败）。trace log：`tests/results/run_tests-20260904-212539.log`。
 
 | 套件 | MINGW 本地（本任务） | WSL 权威 |
 | :-- | :-- | :-- |
-| 全量 run_tests.sh | 不跑（AGENTS §4.4：Windows 不跑全量） | ⏳ 队长填 |
+| 全量 run_tests.sh | 不跑（AGENTS §4.4：Windows 不跑全量） | **1900 PASS / 0 FAIL**（45 套件全绿，exit 0） |
 
 ### 5.2 重点专项套件（MINGW 本地实测）
 
@@ -147,7 +147,7 @@ WAITING 数量上限经 D35 裁决「不设显式上限」（理由见 ADR D35 �
 
 | 项 | 状态 | 说明 / 理由 | P5 建议 |
 | :-- | :-- | :-- | :-- |
-| 全量 WSL 门禁最终数字 | ⏳ 待队长回填 | 本环境为 MINGW（AGENTS §4.4 不在 Windows 跑全量） | §5.1 |
+| 全量 WSL 门禁最终数字 | ✅ 已回填 | **1900 PASS / 0 FAIL**（WSL 权威宿主，§5.1） | 无需跟进 |
 | L3 设备冒烟（p3-device / Dependency 门控真机链路） | ⏳ 待设备 | P4 未增设备用例；D34 mksh 修复需真机 mksh 复验（Android 16） | P5 设备矩阵扩展时执行 `tests/p3-device/smoke.sh --with-device`（含 Runtime 1.28.0 断言） |
 | WAITING 显式数量上限 | 已裁决不设（D35） | WAIT_MAX 有界终态 + registry 有界 + prune 豁免有终态保证 | 若「注册任务无上限/自动生成依赖链」进入 P5，按 D35 重估 |
 | Condition 运算符扩展（`<`/`>`/`>=`/`<=`/`contains`） | 明确不在 P4 范围（ADR D19） | P4-06 只做 `==`/`!=` | P5 可选 |
@@ -163,6 +163,6 @@ WAITING 数量上限经 D35 裁决「不设显式上限」（理由见 ADR D35 �
 2. 8 项安全/资源/兼容性核查通过（§2，含 D34 修复与 FAIL→PASS 证据）；
 3. B1–B14 冻结契约全保持（§3）；
 4. C1–C5 / 禁止项审计通过（§4）；
-5. 专项套件 MINGW 全绿（§5.2），全量 WSL 门禁待队长回填（§5.1，回填后闭合
-   出口标准）；
+5. 专项套件 MINGW 全绿（§5.2），全量 WSL 门禁 **1900 PASS / 0 FAIL**（§5.1，
+   出口标准闭合）；
 6. 配置格式零变更、Legacy 零影响、无新依赖、无第二常驻循环。
