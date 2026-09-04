@@ -170,6 +170,39 @@ poll
 rc=$(req_rc "scr1")
 [ "$rc" = "4" ] && ok "P3-08 fuzz-c: script relative path -> configuration_invalid" || bad "P3-08 fuzz-c: script relative rc=$rc"
 
+# ── P4-06 Condition 表达式注入：校验期拒绝，零副作用、零执行 ────────────
+# condition 是受限表达式（{{ 谓词 }}）；注入串 / 未授权谓词 / 越界 / 穿越 → VALIDATE_TASK
+# 拒绝（rc 4），且绝不进入 shell 求值路径（EXEC_LOG 零新增）。
+cond_inj_cases=(
+  "{{ task.state(x) = Y; rm -rf / }}"
+  '$(id)'
+  'x }; pwd'
+  '{{ env.HOME == /root }}'
+  '{{ time.hour == 99 }}'
+  '{{ file.exists(/etc/passwd) }}'
+  '{{ time.hour >= 8 }}'
+  'sh -c id'
+)
+cid=0
+for cexpr in "${cond_inj_cases[@]}"; do
+    cid=$((cid + 1))
+    cond_payload=$(printf 'schema_version=2\nid=cond_inj_%d\ntrigger=09:00\ncondition=%s\naction.command=echo ok\n' "$cid" "$cexpr")
+    drop_req "cinj$cid" "cinj$cid|VALIDATE_TASK|payload=$(b64 "$cond_payload")"
+done
+SNAP_C=$(tc_snap)
+poll
+cbad=0
+for cid in $(seq 1 ${#cond_inj_cases[@]}); do
+    rc=$(req_rc "cinj$cid")
+    [ "$rc" = "4" ] || cbad=$((cbad + 1))
+done
+[ "$cbad" -eq 0 ] && ok "P4-06 fuzz: ${#cond_inj_cases[@]} condition injection forms rejected (rc 4, no shell eval)" \
+    || bad "P4-06 fuzz: $cbad condition injection forms NOT rejected"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P4-06 fuzz: ZERO Root actions executed by condition injection (no shell execution)" \
+    || bad "P4-06 fuzz: condition injection executed ($(wc -l < "$EXEC_LOG"))"
+[ "$(tc_snap)" = "$SNAP_C" ] && ok "P4-06 fuzz: task-config byte-identical after condition injection" \
+    || bad "P4-06 fuzz: task-config mutated by condition injection"
+
 # ── 副作用：task-config 逐字节不变；EXEC_LOG 仅安全启动那一次（如有）───
 # 前面所有恶意请求不应改 task-config（除 UPDATE 合法更新 command 外）
 grep -q '^action.command=echo ok; rm -rf /$' "$TCFG_DIR/$mkid.task" 2>/dev/null \

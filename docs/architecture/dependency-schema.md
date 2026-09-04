@@ -293,6 +293,59 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 10. P4-06 增补裁决：Condition 受限表达式引擎（ADR D18–D22）
+
+> **状态**：已接受（P4-06 冻结）。在 D3（存储层安全）之上定义受限表达式文法、
+> 白名单谓词、求值语义与安全边界。**禁止任意 Shell 执行**（无 eval / sh -c 拼接 /
+> 用户函数 / 重定向）。
+> **配套实现**：Runtime §26b `cond_grammar_ok` / `cond_eval`（L4990–5210）、
+> `sched_cond_check` 门控并列接入（§20）；写路径校验期拒绝（§19/§23）。详见
+> docs/P4-06.md。
+
+### D18 谓词白名单
+
+表达式必须为 `{{ <谓词> }}` 包裹的**单谓词**（`{{`/`}}` 内首尾空白容忍）。白名单：
+
+| 谓词 | 语义 | 校验约束 |
+| :-- | :-- | :-- |
+| `task.state(<id>) ==/!= <STATE>` | 另一任务实时态比较（读 `tasks/<id>/state.txt`，缺省 PENDING） | id 过 `secv_id_ok`；STATE ∈ TSM 11 态（`COND_TSM_STATES`） |
+| `time.hour ==/!= <0-23>` | 当前小时 | 数字 0-23（去前导零，防 octal） |
+| `time.minute ==/!= <0-59>` | 当前分钟 | 数字 0-59 |
+| `time.wday ==/!= <0-6>` | 星期（0=Sunday） | 数字 0-6 |
+| `env.<NAME> ==/!= <值>` | 白名单环境变量 | **仅** CONFIG_FILE / DATA_DIR / TASKS_DIR（`COND_ENV_ALLOW`）；其余 env.<X> 非法拒绝 |
+| `file.exists(<绝对路径>)` | 文件/目录存在性（只读探测） | 必须绝对路径；仅允许 CONFIG_FILE 同目录或 DATA_DIR 下（词法包含 + 禁 `..`/`//`）；无运算符 |
+
+### D19 运算符集合
+
+- 仅 `==`（等于）/ `!=`（不等于）。`<` / `>` / `>=` / `<=` / `contains` **不在
+  P4-06 范围**（ADR 声明，P5 可扩）。`file.exists` 无比较运算符（存在即真）。
+
+### D20 三态语义
+
+- **真** → 允许执行；
+- **假** → 本轮不满足（**不进入 WAITING、不改状态、不 mark cycle**，直接跳过，
+  下一周期再求值；`sched_advance_waiting` 中条件未满足 → rearm 回 PENDING）；
+- **非法** → 校验期拒绝（写盘前，旧配置逐字节不变，D5/B9 原子性）+
+  运行期防御（理论不应发生，`cond_eval` 返回 2，视为「不满足」并记录，不执行）。
+- condition 空/缺省 = 恒真（不额外求值）。
+
+### D21 安全边界
+
+- 禁止 `eval` / `sh -c` / `$(...)` / 反引号 / 管道到命令 / 重定向 / 用户函数。
+- 纯 POSIX 字符串解析 + case/字段比对 + 白名单表驱动，**绝不把用户表达式拼进任何
+  被执行的 shell 片段**（`COND_PREDS` / `conde_charset_ok` 双保险）。
+- `file.exists` 路径仅允许 CONFIG_FILE 同目录或 DATA_DIR 下（`conde_path_in` 词法
+  包含 + 禁 `..`/`//`）；运行时只读探测，无副作用。
+
+### D22 与依赖门控关系
+
+- 条件与依赖门控**并列 AND**：依赖满足 + 条件真 → 执行；条件假 → 本轮跳过。
+- `sched_gate_check`（依赖维度，返回 0/1/2，P4-04/05 契约）保持不动；条件维度由
+  `sched_cond_check` 独立返回 0=通过 / 1=未满足 / 2=非法（防御），互不破坏返回码
+  语义。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -308,3 +361,8 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   终态不匹配 → 立即 WAITING>FAILED；缺失/禁用 → 有界等待超时 FAILED；Optional
   不参与失败传播；force start/restart 跳过门控；WAIT_MAX 有界语义成文。重试退避
   （FAILED>WAITING）留 P4-07，Condition 求值留 P4-06。
+- 2026-09-04：P4-06 增补 D18–D22（Condition 受限表达式引擎）。白名单谓词（task.
+  state / time.* / env.* 三白名单 / file.exists 受限路径）、运算符仅 ==/!=、三态
+  语义（真执行/假跳过无副作用/非法校验期拒绝+运行期防御）、禁止任意 Shell 求值、
+  与依赖门控并列 AND（sched_cond_check 独立契约）。重试退避留 P4-07，WebUI 开放
+  编辑留 P4-08，CLI 查询展示留 P4-09。

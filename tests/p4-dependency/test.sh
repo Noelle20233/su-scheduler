@@ -156,7 +156,8 @@ min_task "$TCFG_DIR" t_daily
 GOOD1=$(ok_task t_dep | sed 's#^id=.*#id=t_dep#')
 DEP_GOOD=$(printf '%s\n' "dependency=?t_boot:FAILED,?t_daily" "$GOOD1")
 if tcfg_editor_validate_payload "$DEP_GOOD"; then ok "P4-02 editor: legal dependency payload accepted"; else bad "P4-02 editor: legal dependency rejected"; fi
-COND_GOOD=$(printf '%s\n' "condition=time.hour>=8" "$GOOD1")
+# P4-06 修正：合法 condition 改用白名单文法 `{{ time.hour == 8 }}`（`>=` 运算符归 P5）
+COND_GOOD=$(printf '%s\n' "condition={{ time.hour == 8 }}" "$GOOD1")
 if tcfg_editor_validate_payload "$COND_GOOD"; then ok "P4-02 editor: legal condition payload accepted"; else bad "P4-02 editor: legal condition rejected"; fi
 # 非法 dependency / condition → 拒绝（后端权威）
 DEP_BAD=$(printf '%s\n' "dependency=t_a:IDLE" "$GOOD1")
@@ -168,7 +169,7 @@ if tcfg_editor_validate_payload "$COND_BAD"; then bad "P4-02 editor: TAB conditi
 
 # ── §store：tcfg_validate_task 拒绝非法 dependency/condition 任务文件 ─────
 VALIDF="$T/valid.task"
-printf '%s\n' "schema_version=2" "id=valid" "trigger=08:30" "dependency=a,b" "condition=x=y" > "$VALIDF"
+printf '%s\n' "schema_version=2" "id=valid" "trigger=08:30" "dependency=a,b" "condition={{ time.hour == 8 }}" > "$VALIDF"
 tcfg_validate_task "$VALIDF" && ok "P4-02 store: valid dependency/condition task accepted" || bad "P4-02 store: valid task rejected"
 BADF="$T/bad.task"
 printf '%s\n' "schema_version=2" "id=bad" "trigger=08:30" "dependency=../evil" > "$BADF"
@@ -205,11 +206,11 @@ tcfg_new_task "$C_ID" "08:30" "echo cli" >/dev/null 2>&1
 cli_run cmd_task_config set "$C_ID" dependency "?t_boot:FAILED,?t_daily"
 [ "$CLI_RC" -eq 0 ] && grep -q '^dependency=?t_boot:FAILED,?t_daily$' "$TCFG_DIR/$C_ID.task" \
     && ok "P4-02 cli: set dependency persisted (comma canonical)" || bad "P4-02 cli: set dependency rc=$CLI_RC"
-cli_run cmd_task_config set "$C_ID" condition "time.hour>=8"
-[ "$CLI_RC" -eq 0 ] && grep -q '^condition=time.hour>=8$' "$TCFG_DIR/$C_ID.task" \
+cli_run cmd_task_config set "$C_ID" condition "{{ time.hour == 8 }}"
+[ "$CLI_RC" -eq 0 ] && grep -q '^condition={{ time.hour == 8 }}$' "$TCFG_DIR/$C_ID.task" \
     && ok "P4-02 cli: set condition persisted" || bad "P4-02 cli: set condition rc=$CLI_RC"
 cli_run cmd_task_config show "$C_ID"
-echo "$CLI_OUT" | grep -q '^dependency=?t_boot:FAILED,?t_daily$' && echo "$CLI_OUT" | grep -q '^condition=time.hour>=8$' \
+echo "$CLI_OUT" | grep -q '^dependency=?t_boot:FAILED,?t_daily$' && echo "$CLI_OUT" | grep -q '^condition={{ time.hour == 8 }}$' \
     && ok "P4-02 cli: show round-trips dependency+condition" || bad "P4-02 cli: show mismatch"
 # CLI set 非法 dependency → 拒绝且原文件逐字节不变（原子性 B9）
 MD5B=$(md5sum "$TCFG_DIR/$C_ID.task" | cut -d' ' -f1)
@@ -581,6 +582,150 @@ if [ -z "$(grep -l '^WAITING$' "$G_TASKS"/*/state.txt 2>/dev/null)" ]; then
     ok "P4-05 O: no task left in WAITING (terminal reachable in every scenario)"
 else
     bad "P4-05 O: WAITING residual: $(grep -l '^WAITING$' "$G_TASKS"/*/state.txt 2>/dev/null | tr '\n' ' ')"
+fi
+
+# ── §cond-p4-06：Condition 受限表达式引擎（P4-06）─────────────────────────
+# 语义（docs/P4-06.md / dependency-schema.md ADR D18–D22）：
+#   - 语法 `{{ <谓词> }}` 单谓词；白名单谓词：task.state/time.hour/time.minute/
+#     time.wday/env.<CONFIG_FILE|DATA_DIR|TASKS_DIR>/file.exists；运算符 ==/!=。
+#   - 三态：真→执行；假→本轮不满足（直接跳过，不进入 WAITING、不改状态、不 mark
+#     cycle，下周期再求值）；非法→校验期拒绝（写盘前，旧配置逐字节不变）、运行期
+#     防御性不执行（记录）。condition 空=恒真。
+#   - 安全硬性：禁止 eval/sh -c/$(...)/反引号/重定向/管道到命令/用户函数；纯字符串
+#     解析 + 白名单表驱动；注入字符串零副作用、零执行。
+Q_BASE="$T/q-base"; Q_TCFG="$T/q-tc"; Q_TASKS="$T/q-tasks"; Q_CFG="$T/q.cfg"
+rm -rf "$Q_BASE" "$Q_TCFG" "$Q_TASKS"; mkdir -p "$Q_BASE" "$Q_TCFG" "$Q_TASKS"
+echo managed > "$Q_TCFG/MANAGED"; : > "$Q_CFG"
+export TCFG_DIR="$Q_TCFG"; export TR_BASE="$Q_BASE"; export TASKS_DIR="$Q_TASKS"
+# env/file.exists 谓词依赖的允许目录（模拟 daemon 上下文）：CONFIG_FILE 同目录 + DATA_DIR
+export CONFIG_FILE="$Q_CFG"; export DATA_DIR="$Q_BASE"
+Q_EXEC="$T/q-exec.log"; : > "$Q_EXEC"
+execute_task() { id=$1; cmd=$2; ns=$3; ne=$4; msg=$5; itr=$6; tmx=$7
+    d="$TASKS_DIR/$id"; mkdir -p "$d"
+    echo "$cmd" > "$d/command.txt"; echo "RUNNING" > "$d/status.txt"
+    echo "$id|$cmd" >> "$Q_EXEC"
+    echo "0" > "$d/exit_code.txt"; echo "SUCCESS" > "$d/status.txt"; return 0; }
+cond_task() {   # <id> <trigger> <cond> <cmd> → 最小合法 Task v2（含 condition）
+    printf 'schema_version=2\nid=%s\ntrigger=%s\ncondition=%s\naction.command=%s\n' \
+        "$1" "$2" "$3" "$4" > "$Q_TCFG/$1.task"
+}
+qtick() { scheduler_tick "$Q_BASE" "$Q_CFG" "$Q_TASKS" "$1" >/dev/null 2>&1; state_sync_all "$Q_TASKS" >/dev/null 2>&1; }
+qexec_md5() { md5sum "$Q_EXEC" 2>/dev/null | cut -d' ' -f1; }
+
+# P) 条件真（时间谓词）→ 执行；假 → 不执行（EXEC_LOG 无变化）
+# 时间确定性：cond_eval 走 SCHED 的 now（qtick 传参 now=0850 → hour=08, minute=50）。
+#   time.hour == 8  真（now=0850 的 hour=08）；time.hour != 8  假（恒假）。
+cond_task q_p1 08:50 "{{ time.hour == 8 }}" "echo P-exec"
+# 「!= 当前 tick 小时」构造运行期假（now=0850 的 hour=08 != 8 恒假）
+cond_task q_p2 08:50 "{{ time.hour != 8 }}" "echo Q-not-exec"
+cond_task q_emp 08:50 "" "echo EMP-exec"
+SCHED_CYCLE_NOW=202609040850 qtick 0850
+grep -q 'echo P-exec' "$Q_EXEC" && ok "P4-06 P: time predicate true → executed" || bad "P4-06 P: true-time task NOT executed"
+[ ! -f "$Q_TASKS/q_p1/state.txt" ] || [ "$(cat "$Q_TASKS/q_p1/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-06 P: true-condition task completed STOPPED" || bad "P4-06 P: q_p1 state=$(cat "$Q_TASKS/q_p1/state.txt" 2>/dev/null)"
+grep -q 'echo Q-not-exec' "$Q_EXEC" && bad "P4-06 P: false-condition task executed" || ok "P4-06 P: false-condition task NOT executed (EXEC_LOG unchanged)"
+[ ! -f "$Q_TASKS/q_p2/state.txt" ] \
+    && ok "P4-06 P: false-condition task leaves NO run dir / no state write (no side effect)" \
+    || bad "P4-06 P: q_p2 state written ($(cat "$Q_TASKS/q_p2/state.txt" 2>/dev/null))"
+grep -q 'echo EMP-exec' "$Q_EXEC" && ok "P4-06 P: empty condition = always true → executed" || bad "P4-06 P: empty-condition task NOT executed"
+# q_p2 未执行 → md5 无变化（本轮未产生副作用）
+QMD5_BEFORE=$(qexec_md5)
+qtick 0851
+[ "$(qexec_md5)" = "$QMD5_BEFORE" ] && ok "P4-06 P: false-condition round produces zero side effects (exec md5 unchanged)" \
+    || bad "P4-06 P: exec log changed after false-condition round"
+
+# Q) task.state 谓词：比较另一任务实时态（== 与 != 各状态）
+cond_task q_dep 23:59 "" "echo DQ"
+cond_task q_t1 09:00 "{{ task.state(q_dep) == RUNNING }}" "echo T1"
+cond_task q_t2 09:00 "{{ task.state(q_dep) != RUNNING }}" "echo T2"
+mkdir -p "$Q_TASKS/q_dep"; echo RUNNING > "$Q_TASKS/q_dep/state.txt"
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo T1' "$Q_EXEC" && ok "P4-06 Q: task.state(==RUNNING) true → executed" || bad "P4-06 Q: T1 not executed"
+grep -q 'echo T2' "$Q_EXEC" && bad "P4-06 Q: task.state(!=RUNNING) false → wrongly executed" || ok "P4-06 Q: task.state(!=RUNNING) false → NOT executed"
+# 切态后复查：FAILED → != RUNNING 为真
+echo FAILED > "$Q_TASKS/q_dep/state.txt"
+cond_task q_t3 09:00 "{{ task.state(q_dep) == FAILED }}" "echo T3"
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo T3' "$Q_EXEC" && ok "P4-06 Q: task.state(==FAILED) true → executed" || bad "P4-06 Q: T3 not executed"
+cond_task q_t4 09:00 "{{ task.state(q_dep) == PENDING }}" "echo T4"
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo T4' "$Q_EXEC" && bad "P4-06 Q: task.state(==PENDING) on FAILED wrongly true" || ok "P4-06 Q: task.state(==PENDING) false → NOT executed"
+
+# R) 校验期非法拒绝（tcfg_set_field / tcfg_apply_task / 越界 / 未授权 / 注入）
+# 写路径非法 condition → rc 非 0 且原文件逐字节不变（原子性 B9）
+cond_task q_r1 09:00 "{{ time.hour == 8 }}" "echo R"
+Q_R1_MD5=$(md5sum "$Q_TCFG/q_r1.task" | cut -d' ' -f1)
+for bad in '{{ time.hour >= 8 }}' '{{ time.hour == 99 }}' '{{ time.minute == 60 }}' \
+           '{{ time.wday == 7 }}' '{{ env.HOME == /root }}' '{{ env.CONFIG_FILE == a;b }}' \
+           '{{ task.state(q_dep) == RUNNING }}; rm -rf /' 'x }; pwd' '$(id)' '`id`' \
+           '{{ file.exists(../etc/passwd) }}' '{{ file.exists(/etc/passwd) }}' \
+           '{{ file.exists(relative) }}' 'not wrapped' '{{ }}' '{{ task.state() == RUNNING }}' \
+           '{{ task.state(q_dep) == IDLE }}' '{{ time.hour = 8 }}' '{{ foo == bar }}'; do
+    if tcfg_set_field q_r1 condition "$bad" >/dev/null 2>&1; then
+        bad "P4-06 R: illegal condition ACCEPTED by set: '$bad'"
+    fi
+done
+ok "P4-06 R: all illegal condition forms rejected by tcfg_set_field"
+[ "$(md5sum "$Q_TCFG/q_r1.task" | cut -d' ' -f1)" = "$Q_R1_MD5" ] \
+    && ok "P4-06 R: rejected writes leave task file byte-identical" || bad "P4-06 R: task file mutated on rejection"
+# apply 路径非法 → 拒绝（rc 非 0）
+cond_task q_r2 09:00 "{{ time.hour == 8 }}" "echo R2"
+Q_R2_MD5=$(md5sum "$Q_TCFG/q_r2.task" | cut -d' ' -f1)
+if tcfg_apply_task q_r2 "$(printf 'schema_version=2\nid=q_r2\ntrigger=09:00\ncondition={{ env.SECRET == x }}\naction.command=echo R2\n')" >/dev/null 2>&1; then
+    bad "P4-06 R: apply accepted unauthorized env condition"
+else
+    ok "P4-06 R: apply rejects unauthorized env condition (rc non-zero)"
+fi
+[ "$(md5sum "$Q_TCFG/q_r2.task" | cut -d' ' -f1)" = "$Q_R2_MD5" ] \
+    && ok "P4-06 R: apply rejection leaves original task byte-identical" || bad "P4-06 R: apply mutated task on rejection"
+# 运行期非法（防御性）：手动写非法 condition 文件 → 求值视为「不满足」且不执行
+cond_task q_r3 09:00 "{{ time.hour == 8 }}" "echo R3"
+# 直接落盘一个非法 condition（绕过校验，模拟理论不应发生的防御场景）
+printf 'schema_version=2\nid=q_r3\ntrigger=09:00\ncondition={{ oops == 1 }}\naction.command=echo R3\n' > "$Q_TCFG/q_r3.task"
+sched_reload "$Q_BASE" "$Q_CFG" >/dev/null 2>&1
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo R3' "$Q_EXEC" && bad "P4-06 R: illegal runtime condition executed (defensive gate failed)" \
+    || ok "P4-06 R: illegal runtime condition treated as unmet → NOT executed (defensive)"
+
+# S) env.* 白名单：CONFIG_FILE / DATA_DIR / TASKS_DIR 比较；其余 env → 拒绝
+cond_task q_e1 09:00 "{{ env.CONFIG_FILE == $Q_CFG }}" "echo E1"
+# 先建真实 config 文件供存在/比较
+: > "$Q_CFG"
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo E1' "$Q_EXEC" && ok "P4-06 S: env.CONFIG_FILE==path true → executed" || bad "P4-06 S: E1 not executed (env compare failed)"
+cond_task q_e2 09:00 "{{ env.TASKS_DIR == $Q_TASKS }}" "echo E2"
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo E2' "$Q_EXEC" && ok "P4-06 S: env.TASKS_DIR==path true → executed" || bad "P4-06 S: E2 not executed"
+# 其余 env（未授权）→ 校验期拒绝
+if tcfg_set_field q_r1 condition "{{ env.HOME == /root }}" >/dev/null 2>&1; then
+    bad "P4-06 S: unauthorized env.HOME accepted"
+else
+    ok "P4-06 S: unauthorized env.HOME rejected (whitelist only CONFIG_FILE/DATA_DIR/TASKS_DIR)"
+fi
+
+# T) file.exists：允许目录（CONFIG_FILE 同目录 / DATA_DIR 下）内文件存在 → 真；
+#    目录穿越/系统路径 → 校验期拒绝
+cond_task q_f1 09:00 "{{ file.exists($Q_CFG) }}" "echo F1"   # CONFIG_FILE 同目录文件
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo F1' "$Q_EXEC" && ok "P4-06 T: file.exists(config in allow dir) true → executed" || bad "P4-06 T: F1 not executed"
+cond_task q_f2 09:00 "{{ file.exists($Q_BASE) }}" "echo F2"   # DATA_DIR 下目录
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo F2' "$Q_EXEC" && ok "P4-06 T: file.exists(DATA_DIR dir) true → executed" || bad "P4-06 T: F2 not executed"
+# 穿越/系统路径 → 校验期拒绝（tcfg_set_field 在 §R 已覆盖 /etc/passwd、../，这里再确认 data-dir 外）
+if tcfg_set_field q_r1 condition "{{ file.exists(/data/adb/su-scheduler/../../etc/passwd) }}" >/dev/null 2>&1; then
+    bad "P4-06 T: file.exists traversal into system path accepted"
+else
+    ok "P4-06 T: file.exists path traversal rejected (validated lexical, no side effect)"
+fi
+
+# U) 运算符 ==/!= 合法；其它运算符（< > >= <= contains）→ 校验期拒绝（已含 §R）
+cond_task q_u 09:00 "{{ time.hour != 23 }}" "echo U"
+SCHED_CYCLE_NOW=202609040900 qtick 0900
+grep -q 'echo U' "$Q_EXEC" && ok "P4-06 U: '!=' operator valid → executed (hour=09 != 23 true)" || bad "P4-06 U: != not executed"
+if tcfg_set_field q_r1 condition "{{ time.hour contains 8 }}" >/dev/null 2>&1; then
+    bad "P4-06 U: unsupported 'contains' operator accepted"
+else
+    ok "P4-06 U: unsupported operator 'contains' rejected (== / != only)"
 fi
 
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────

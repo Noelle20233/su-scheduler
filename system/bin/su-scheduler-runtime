@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.23.0"
+RUNTIME_LIB_VERSION="1.24.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -2668,6 +2668,7 @@ tcfg_validate_task() {   # <file> → 0 合法 / 1 非法（绝不清空、绝�
     dep_validate "$tcfgv_dep" || return 1
     tcfgv_cond=$(tcfg_get "$tcfgv_f" condition)
     cond_validate "$tcfgv_cond" || return 1
+    [ -z "$tcfgv_cond" ] || cond_grammar_ok "$tcfgv_cond" || return 1   # P4-06 文法/白名单
     return 0
 }
 
@@ -2843,7 +2844,9 @@ tcfg_set_field() {   # <id> <key> <value> → 0/1/2
     # P4-02：dependency/condition 走后端权威校验；非法 → 拒绝且原文件逐字节不变
     case "$key" in
         dependency) dep_validate "$value" || { echo "[task-config] ERROR: invalid dependency '$value' (expect '[?]<task-id>[:STATE]', <= $DEP_MAX entries)" >&2; return 1; } ;;
-        condition)  cond_validate "$value" || { echo "[task-config] ERROR: invalid condition (printable ASCII, <= $COND_MAX_LEN chars)" >&2; return 1; } ;;
+        condition)
+            cond_validate "$value" || { echo "[task-config] ERROR: invalid condition (printable ASCII, <= $COND_MAX_LEN chars)" >&2; return 1; }
+            [ -z "$value" ] || cond_grammar_ok "$value" || { echo "[task-config] ERROR: invalid condition expression (whitelisted predicates only; see docs/P4-06.md)" >&2; return 1; } ;;
     esac
     # P4-03：写 dependency 键后做依赖图校验（未知/自依赖/环）——「当前目录 +
     # 本字段写改后的有效集合」判定；失败 → 拒绝且原文件逐字节不变
@@ -3236,11 +3239,30 @@ sched_dep_satisfied() {
     return 0
 }
 
-# 门控判定（P4-04 决策层；P4-06 在此叠加 condition 求值）：<tasks_dir> <id>
+# 门控判定（P4-04 决策层）：<tasks_dir> <id>
 # → 0=通过 1=未通过（可等待：缺失/禁用/非终态） 2=未通过（Required 终态不匹配，
 #   立即失败）。当前仅依赖维度。
 sched_gate_check() {
     sched_dep_satisfied "$1" "$2"
+}
+
+# 条件求值门（P4-06）：<tasks_dir> <id> [<now> HHMM] [<wday> 0-6]
+# → 0=通过（condition 空=恒真，或求值为真） 1=未通过（求值为假） 2=非法（运行期
+#   防御，理论校验期已拒；视为「本轮不满足」并记录）。只读、无副作用。
+# 语义（P4-06 ADR）：条件与依赖门控**并列 AND**——依赖满足 + 条件真 → 执行；
+# 条件假 → 本轮不满足（直接跳过，不进入 WAITING、不改状态、不 mark cycle）。
+sched_cond_check() {
+    conde_tasks=$1; conde_id=$2; conde_now=${3:-$(date +%H%M)}; conde_wday=${4:-$(date +%w)}
+    conde_tf=$(registry_task_file "$conde_id" 2>/dev/null) || { echo "cond no-task"; return 2; }
+    conde_expr=$(sched_task_field "$conde_tf" condition)
+    [ -z "$conde_expr" ] && return 0   # 空/缺省 = 恒真（不额外求值）
+    cond_eval "$conde_expr" "$conde_tasks" "$conde_now" "$conde_wday"
+    conde_erc=$?
+    case "$conde_erc" in
+        0) echo "cond ok" ; return 0 ;;
+        1) echo "cond unmet: $conde_expr" ; return 1 ;;
+        *) echo "cond illegal (defensive): $conde_expr" ; return 2 ;;
+    esac
 }
 
 # 已 WAITING 任务复查（每个 tick 一次）：<base> <config> <tasks_dir> <id> <now> <boot>
@@ -3263,6 +3285,16 @@ sched_advance_waiting() {
         *) due=0 ;;
     esac
     if [ "$grc" -eq 0 ]; then
+        # P4-06 条件门控（并列 AND）：依赖满足但条件非空且求值为假/非法（防御）→
+        # rearm 回 PENDING（返回 3），下一周期再求值（有界，无永久 WAITING）。
+        cres=$(sched_cond_check "$tasks" "$id" "$now" "$(date +%w)")
+        crc=$?
+        if [ "$crc" -ne 0 ]; then
+            state_log_event "$run_dir" "$id" rearm PENDING "" "" "condition unmet: $cres" >/dev/null 2>&1
+            sched_gate_clear "$run_dir"
+            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=rearm|reason=condition|mode=$(sched_source_mode "$base")"
+            return 3
+        fi
         # 依赖已满足：触发仍匹配 → WAITING>STARTING → action_run；不再匹配 → rearm
         if [ "$due" -eq 1 ]; then
             state_log_event "$run_dir" "$id" gate_ok STARTING "" "" "deps satisfied" >/dev/null 2>&1
@@ -3357,6 +3389,15 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
         state_log_event "$run_dir" "$id" gate_wait WAITING "" "" "$gres" >/dev/null 2>&1
         sched_audit "$base" "op=gate|task=$id|trigger=$trig|blocked=1|reason=$gres|mode=$(sched_source_mode "$base")"
         return 3
+    fi
+    # P4-06 条件门控（与依赖门控并列 AND）：条件非空且求值为假/非法（防御）→
+    # 本轮直接跳过（不进入 WAITING、不改状态、不 mark cycle），下一周期再求值。
+    # 条件空 = 恒真（sched_cond_check rc 0，不额外求值）。
+    cres=$(sched_cond_check "$tasks" "$id" "$now" "$(date +%w)")
+    crc=$?
+    if [ "$crc" -ne 0 ]; then
+        sched_audit "$base" "op=cond|task=$id|trigger=$trig|blocked=1|reason=$cres|mode=$(sched_source_mode "$base")"
+        return 1
     fi
     cmd=$(sched_task_field "$tf" action.command)
     tmx=$(sched_task_field "$tf" action.termux);  [ -z "$tmx" ] && tmx=0
@@ -4350,7 +4391,10 @@ tcfg_editor_validate_payload() {   # <content>
             dependency)
                 dep_validate "$tedv_val" || { echo "[editor] ERROR: dependency syntax invalid (got '$tedv_val'; expect '[?]<task-id>[:STATE]', ',' or space separated, <= $DEP_MAX entries)" >&2; tedv_err=1; } ;;
             condition)
-                cond_validate "$tedv_val" || { echo "[editor] ERROR: condition invalid (got '$tedv_val'; printable ASCII, <= $COND_MAX_LEN chars)" >&2; tedv_err=1; } ;;
+                cond_validate "$tedv_val" || { echo "[editor] ERROR: condition invalid (got '$tedv_val'; printable ASCII, <= $COND_MAX_LEN chars)" >&2; tedv_err=1; }
+                if [ -n "$tedv_val" ] && ! cond_grammar_ok "$tedv_val"; then
+                    echo "[editor] ERROR: condition expression illegal (got '$tedv_val'; whitelisted predicates only: task.state/time.hour/time.minute/time.wday/env.<CONFIG_FILE|DATA_DIR|TASKS_DIR>/file.exists, ops ==/!=)" >&2; tedv_err=1
+                fi ;;
             source.*|runtime.*) : ;;   # 只读保留字段（编辑器不可改）
             *) echo "[editor] ERROR: unknown key '$tedv_key' (editor schema)" >&2; tedv_err=1 ;;
         esac
@@ -4942,6 +4986,218 @@ cond_validate() {
     return 0
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# §26b P4-06 Condition 受限表达式引擎（白名单谓词求值）：
+# 在 §26 cond_validate（存储层安全）之上叠加受限表达式文法与求值。**禁止任何
+# Shell 执行**：无 eval / sh -c / $(...) / 反引号 / 管道到命令 / 重定向 / 用户
+# 函数调用——只做纯 POSIX 字符串解析 + case/字段比对 + 白名单表驱动，绝不在求值
+# 中把用户表达式拼进任何被执行的 shell 片段。
+# 语法：`{{ <谓词> }}` 包裹**单谓词**（`{{`/`}}` 内首尾空白容忍），求值为真/假。
+# 谓词白名单（COND_PREDS）：
+#   task.state(<id>) == <STATE> / !=   另一任务实时态比较（读 tasks/<id>/state.txt，
+#                                       缺省 PENDING；无副作用）
+#   time.hour == <0-23> / time.minute == <0-59> / time.wday == <0-6>（0=Sunday）
+#   env.<NAME> == <值> / !=            仅白名单环境变量 CONFIG_FILE / DATA_DIR /
+#                                       TASKS_DIR（其余 env.<X> → 非法拒绝）
+#   file.exists(<绝对路径>)             文件存在性；路径仅允许 CONFIG_FILE 同目录 或
+#                                       DATA_DIR 下；禁止 `..`/`//` 穿越；只读探测
+# 比较运算符（P4-06 决策，勿改）：`==`（等于）/ `!=`（不等于）两个即可；`<`/`>`/
+# `>=`/`<=`/`contains` 不在 P4-06 范围（P5 可扩）。
+# 三态语义：cond_eval rc 0=真 1=假 2=非法。
+#   - 校验期：cond_grammar_ok 只做文法/白名单/越界/注入检查（不读文件、不读状态），
+#     用于 tcfg/editor/apply/set/import 写路径——非法 → 写盘前拒绝，旧配置逐字节
+#     不变（D5/B9）。
+#   - 运行期：cond_eval 先过 cond_grammar_ok（非法 → 防御性 return 2，理论不应
+#     发生），再按谓词求值；文件系统只读探测，无副作用。
+# 命名空间：cond_/conde_ 前缀（conde_ 行内变量防覆盖调用方全局，同 §26）。
+# ═══════════════════════════════════════════════════════════════════════════
+COND_TSM_STATES="DISABLED PENDING WAITING STARTING RUNNING HEALTHY UNHEALTHY RECOVERING FAILED STOPPING STOPPED"
+COND_PREDS="task.state time.hour time.minute time.wday env file.exists"
+COND_ENV_ALLOW="CONFIG_FILE DATA_DIR TASKS_DIR"
+
+# 去前导零：<num> → echo 去零数字（POSIX 无 10# 基数写法，避免 08 触 octal）
+conde_unzero() {
+    conde_v=$1
+    while :; do
+        case "$conde_v" in 0*) conde_v=${conde_v#0} ;; *) break ;; esac
+    done
+    [ -n "$conde_v" ] || conde_v=0
+    echo "$conde_v"
+}
+# 安全字符集：<str> → 0 全部为 [A-Za-z0-9_/.:+-]（无空白/元字符/控制符/重定向/`;`）
+conde_charset_ok() {
+    case "$1" in
+        ''|*[!A-Za-z0-9_/.:+-]*) return 1 ;;
+    esac
+    return 0
+}
+# TSM 状态成员：<state> → 0 合法
+conde_state_ok() {
+    case " $COND_TSM_STATES " in *" $1 "*) return 0 ;; *) return 1 ;; esac
+}
+# 词法路径包含：<base> <path> → 0=path 位于 base 内（含 base 自身，逐段无 `..`/`//`）
+conde_path_in() {
+    conde_base=$1; conde_path=$2
+    case "$conde_path" in
+        "$conde_base") return 0 ;;
+        "$conde_base"/*) ;;
+        *) return 1 ;;
+    esac
+    conde_rel=${conde_path#"$conde_base"/}
+    case "$conde_rel" in
+        *".."*|*"//"*) return 1 ;;
+    esac
+    return 0
+}
+# 抽取 `{{ }}` 内层并去首尾空白：<expr> → echo inner（或空 = 非法包裹）
+conde_inner() {
+    conde_e=$1
+    case "$conde_e" in
+        "{{"*"}}") ;;
+        *) return 1 ;;
+    esac
+    conde_in=${conde_e#"{{"}
+    conde_in=${conde_in%"}}"}
+    while :; do
+        case "$conde_in" in
+            ' '*|"	"*) conde_in=${conde_in#?} ;;
+            *' '|*"	") conde_in=${conde_in%?} ;;
+            *) break ;;
+        esac
+    done
+    echo "$conde_in"
+}
+
+# 文法/白名单/越界/注入校验：<expr> → 0=合法 1=非法（纯词法，无副作用）
+cond_grammar_ok() {
+    conde_expr=$1
+    [ -n "$conde_expr" ] || return 1
+    conde_in=$(conde_inner "$conde_expr") || return 1
+    [ -n "$conde_in" ] || return 1
+    # 顶层注入面：单谓词表达式内不得出现命令拼接痕迹（防御，与下文字符集双保险）
+    case "$conde_in" in
+        *";"*|*'`'*|*"\$("*|*"sh -c"*|*"|"*|*"&"*|*">"*|*"<"*) return 1 ;;
+    esac
+    conde_oldifs=$IFS; IFS=' '
+    set -- $conde_in
+    IFS=$conde_oldifs
+    conde_l=$1; conde_op=${2:-}; conde_r=${3:-}
+    [ -n "$conde_l" ] || return 1
+    case "$conde_l" in
+        task.state\(*\))
+            conde_id=${conde_l#task.state(}
+            conde_id=${conde_id%)}
+            [ "$conde_l" = "task.state($conde_id)" ] || return 1   # 精确包裹（拒多余 `)`）
+            secv_id_ok "$conde_id" || return 1
+            [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
+            conde_state_ok "$conde_r" || return 1
+            ;;
+        time.hour|time.minute|time.wday)
+            [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
+            case "$conde_r" in
+                ''|*[!0-9]*) return 1 ;;
+            esac
+            conde_rn=$(conde_unzero "$conde_r")
+            case "$conde_l" in
+                time.hour)   [ "$conde_rn" -le 23 ] 2>/dev/null || return 1 ;;
+                time.minute) [ "$conde_rn" -le 59 ] 2>/dev/null || return 1 ;;
+                time.wday)   [ "$conde_rn" -le 6 ] 2>/dev/null || return 1 ;;
+            esac
+            ;;
+        env.*)
+            conde_name=${conde_l#env.}
+            case " $COND_ENV_ALLOW " in *" $conde_name "*) ;; *) return 1 ;; esac   # 未授权 env
+            [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
+            conde_charset_ok "$conde_r" || return 1
+            ;;
+        file.exists\(*\))
+            conde_path=${conde_l#file.exists(}
+            conde_path=${conde_path%)}
+            [ "$conde_l" = "file.exists($conde_path)" ] || return 1
+            [ -z "$conde_op" ] || return 1   # file.exists 无比较运算符
+            case "$conde_path" in
+                /*) ;;
+                *) return 1 ;;   # 必须绝对路径
+            esac
+            conde_charset_ok "$conde_path" || return 1
+            # 允许目录 = CONFIG_FILE 同目录 或 DATA_DIR（词法包含，防 `..`/`//` 穿越）
+            conde_cfg=${CONFIG_FILE:-/sdcard/Documents/su-scheduler/config.txt}
+            conde_datadir=${DATA_DIR:-/data/adb/su-scheduler}
+            conde_cfgdir=${conde_cfg%/*}
+            if ! conde_path_in "$conde_cfgdir" "$conde_path" && \
+               ! conde_path_in "$conde_datadir" "$conde_path"; then
+                return 1
+            fi
+            ;;
+        *)
+            return 1 ;;
+    esac
+    return 0
+}
+
+# 受限表达式求值：<expr> <tasks_dir> [<now> HHMM] [<wday> 0-6] → 0=真 1=假 2=非法
+# 非法表达式（防御性，理论校验期已拒）→ return 2（stdout 给原因）；文件只读探测。
+cond_eval() {
+    conde_expr=$1; conde_tasks=${2:-}
+    conde_now=${3:-$(date +%H%M)}; conde_wday=${4:-$(date +%w)}
+    cond_grammar_ok "$conde_expr" || { echo "condition illegal (grammar)"; return 2; }
+    conde_in=$(conde_inner "$conde_expr") || { echo "condition illegal (wrap)"; return 2; }
+    conde_oldifs=$IFS; IFS=' '
+    set -- $conde_in
+    IFS=$conde_oldifs
+    conde_l=$1; conde_op=${2:-}; conde_r=${3:-}
+    case "$conde_l" in
+        task.state\(*\))
+            conde_id=${conde_l#task.state(}
+            conde_id=${conde_id%)}
+            conde_cur=$(runtime_current_state "$conde_tasks/$conde_id" 2>/dev/null)
+            if [ "$conde_op" = "==" ]; then
+                [ "$conde_cur" = "$conde_r" ] && return 0 || return 1
+            else
+                [ "$conde_cur" != "$conde_r" ] && return 0 || return 1
+            fi
+            ;;
+        time.hour|time.minute|time.wday)
+            case "$conde_l" in
+                time.hour)   conde_cur=$(printf '%s' "$conde_now" | cut -c1-2) ;;
+                time.minute) conde_cur=$(printf '%s' "$conde_now" | cut -c3-4) ;;
+                time.wday)   conde_cur=$conde_wday ;;
+            esac
+            conde_curn=$(conde_unzero "$conde_cur")
+            conde_rn=$(conde_unzero "$conde_r")
+            if [ "$conde_op" = "==" ]; then
+                [ "$conde_curn" -eq "$conde_rn" ] 2>/dev/null && return 0 || return 1
+            else
+                [ "$conde_curn" -ne "$conde_rn" ] 2>/dev/null && return 0 || return 1
+            fi
+            ;;
+        env.*)
+            conde_name=${conde_l#env.}
+            conde_cfg=${CONFIG_FILE:-/sdcard/Documents/su-scheduler/config.txt}
+            conde_datadir=${DATA_DIR:-/data/adb/su-scheduler}
+            case "$conde_name" in
+                CONFIG_FILE) conde_val=$conde_cfg ;;
+                DATA_DIR)    conde_val=$conde_datadir ;;
+                TASKS_DIR)   conde_val=${TASKS_DIR:-$conde_datadir/tasks} ;;
+                *) echo "condition illegal (env not allowed)"; return 2 ;;
+            esac
+            if [ "$conde_op" = "==" ]; then
+                [ "$conde_val" = "$conde_r" ] && return 0 || return 1
+            else
+                [ "$conde_val" != "$conde_r" ] && return 0 || return 1
+            fi
+            ;;
+        file.exists\(*\))
+            conde_path=${conde_l#file.exists(}
+            conde_path=${conde_path%)}
+            [ -e "$conde_path" ] && return 0 || return 1
+            ;;
+        *)
+            echo "condition illegal (unknown predicate)"; return 2 ;;
+    esac
+}
+# ═══════════════════════════════════════════════════════════════════════════
+
 # 依赖图校验（P4-03）：遍历 <dir> 全部 .task 构建 id 集合 + 依赖边，执行
 # 未知依赖 / 自依赖 / 环检测。返回 0=无环且引用完整；非 0=拒绝（错误消息
 # 写 stderr，含具体原因：unknown dependency 'x' in 't_a' / self-dependency /
@@ -5127,8 +5383,8 @@ runtime_lib_selfcheck() {
               tcfg_new_id tcfg_atomic_write sched_reload sched_snapshot_managed \
               scheduler_tick scheduler_boot sched_execute_one sched_cycle_mark \
               sched_cycle_seen sched_source_mode sched_remove_task sched_prune_ron \
-              sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
-              sched_gate_epoch sched_advance_waiting ipc_server_init ipc_server_poll \
+sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
+               sched_cond_check sched_gate_epoch sched_advance_waiting ipc_server_init ipc_server_poll \
               ipc_parse ipc_params_valid ipc_param ipc_respond ipc_dispatch \
               ipc_allowed_keys ipc_op_get_tasks ipc_op_get_status ipc_op_get_log ipc_op_validate \
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
@@ -5145,6 +5401,7 @@ runtime_lib_selfcheck() {
                secv_guard_task_dir secv_ipc_ratelimit secv_sweep_tmp \
                secv_fix_perms secv_effective_timeout runtime_limit_task_log \
                dep_normalize dep_entry_ok dep_validate cond_validate \
+               cond_grammar_ok cond_eval \
                dep_validate_graph; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done

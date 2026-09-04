@@ -137,6 +137,26 @@ poll
 printf '%s\n' "$(cat "$BASE/ipc/responses/b3.resp")" | grep -q '"truncated":1' \
     && ok "P3-05 sec-e: events >200 lines -> truncated flag" || bad "P3-05 sec-e: events truncation missing"
 
+# ── P4-06 Condition 表达式注入：EDIT/VALIDATE 写路径校验期拒绝，零 exec、零 config 写 ──
+# condition 是受限表达式；注入/未授权谓词 → EDIT_TASK rc 4（configuration_invalid），
+# task-config 逐字节不变、EXEC_LOG 零新增（绝不进入 shell 求值）。
+SNAP_C=$(tc_snap)
+cond_edit="schema_version=2
+id=tsec
+trigger=08:30
+action.type=command
+action.command=echo safe
+condition={{ task.state(x) = Y; rm -rf / }}
+"
+drop_req "c1" "c1|EDIT_TASK|id=$(ipc_b64enc tsec)&payload=$(ipc_b64enc "$cond_edit")"
+poll
+[ "$(req_rc c1)" = "4" ] && ok "P4-06 sec: EDIT_TASK condition injection -> configuration_invalid (rc 4)" \
+    || bad "P4-06 sec: EDIT_TASK condition injection rc=$(req_rc c1)"
+[ "$(tc_snap)" = "$SNAP_C" ] && ok "P4-06 sec: task-config byte-identical after condition injection edit" \
+    || bad "P4-06 sec: task-config mutated by condition edit"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P4-06 sec: ZERO Root actions executed by condition injection edit" \
+    || bad "P4-06 sec: condition edit executed ($(wc -l < "$EXEC_LOG"))"
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "webui security tests: PASS=$PASS FAIL=$FAIL"
