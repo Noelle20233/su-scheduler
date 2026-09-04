@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.26.0"
+RUNTIME_LIB_VERSION="1.27.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1142,6 +1142,7 @@ task_cli_status() {
     echo "name=$(grep '^name=' "$f" | head -1 | cut -d= -f2-)"
     echo "enabled=$(grep '^enabled=' "$f" | head -1 | cut -d= -f2)"
     echo "trigger=$(grep '^trigger=' "$f" | head -1 | cut -d= -f2)"
+    echo "dependency=$(grep '^dependency=' "$f" | head -1 | cut -d= -f2-)"
     echo "condition=$(grep '^condition=' "$f" | head -1 | cut -d= -f2-)"
     echo "action=$(grep '^action.command=' "$f" | head -1 | cut -d= -f2-)"
     echo "source.type=$(grep '^source.type=' "$f" | head -1 | cut -d= -f2)"
@@ -1165,6 +1166,11 @@ task_cli_status() {
         echo "last_event=$(tail -1 "$rdir/events.log" 2>/dev/null)"
     else
         echo "last_event="
+    fi
+    # P4-09：门控状态行（WAITING + 原因；缺省空）
+    obs_g=$(obs_gate_state "${TASK_CLI_TASKS_DIR:-}" "$id")
+    if [ -n "$obs_g" ]; then
+        echo "Gate: $obs_g"
     fi
     return 0
 }
@@ -4228,6 +4234,53 @@ web_log_lines_json() {   # <file> <returned>
     fi
     printf ']'
 }
+# ── P4-09 只读门控/依赖状态观测（无副作用；供 CLI 与 WebUI 查询面复用）──────
+# 当前任务状态是否为 WAITING（gate 原因）：<tasks_dir> <id>
+# → stdout=如 "WAITING (dep failed: t_b)"；非 WAITING/无运行目录 → 空。
+# 原因来源：运行目录 gate 工件（retry.until=退避中 / gate.fail 标记）或
+# events.log 最新 gate_wait/gate_fail 事件 msg（依赖原因可读）。
+obs_gate_state() {
+    obs_tasks=$1; obs_id=$2
+    obs_rd="$obs_tasks/$obs_id"
+    if [ -n "$obs_tasks" ] && [ -d "$obs_rd" ]; then
+        obs_st=$(runtime_current_state "$obs_rd" 2>/dev/null)
+        if [ "$obs_st" = "WAITING" ]; then
+            obs_reason=""
+            if [ -f "$(sched_retry_until_file "$obs_rd")" ]; then
+                obs_reason="retry backoff (until $(cat "$(sched_retry_until_file "$obs_rd")" 2>/dev/null))"
+            elif [ -f "$(sched_retry_gatefail_file "$obs_rd")" ]; then
+                obs_reason=$(cat "$(sched_retry_gatefail_file "$obs_rd")" 2>/dev/null)
+            else
+                obs_reason=$(grep -E '\|(gate_wait|gate_fail)\|' "$obs_rd/events.log" 2>/dev/null | tail -1 | cut -d'|' -f7-)
+            fi
+            if [ -n "$obs_reason" ]; then
+                printf 'WAITING (%s)' "$obs_reason"
+            else
+                printf 'WAITING'
+            fi
+            return 0
+        fi
+    fi
+    return 0
+}
+# 当前依赖门控判定摘要（复用 §20 sched_dep_satisfied，只读无副作用）：
+# <tasks_dir> <id> → stdout=ok|satisfied|waiting|unsat
+obs_dep_state() {
+    obs_tasks=$1; obs_id=$2
+    obs_tf=$(registry_task_file "$obs_id" 2>/dev/null)
+    [ -n "$obs_tf" ] || { echo "ok"; return 0; }
+    obs_dep=$(sched_task_field "$obs_tf" dependency)
+    [ -n "$obs_dep" ] || { echo "ok"; return 0; }
+    sched_dep_satisfied "$obs_tasks" "$obs_id" >/dev/null 2>&1
+    obs_rc=$?
+    case "$obs_rc" in
+        0) echo "satisfied" ;;
+        1) echo "waiting" ;;
+        2) echo "unsat" ;;
+        *) echo "ok" ;;
+    esac
+    return 0
+}
 # 任务紧凑行（GET_SUMMARY.tasks 元素）
 web_task_row() {   # <tasks_dir> <task_file> <id>
     webv_tasks=$1; webv_f=$2; webv_id=$3
@@ -4255,7 +4308,7 @@ web_task_row() {   # <tasks_dir> <task_file> <id>
 # ── GET_SUMMARY：计数 + 任务紧凑列表（Dashboard + Task List 单调用）────────
 web_agg_summary() {   # <base> <tasks> → 单行 JSON
     webv_base=$1; webv_tasks=$2
-    webv_total=0 webv_running=0 webv_healthy=0 webv_failed=0 webv_disabled=0 webv_unhealthy=0 webv_unknown=0
+    webv_total=0 webv_running=0 webv_healthy=0 webv_failed=0 webv_disabled=0 webv_unhealthy=0 webv_unknown=0 webv_waiting=0
     webv_rows="" webv_sep=""
     for webv_id in $(registry_task_ids); do
         webv_f=$(registry_task_file "$webv_id" 2>/dev/null) || continue
@@ -4268,6 +4321,7 @@ web_agg_summary() {   # <base> <tasks> → 单行 JSON
             HEALTHY) webv_healthy=$((webv_healthy + 1)) ;;
             FAILED) webv_failed=$((webv_failed + 1)) ;;
             UNHEALTHY) webv_unhealthy=$((webv_unhealthy + 1)) ;;
+            WAITING) webv_waiting=$((webv_waiting + 1)) ;;
             *) webv_unknown=$((webv_unknown + 1)) ;;
         esac
         webv_row=$(web_task_row "$webv_tasks" "$webv_f" "$webv_id")
@@ -4275,9 +4329,9 @@ web_agg_summary() {   # <base> <tasks> → 单行 JSON
         webv_sep=","
     done
     webv_mode=$(sched_source_mode "$webv_base")
-    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s},"tasks":[%s]}' \
+    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s},"tasks":[%s]}' \
         "$(web_json_str "$webv_mode")" \
-        "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" \
+        "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" "$webv_waiting" \
         "$webv_rows"
 }
 # ── GET_TASK_DETAIL：完整任务详情（Task Detail 页）─────────────────────────
@@ -4314,6 +4368,13 @@ web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
         "$(web_json_str "$(sched_task_field "$webv_f" source.type)")" \
         "$(web_json_str "$(sched_task_field "$webv_f" source.line)")" \
         "$(web_json_str "$(sched_task_field "$webv_f" source.raw)")"
+    # P4-09：依赖/条件原字符串 + 只读门控判定摘要（dependency_state / gate_state）
+    printf '"dependency":%s,"condition":%s,' \
+        "$(web_json_str "$(sched_task_field "$webv_f" dependency)")" \
+        "$(web_json_str "$(sched_task_field "$webv_f" condition)")"
+    printf '"dependency_state":%s,"gate_state":%s,' \
+        "$(web_json_str "$(obs_dep_state "$webv_tasks" "$webv_id")")" \
+        "$(web_json_str "$(obs_gate_state "$webv_tasks" "$webv_id")")"
     printf '"has_run_dir":%s}}' "$webv_hasrun"
 }
 # ── 日志聚合（GET_TASK_EVENTS / GET_DAEMON_LOG / GET_TASK_LOG）──────────────
@@ -5536,6 +5597,7 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
               web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
               web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
+              obs_gate_state obs_dep_state \
               tcfg_editor_num tcfg_editor_bool tcfg_editor_id_ok tcfg_editor_trigger_ok tcfg_editor_action_ok \
               tcfg_editor_health_ok tcfg_editor_recovery_ok tcfg_editor_validate_payload tcfg_apply_task ipc_op_get_task_edit ipc_op_edit_task \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \

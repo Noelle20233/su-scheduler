@@ -764,10 +764,10 @@ rtick() {   # <now> → 单次调度周期 + 终态对账
 }
 rexec_count() { grep -c "$1" "$R_EXEC" 2>/dev/null || echo 0; }
 
-# 版本一致性：RUNTIME_LIB_VERSION = 1.26.0（P4-08 递增，B5 版本线同步）
-[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.26.0" ] \
-    && ok "P4-08 version: RUNTIME_LIB_VERSION=1.26.0 (P4-08 editor dependency/condition open-up)" \
-    || bad "P4-08 version: RUNTIME_LIB_VERSION=$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')"
+# 版本一致性：RUNTIME_LIB_VERSION = 1.27.0（P4-09 递增，B5 版本线同步）
+[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.27.0" ] \
+    && ok "P4-09 version: RUNTIME_LIB_VERSION=1.27.0 (P4-09 observability surface)" \
+    || bad "P4-09 version: RUNTIME_LIB_VERSION=$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')"
 
 # R1) FAILED>WAITING 退避接线：retry.max=1 任务执行失败 → FAILED → 下一 tick 接
 #     FAILED>WAITING（retry.until 落盘 + rearm 事件 + 退避期间不执行）
@@ -924,12 +924,136 @@ SCHED_CYCLE_NOW=202609040941 GATE_NOW=6001 rtick 0941      # 到点 → 重试�
 [ "$(rexec_count FAIL_t_e)" -eq 2 ] \
     && ok "P4-07 R7: post-restart backoff elapsed → retry executed (exec=2)" || bad "P4-07 R7: exec=$(rexec_count FAIL_t_e)"
 
+# ── §obs-p4-09：可观测查询面（依赖/条件/门控状态 + WAITING 事件与控制行为）──
+# 语义（docs/P4-09.md / dependency-schema.md ADR D30–D33）：
+#   - task_cli_status_id 输出 dependency=/condition=/Gate 行（managed 域，空值输出空）；
+#   - GET_TASK_EVENTS（web_log_payload 读 events.log）返回 gate_wait/gate_ok/
+#     gate_fail/retry-backoff 事件且原因可读；
+#   - GET_SUMMARY counts 含 waiting 计数；GET_TASK_DETAIL 含 dependency/
+#     condition/dependency_state/gate_state（只增键不删改，B8）。
+#   - WAITING 下 start/stop/restart/check 行为固化（P4-05 D17，不改实现）：
+#     force start 跳过门控执行、非 force 拒绝、stop 不写状态、check 只健康探测。
+O_BASE="$T/o-base"; O_TCFG="$T/o-tc"; O_TASKS="$T/o-tasks"; O_CFG="$T/o.cfg"
+rm -rf "$O_BASE" "$O_TCFG" "$O_TASKS"; mkdir -p "$O_BASE" "$O_TCFG" "$O_TASKS"
+echo managed > "$O_TCFG/MANAGED"; : > "$O_CFG"
+export TCFG_DIR="$O_TCFG"; export TR_BASE="$O_BASE"; export TASKS_DIR="$O_TASKS"
+O_EXEC="$T/o-exec.log"; : > "$O_EXEC"
+# FAIL_ 前缀命令 → 失败（exit_code=1）；否则成功（同 §retry-p4-07 语义）
+execute_task() { id=$1; cmd=$2; ns=$3; ne=$4; msg=$5; itr=$6; tmx=$7
+    d="$TASKS_DIR/$id"; mkdir -p "$d"
+    echo "$cmd" > "$d/command.txt"; echo "RUNNING" > "$d/status.txt"
+    echo "$id|$cmd" >> "$O_EXEC"
+    case "$cmd" in
+        FAIL_*) echo "1" > "$d/exit_code.txt"; echo "FAILED" > "$d/status.txt" ;;
+        *) echo "0" > "$d/exit_code.txt"; echo "SUCCESS" > "$d/status.txt" ;;
+    esac
+    return 0; }
+o_task() {   # <id> <trigger> <dep> <cond> <cmd>
+    printf 'schema_version=2\nid=%s\ntrigger=%s\ndependency=%s\ncondition=%s\naction.command=%s\n' \
+        "$1" "$2" "$3" "$4" "$5" > "$O_TCFG/$1.task"
+}
+otick() {   # <now> → 单次调度周期 + 终态对账
+    scheduler_tick "$O_BASE" "$O_CFG" "$O_TASKS" "$1" >/dev/null 2>&1
+    state_sync_all "$O_TASKS" >/dev/null 2>&1
+}
+
+# O1) managed 任务 task_cli_status_id 输出 dependency=/condition=；WAITING 时 Gate 行
+o_task dep_o1 23:59 "" "" "echo O1-dep"
+o_task t_o1 08:50 "dep_o1" "{{ time.hour == 8 }}" "echo O1"
+sched_reload "$O_BASE" "$O_CFG" >/dev/null 2>&1
+OST=$(task_cli_status_id "$O_BASE" "$O_TASKS" "" t_o1 2>/dev/null); ORC=$?
+[ "$ORC" -eq 0 ] \
+    && printf '%s\n' "$OST" | grep -q '^dependency=dep_o1$' \
+    && printf '%s\n' "$OST" | grep -q '^condition={{ time.hour == 8 }}$' \
+    && ok "P4-09 O1: task status shows dependency=/condition= (managed)" \
+    || bad "P4-09 O1: status rc=$ORC out=[$OST]"
+printf '%s\n' "$OST" | grep -q '^Gate:' && bad "P4-09 O1: Gate leaked before WAITING" \
+    || ok "P4-09 O1: no Gate line before WAITING"
+
+# O2) 依赖未满足触发 → WAITING；GET_TASK_EVENTS 返回 gate_wait + 原因可读
+SCHED_CYCLE_NOW=202609040850 GATE_NOW=1000 otick 0850
+[ "$(cat "$O_TASKS/t_o1/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-09 O2: t_o1 entered WAITING (dep unmet)" || bad "P4-09 O2: state=$(cat "$O_TASKS/t_o1/state.txt" 2>/dev/null)"
+OEV=$(web_log_payload "$O_TASKS/t_o1/events.log" 50 '"task":"t_o1",')
+printf '%s' "$OEV" | grep -q 'gate_wait' && printf '%s' "$OEV" | grep -q 'dep unsat: dep_o1' \
+    && ok "P4-09 O2: GET_TASK_EVENTS payload contains gate_wait with readable reason" \
+    || bad "P4-09 O2: events payload=[$OEV]"
+# task status Gate 行：WAITING + 原因（events.log 最新 gate 事件）
+OST=$(task_cli_status_id "$O_BASE" "$O_TASKS" "" t_o1 2>/dev/null)
+printf '%s\n' "$OST" | grep -q '^Gate: WAITING (dep unsat: dep_o1' \
+    && ok "P4-09 O2: task status Gate line = WAITING (dep unsat: dep_o1...)" \
+    || bad "P4-09 O2: Gate=[$(printf '%s\n' "$OST" | grep '^Gate:')]"
+# GET_SUMMARY waiting 计数 + GET_TASK_DETAIL 新字段（含既有字段保留）
+ipc_server_init "$O_BASE" >/dev/null 2>&1
+O_REQ="$O_BASE/ipc/requests"; mkdir -p "$O_REQ"
+printf '%s\n' "osum|GET_SUMMARY|" > "$O_REQ/osum.req"
+ipc_server_poll "$O_BASE" "$O_CFG" "$O_TASKS" >/dev/null 2>&1
+OSUM=$(cat "$O_BASE/ipc/responses/osum.resp" 2>/dev/null)
+printf '%s' "$OSUM" | grep -q '"waiting":1' \
+    && ok "P4-09 O2: GET_SUMMARY counts waiting=1 (WAITING observable)" \
+    || bad "P4-09 O2: summary=[$(printf '%s' "$OSUM" | tail -1)]"
+printf '%s\n' "odet|GET_TASK_DETAIL|id=$(ipc_b64enc t_o1)" > "$O_REQ/odet.req"
+ipc_server_poll "$O_BASE" "$O_CFG" "$O_TASKS" >/dev/null 2>&1
+ODET=$(cat "$O_BASE/ipc/responses/odet.resp" 2>/dev/null)
+printf '%s' "$ODET" | grep -q '"dependency":"dep_o1"' \
+    && printf '%s' "$ODET" | grep -q '"condition":"{{ time.hour == 8 }}"' \
+    && printf '%s' "$ODET" | grep -q '"dependency_state":"waiting"' \
+    && printf '%s' "$ODET" | grep -q '"gate_state":"WAITING (dep unsat: dep_o1' \
+    && printf '%s' "$ODET" | grep -q '"id":"t_o1"' \
+    && printf '%s' "$ODET" | grep -q '"status":"WAITING"' \
+    && ok "P4-09 O2: GET_TASK_DETAIL new fields + existing id/status intact" \
+    || bad "P4-09 O2: detail=[$(printf '%s' "$ODET" | tail -1)]"
+
+# O3) WAITING 控制行为固化（P4-05 D17）：非 force 拒 / force 跳过 / stop 不写状态 /
+#     check 只健康探测；gate_ok 事件解除
+OS_OUT=$(tctl_start "$O_BASE" "$O_TASKS" t_o1 0 2>/dev/null); OS_RC=$?
+[ "$OS_RC" -eq 3 ] && printf '%s' "$OS_OUT" | grep -q 'illegal' \
+    && ok "P4-09 O3: non-force start on WAITING -> illegal (rc 3, D17)" || bad "P4-09 O3: rc=$OS_RC out=$OS_OUT"
+O_STOP=$(tctl_stop "$O_BASE" "$O_TASKS" t_o1 2>/dev/null); O_STOP_RC=$?
+[ "$(cat "$O_TASKS/t_o1/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-09 O3: stop on WAITING does NOT write state (still WAITING)" \
+    || bad "P4-09 O3: stop mutated state=$(cat "$O_TASKS/t_o1/state.txt" 2>/dev/null)"
+O_CHK=$(tctl_check "$O_BASE" "$O_TASKS" t_o1 2>/dev/null); O_CHK_RC=$?
+[ "$O_CHK_RC" -eq 5 ] && printf '%s' "$O_CHK" | grep -q 'no_health_configured' \
+    && ok "P4-09 O3: check on WAITING -> health probe only (no state change)" || bad "P4-09 O3: check rc=$O_CHK_RC out=$O_CHK"
+# 依赖解除 → gate_ok 释放执行（GET_TASK_EVENTS 含 gate_ok）
+mkdir -p "$O_TASKS/dep_o1"; echo STOPPED > "$O_TASKS/dep_o1/state.txt"
+SCHED_CYCLE_NOW=202609040850 GATE_NOW=1100 otick 0850
+OEV=$(web_log_payload "$O_TASKS/t_o1/events.log" 50 '"task":"t_o1",')
+printf '%s' "$OEV" | grep -q 'gate_ok' && printf '%s' "$OEV" | grep -q 'deps satisfied' \
+    && ok "P4-09 O3: GET_TASK_EVENTS contains gate_ok on release" \
+    || bad "P4-09 O3: events=[$OEV]"
+
+# O4) retry backoff 事件查询面：FAILED>WAITING rearm（retry backoff attempt N/M）
+o_task r_o4 08:55 "" "" "FAIL_r_o4" >/dev/null 2>&1
+printf 'schema_version=2\nid=r_o4\ntrigger=08:55\naction.command=FAIL_r_o4\nretry.max=1\nretry.interval=1\nrecovery.type=none\ndependency=\n' > "$O_TCFG/r_o4.task"
+sched_reload "$O_BASE" "$O_CFG" >/dev/null 2>&1
+SCHED_CYCLE_NOW=202609040855 GATE_NOW=2000 otick 0855
+SCHED_CYCLE_NOW=202609040855 GATE_NOW=2000 otick 0855     # FAILED>WAITING backoff
+OEV=$(web_log_payload "$O_TASKS/r_o4/events.log" 50 '"task":"r_o4",')
+printf '%s' "$OEV" | grep -q 'rearm' && printf '%s' "$OEV" | grep -q 'retry backoff' \
+    && ok "P4-09 O4: GET_TASK_EVENTS contains rearm retry-backoff (reason readable)" \
+    || bad "P4-09 O4: events=[$OEV]"
+OST=$(task_cli_status_id "$O_BASE" "$O_TASKS" "" r_o4 2>/dev/null)
+printf '%s\n' "$OST" | grep -q '^Gate: WAITING (retry backoff' \
+    && ok "P4-09 O4: task status Gate line reports retry backoff" \
+    || bad "P4-09 O4: Gate=[$(printf '%s\n' "$OST" | grep '^Gate:')]"
+rm -f "$O_REQ"/*.req "$O_BASE/ipc/responses"/*.resp 2>/dev/null
+
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────
 # legacy 解析/执行路径无 dependency/condition 新接线（C2/C4 零改动）
 grep -n 'dependency\|condition' "$DAEMON" >/dev/null 2>&1 \
     && bad "P4-02 legacy: daemon references dependency/condition (must not)" || ok "P4-02 legacy: daemon (schedulerd) has zero dependency/condition refs"
-# Legacy 解析函数不处理 dependency/condition（保持 C2 原样）
-grep -q 'dependency\|condition' "$CLI" && bad "P4-02 legacy: CLI 顶层含 dependency/condition 新路径" || ok "P4-02 legacy: CLI top-level no new dependency/condition path"
+# Legacy 解析函数（parse_modifiers/extract_command/cmd_add/cmd_list/cmd_log/cmd_edit/
+# cmd_remove）不处理 dependency/condition（保持 C2 原样）。注：P4-09 起 CLI 的
+# cmd_task_info 在 managed 域展示 dependency=/condition=（只读展示、非解析路径），
+# 因此断言收敛到 legacy 解析函数本体，不再 grep 整个 CLI 文件。
+LEGACY_PARSE_REFS=$(sed -n '/^parse_modifiers()/,/^}/p;/^extract_command()/,/^}/p;/^cmd_add()/,/^}/p;/^cmd_list()/,/^}/p;/^cmd_log()/,/^}/p;/^cmd_edit()/,/^}/p;/^cmd_remove()/,/^}/p' "$CLI")
+if printf '%s' "$LEGACY_PARSE_REFS" | grep -q 'dependency\|condition'; then
+    bad "P4-02 legacy: legacy parse funcs reference dependency/condition (C2 breach)"
+else
+    ok "P4-02 legacy: legacy parse funcs have zero dependency/condition refs (cmd_task_info display exempt)"
+fi
 
 # ── POSIX：库（含 §26）dash -n ───────────────────────────────────────────
 if command -v dash >/dev/null 2>&1; then

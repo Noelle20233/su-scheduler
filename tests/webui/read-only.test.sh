@@ -119,6 +119,17 @@ r=$(send_req "s2" "s2|GET_SUMMARY|")
 printf '%s\n' "$r" | grep -q 't_run' && printf '%s\n' "$r" | grep -q '"mode":"managed"' \
     && ok "P3-05 agg: GET_SUMMARY tasks array + mode" || bad "P3-05 agg: tasks array/mode missing"
 
+# P4-09：GET_SUMMARY counts 含 waiting 计数；WAITING 计入 waiting 而非 unknown
+tcfg_new_task t_wait "12:30" "echo wait" >/dev/null 2>&1
+mkdir -p "$TASKS_DIR/t_wait"
+echo "WAITING" > "$TASKS_DIR/t_wait/state.txt"
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+r=$(send_req "s3" "s3|GET_SUMMARY|")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q '"waiting":1' \
+    && printf '%s\n' "$r" | grep -q '"total":6' \
+    && ok "P4-09 agg: GET_SUMMARY counts include waiting (total=6, waiting=1)" \
+    || bad "P4-09 agg: waiting count rc=$(resp_rc "$r") payload=$(printf '%s' "$r" | tail -n +2)"
+
 r=$(send_req "d1" "d1|GET_TASK_DETAIL|id=$(ipc_b64enc t_run)")
 rc=$(resp_rc "$r")
 [ "$rc" = "0" ] && printf '%s\n' "$r" | grep -q '"id":"t_run"' \
@@ -127,6 +138,44 @@ rc=$(resp_rc "$r")
     && printf '%s\n' "$r" | grep -q '"restart_count":0' \
     && printf '%s\n' "$r" | grep -q '"has_run_dir":1' \
     && ok "P3-05 agg: GET_TASK_DETAIL full fields" || bad "P3-05 agg: detail payload=$(printf '%s' "$r" | tail -n +2)"
+
+# P4-09：GET_TASK_DETAIL 含 dependency/condition/dependency_state/gate_state，
+# 且既有字段全部保留（只增键不删改，B8 统一 JSON 契约）
+r=$(send_req "d9" "d9|GET_TASK_DETAIL|id=$(ipc_b64enc t_run)")
+rc=$(resp_rc "$r")
+[ "$rc" = "0" ] \
+    && printf '%s\n' "$r" | grep -q '"id":"t_run"' \
+    && printf '%s\n' "$r" | grep -q '"status":"RUNNING"' \
+    && printf '%s\n' "$r" | grep -q '"health":{"type":"none"' \
+    && printf '%s\n' "$r" | grep -q '"has_run_dir":1' \
+    && printf '%s\n' "$r" | grep -q '"dependency":""' \
+    && printf '%s\n' "$r" | grep -q '"condition":""' \
+    && printf '%s\n' "$r" | grep -q '"dependency_state":"ok"' \
+    && printf '%s\n' "$r" | grep -q '"gate_state":""' \
+    && ok "P4-09 agg: GET_TASK_DETAIL new fields present + existing keys intact" \
+    || bad "P4-09 agg: detail fields payload=$(printf '%s' "$r" | tail -n +2)"
+
+# P4-09：有 dependency 的 WAITING 任务 → dependency_state=waiting + gate_state 含原因
+tcfg_set_field t_run dependency "t_ok" >/dev/null 2>&1
+mkdir -p "$TASKS_DIR/t_run"
+echo "WAITING" > "$TASKS_DIR/t_run/state.txt"
+printf '2026-09-02 08:30:01|t_run|gate_wait|WAITING|||dep unsat: t_ok\n' >> "$TASKS_DIR/t_run/events.log"
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+r=$(send_req "d10" "d10|GET_TASK_DETAIL|id=$(ipc_b64enc t_run)")
+rc=$(resp_rc "$r")
+[ "$rc" = "0" ] \
+    && printf '%s\n' "$r" | grep -q '"dependency":"t_ok"' \
+    && printf '%s\n' "$r" | grep -q '"dependency_state":"waiting"' \
+    && printf '%s\n' "$r" | grep -q '"gate_state":"WAITING (dep unsat: t_ok)"' \
+    && printf '%s\n' "$r" | grep -q '"status":"WAITING"' \
+    && ok "P4-09 agg: WAITING task detail shows dependency_state=waiting + gate_state reason" \
+    || bad "P4-09 agg: WAITING detail payload=$(printf '%s' "$r" | tail -n +2)"
+# 还原 t_run 状态与依赖（避免影响后续 §3/§4 用例；events.log 重置为既有首行
+# 以免污染下方「events 2 行 → truncated」断言）
+rm -f "$TASKS_DIR/t_run/state.txt"
+printf '2026-09-02 08:30:01|t_run|spawn|STARTING|1001||launched\n' > "$TASKS_DIR/t_run/events.log"
+tcfg_set_field t_run dependency "" >/dev/null 2>&1
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
 
 r=$(send_req "d2" "d2|GET_TASK_DETAIL|id=$(ipc_b64enc nope)")
 [ "$(resp_rc "$r")" = "3" ] && ok "P3-05 agg: GET_TASK_DETAIL unknown -> task_not_found" || bad "P3-05 agg: unknown rc=$(resp_rc "$r")"

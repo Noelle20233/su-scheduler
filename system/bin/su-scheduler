@@ -507,7 +507,14 @@ cmd_task_info() {
     [ -f "$task_dir/start_time.txt" ] && echo -e "${BOLD}Started:${RESET} $(cat "$task_dir/start_time.txt")"
     [ -f "$task_dir/end_time.txt" ] && echo -e "${BOLD}Ended:${RESET} $(cat "$task_dir/end_time.txt")"
     [ -f "$task_dir/exit_code.txt" ] && echo -e "${BOLD}Exit Code:${RESET} $(cat "$task_dir/exit_code.txt")"
-    
+    # P4-09：managed 域任务附加 dependency/condition 观测（legacy 显示空/不显示）
+    if [ "$RUNTIME_LOADED" -eq 1 ] && tcfg_is_managed 2>/dev/null; then
+        tf=$(tcfg_task_file "$task_id" 2>/dev/null)
+        if [ -n "$tf" ] && [ -f "$tf" ]; then
+            echo -e "${BOLD}Dependency:${RESET} $(grep '^dependency=' "$tf" | head -1 | cut -d= -f2-)"
+            echo -e "${BOLD}Condition:${RESET} $(grep '^condition=' "$tf" | head -1 | cut -d= -f2-)"
+        fi
+    fi
     echo -e "${BLUE}============================================================${RESET}"
 }
 

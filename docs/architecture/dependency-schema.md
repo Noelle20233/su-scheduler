@@ -433,6 +433,54 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 - 该原子性与 P4-02 D5 / P4-03 D9 的「校验失败不写盘」契约一致，此处针对编辑器
   开放后新增的注入面重申并由 webui/editor、webui/security、fuzz 三套件锁定。
 
+## 13. P4-09 增补裁决：CLI/日志可观测查询面（ADR D30–D33）
+
+> **状态**：已接受（P4-09 冻结）。在 D11–D29 之上补齐依赖状态、条件结果与 WAITING
+> 原因的**只读查询面**，不改任何调度/门控/Retry/Supervisor 实现。
+> **配套实现**：Runtime §22 `obs_gate_state`/`obs_dep_state` + `web_agg_summary`
+> waiting 计数 + `web_task_detail` 新字段 + §7 `task_cli_status` dependency=/Gate
+> 行 + CLI `cmd_task_info` managed 附加行。详见 docs/P4-09.md。
+
+### D30 可观测面复用既有 IPC 只读通道（不新增 op）
+
+- 依赖/条件/门控状态全部经既有 `GET_TASK_DETAIL` / `GET_SUMMARY` /
+  `GET_TASK_EVENTS` 暴露，**不新增 IPC op**（白名单仍 19 op，B7）。
+- `dependency_state` = 当前门控判定摘要（ok|satisfied|waiting|unsat），复用 §20
+  `sched_dep_satisfied` **只读消费**（返回码 0/1/2 映射，无副作用、不改工件）；
+  无依赖 → `ok`，满足 → `satisfied`，可等待未满足（缺失/禁用/非终态）→ `waiting`，
+  终态不匹配立即失败 → `unsat`。
+- `gate_state` = 任务当前是否 WAITING + 原因，由 `obs_gate_state` 只读聚合运行目录
+  `state.txt` + events.log 最新 gate 事件 / 工件（retry.until=退避中、gate.fail
+  标记）得到，形如 `WAITING (dep unsat: t_b)` / `WAITING (retry backoff …)`。
+- CLI 侧：`task status` 经既有 `task_cli_status_id` 通道补 `dependency=` 与 `Gate:`
+  行；`task-info` 经既有旧工件命令在 managed 域附加 `Dependency:`/`Condition:`。
+
+### D31 JSON 只增键不删改（B8 统一契约）
+
+- `GET_TASK_DETAIL` task 对象既有字段（id/name/status/trigger/action/enabled/
+  health/recovery/pid/last_*/restart_count/run_count/source/has_run_dir）**名字与
+  结构零变更**，仅新增 `dependency` / `condition` / `dependency_state` /
+  `gate_state` 4 键。
+- `GET_SUMMARY` counts 既有 7 键（total/running/healthy/failed/disabled/unhealthy/
+  unknown）不变，仅新增 `"waiting"`（WAITING 不再计入 unknown）。
+- WebUI 前端对未知键既有容错（`counts.total || 0` 等），新键自动兼容，无需前端改动。
+
+### D32 CLI 旧输出兼容
+
+- task status / task-info 既有行格式**不动**（新行附加）：`dependency=`/`condition=`
+  空值输出空；`Gate:` 行仅 WAITING 时输出（缺省空）；`task-info` 的
+  `Dependency:`/`Condition:` 仅 managed 域显示（legacy 不显示新字段）。
+- task-output / task-log 语义零改动（cmd_task_output 读 output.log、
+  cmd_task_logs 走 GET_TASK_LOG 均保持既有行为）。
+
+### D33 WAITING 控制行为固化（引用 D17）
+
+- WAITING 下 start/stop/restart/check 行为沿用 P4-05 D17，**不再改动实现**：
+  force start（含 restart）跳过门控直接执行（manual_exec）、非 force start 拒绝
+  （rc 3）、stop 不写状态、check 只健康探测不改 state.txt。
+- 查询面作为可观测证据：GET_TASK_EVENTS 返回 gate_wait/gate_ok/gate_fail/
+  retry-backoff 事件且原因可读；测试固化这些控制行为 + 事件断言。
+
 ---
 
 ## 附：决策记录
@@ -465,3 +513,8 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   权威校验（语法+图+文法）已在 P4-02/03/06 就绪；前端校验非安全边界（仅即时提示，
   textContent 渲染、无 Root 直执/eval）；失败编辑 task-config 逐字节不变（B9 重申）。
   版本 1.25.0 → 1.26.0。CLI 查询展示留 P4-09。
+- 2026-09-04：P4-09 增补 D30–D33（CLI/日志可观测查询面）。依赖/条件/门控状态经
+  既有只读 IPC 通道暴露（不新增 op），dependency_state 复用 sched_dep_satisfied
+  只读消费、gate_state 读运行目录状态/事件；JSON 只增键不删改（B8）；CLI 旧输出
+  兼容（新行附加、空值输出空、legacy task-info 不显示新字段、task-output/log 语义
+  零改动）；WAITING 控制行为固化引用 D17（不改实现）。版本 1.26.0 → 1.27.0。

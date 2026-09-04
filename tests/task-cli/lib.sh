@@ -108,6 +108,7 @@ task_cli_status() {
     echo "name=$(grep '^name=' "$f" | head -1 | cut -d= -f2-)"
     echo "enabled=$(grep '^enabled=' "$f" | head -1 | cut -d= -f2)"
     echo "trigger=$(grep '^trigger=' "$f" | head -1 | cut -d= -f2)"
+    echo "dependency=$(grep '^dependency=' "$f" | head -1 | cut -d= -f2-)"
     echo "condition=$(grep '^condition=' "$f" | head -1 | cut -d= -f2-)"
     echo "action=$(grep '^action.command=' "$f" | head -1 | cut -d= -f2-)"
     echo "source.type=$(grep '^source.type=' "$f" | head -1 | cut -d= -f2)"
@@ -131,6 +132,15 @@ task_cli_status() {
         echo "last_event=$(tail -1 "$rdir/events.log" 2>/dev/null)"
     else
         echo "last_event="
+    fi
+    # P4-09：门控状态行（WAITING + 原因；缺省空）
+    if [ -d "$rdir" ] && [ "$(cat "$rdir/state.txt" 2>/dev/null)" = "WAITING" ]; then
+        greason=$(grep -E '\|(gate_wait|gate_fail)\|' "$rdir/events.log" 2>/dev/null | tail -1 | cut -d'|' -f7-)
+        if [ -n "$greason" ]; then
+            echo "Gate: WAITING ($greason)"
+        else
+            echo "Gate: WAITING"
+        fi
     fi
     return 0
 }

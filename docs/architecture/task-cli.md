@@ -56,13 +56,20 @@
 key=value 行（对齐 P1-02 task 文件风格）：
 
 ```
-id / name / enabled / trigger / condition / action
+id / name / enabled / trigger / dependency / condition / action
 source.type / source.line / source.raw     # 来源（P1-02 source.*）
 state / legacy_status                       # 当前状态 + 旧兼容状态
 run_count / last_status / last_exit / last_start / last_end  # 最近一次执行
 daemon=running|stopped                      # 注入锁且可判定时
 last_event=                                 # events.log 尾行（P1-09）
+Gate: <WAITING + 原因>                      # P4-09 门控状态行（仅 WAITING 时，缺省空）
 ```
+
+- `dependency`/`condition`：managed Task v2 域的配置字段（P4-09 起输出；空值输出空，
+  legacy 快照无值亦输出空行）。
+- `Gate:` 行（P4-09）：任务当前处于 WAITING 时输出 `Gate: WAITING (<原因>)`，原因取
+  自运行目录 gate 工件（retry.until / gate.fail）或 events.log 最新 gate 事件 msg；
+  非 WAITING 不产生该行。
 
 ## 3. 数据源（验收 1：CLI 读 Task Registry）
 

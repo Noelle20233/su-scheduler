@@ -97,6 +97,13 @@
       有界等待超时；
     - `wait timeout > WAIT_MAX=…; dep unsat: <depid>` —— 依赖尚在非终态，有界等待
       超时。
+  - `rearm`（FAILED>WAITING 重试退避，P4-07）：msg=`retry backoff attempt N/M
+    (interval=…s)`，同样可消费。
+- **P4-09 查询面**：以上 WAITING 相关事件（gate_wait/gate_ok/gate_fail/retry 退避）
+  均可经 **GET_TASK_EVENTS**（`web_log_payload` 读 `events.log`，≤200 行）与 CLI
+  `task status` 的 `last_event=`/`Gate:` 行消费；`gate_state` 摘要（WAITING + 原因）
+  由 `obs_gate_state` 只读聚合运行目录 state + events 最新 gate 事件/工件，供
+  GET_TASK_DETAIL 与 task status 使用。
 - **校验**：`state` 须通过 `task_state_is_valid`；`event` 须在 `RT_EVENTS`；
   任一非法 → 整体拒绝（rc 1），事件与状态**都不写**（不污染状态源，P1-03
   「非法转换必须被拒绝并记录日志」的持久化对应）。

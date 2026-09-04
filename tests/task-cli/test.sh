@@ -154,6 +154,39 @@ side=$(TR_LOGGING=0 registry_init "$BASE" "$CFG_PART" >/dev/null 2>&1; registry_
 task_cli_list >/dev/null 2>&1 && ok "list rc 0 on partial-bad (fail-safe subset)" || bad "list on partial-bad"
 rm -f "$CFG_PART"
 
+# ── 8) P4-09：task status 输出 dependency=/condition=/Gate 行 ──────────────
+# 恢复有效快照（§7 partial-bad 实验后 current 可能指向损坏子集）
+TR_LOGGING=0 registry_init "$BASE" "$CFG" >/dev/null 2>&1
+# managed 场景构造：向当前快照写入带 dependency/condition 的 v2 任务文件
+# （test-domain registry 快照任务文件即 task_cli_status 的数据源）
+SNAP=$(registry_snapshot_dir)
+[ -n "$SNAP" ] || { bad "P4-09 status: snapshot dir unavailable"; exit 1; }
+printf 'schema_version=2\nid=t_v2_1\ntrigger=08:30\ndependency=dep_a,?dep_b:FAILED\ncondition={{ time.hour == 8 }}\naction.command=echo hi\n' > "$SNAP/t_v2_1.task"
+vout=$(TASK_CLI_LOCK="" task_cli_status t_v2_1 2>/dev/null)
+grep -q '^dependency=dep_a,?dep_b:FAILED$' <<< "$vout" \
+    && ok "P4-09 status: dependency= emitted (managed v2 task with optional/state)" \
+    || bad "P4-09 status: dependency missing out=[$vout]"
+grep -q '^condition={{ time.hour == 8 }}$' <<< "$vout" \
+    && ok "P4-09 status: condition= emitted verbatim" || bad "P4-09 status: condition missing"
+grep -q '^Gate:' <<< "$vout" && bad "P4-09 status: Gate leaked for non-WAITING task" \
+    || ok "P4-09 status: no Gate line when not WAITING"
+# 空值输出空：legacy 快照无 dependency/condition 值 → 输出空（既有 condition= 语义对齐）
+gout=$(TASK_CLI_LOCK="" task_cli_status t45_2200 2>/dev/null)
+grep -q '^dependency=$' <<< "$gout" \
+    && ok "P4-09 status: empty dependency= output for legacy (no value)" \
+    || bad "P4-09 status: legacy dependency=[$(echo "$gout" | grep '^dependency=')]"
+# Gate 行：WAITING 运行目录 → 门控状态行（WAITING + 原因）
+mkdir -p "$RUNDIR/t_v2_1"
+printf 'WAITING\n' > "$RUNDIR/t_v2_1/state.txt"
+printf '2026-09-01 01:02:03|t_v2_1|gate_wait|WAITING|||dep unsat: dep_a\n' > "$RUNDIR/t_v2_1/events.log"
+wout=$(TASK_CLI_TASKS_DIR="$RUNDIR" TASK_CLI_LOCK="$LKF" task_cli_status t_v2_1 2>/dev/null)
+grep -q '^Gate: WAITING (dep unsat: dep_a)$' <<< "$wout" \
+    && ok "P4-09 status: Gate: WAITING (dep unsat: dep_a) line emitted" \
+    || bad "P4-09 status: Gate=[$(echo "$wout" | grep '^Gate:')]"
+grep -q '^state=WAITING$' <<< "$wout" \
+    && ok "P4-09 status: state=WAITING from run-dir state.txt" || bad "P4-09 status: state"
+
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 rm -f "$LKF"
 rm -rf "$BASE" "$BASE_BAD" "$RUNDIR"

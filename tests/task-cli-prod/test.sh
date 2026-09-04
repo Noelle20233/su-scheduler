@@ -79,6 +79,12 @@ grep -q '^id=t45_2200$' <<< "$sout" && ok "P2-08 status: id=t45_2200" || bad "P2
 grep -q '^source.line=45$' <<< "$sout" && ok "P2-08 status: source.line=45" || bad "P2-08 status: source.line"
 grep -q '^state=PENDING$' <<< "$sout" && ok "P2-08 status: state=PENDING (registry fallback, never ran)" || bad "P2-08 status: state=$(echo "$sout" | grep '^state=' )"
 grep -q '^queried_id=' <<< "$sout" && bad "P2-08 status: canonical query must NOT emit queried_id" || ok "P2-08 status: no queried_id for canonical id"
+# P4-09：legacy 快照任务新字段空值输出空（dependency= 无值、无 Gate 行）
+grep -q '^dependency=$' <<< "$sout" \
+    && ok "P4-09 status: legacy task dependency= empty (no value)" \
+    || bad "P4-09 status: legacy dependency=[$(echo "$sout" | grep '^dependency=')]"
+grep -q '^Gate:' <<< "$sout" && bad "P4-09 status: legacy task wrongly shows Gate" \
+    || ok "P4-09 status: legacy task has no Gate line (not WAITING)"
 
 # ── 5) 旧运行 ID 查询（§9 idmap 双向解析）─────────────────────────────────
 RUN="$T/run"
@@ -90,6 +96,49 @@ rc=$?
 grep -q '^queried_id=time_2200_1_12345$' <<< "$sout" && ok "P2-08 legacy: queried_id echoed" || bad "P2-08 legacy: queried_id missing"
 grep -q '^canonical_id=t45_2200$' <<< "$sout" && ok "P2-08 legacy: canonical_id=t45_2200 (idmap run→canonical)" || bad "P2-08 legacy: canonical_id missing"
 grep -q '^id=t45_2200$' <<< "$sout" && ok "P2-08 legacy: status shows canonical id" || bad "P2-08 legacy: id missing"
+
+# ── 5b) P4-09：managed 场景 task status 输出 dependency=/condition=/Gate ────
+# 构造 managed task-config（dep_a + t_dep 带 dependency/condition），经
+# sched_reload 重建快照后 task_cli_status_id 读取 task-config 字段（P4-09）。
+MTC="$T/mtc"; mkdir -p "$MTC"; echo managed > "$MTC/MANAGED"
+export TCFG_DIR="$MTC"
+printf 'schema_version=2\nid=dep_a\ntrigger=23:59\naction.command=echo dep\n' > "$MTC/dep_a.task"
+printf 'schema_version=2\nid=dep_b\ntrigger=23:58\naction.command=echo depb\n' > "$MTC/dep_b.task"
+printf 'schema_version=2\nid=t_dep\ntrigger=08:30\ndependency=dep_a,?dep_b:FAILED\ncondition={{ time.hour == 8 }}\naction.command=echo hi\n' > "$MTC/t_dep.task"
+printf 'schema_version=2\nid=t_empty\ntrigger=09:00\naction.command=echo x\n' > "$MTC/t_empty.task"
+rm -f "$BASE/scheduler/source.md5"
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_dep 2>/dev/null)
+rc=$?
+[ "$rc" -eq 0 ] && ok "P4-09 status: managed t_dep rc=0" || bad "P4-09 status: managed rc=$rc out=$sout"
+grep -q '^dependency=dep_a,?dep_b:FAILED$' <<< "$sout" \
+    && ok "P4-09 status: dependency= from task-config (optional/state kept)" \
+    || bad "P4-09 status: dependency=[$(echo "$sout" | grep '^dependency=')]"
+grep -q '^condition={{ time.hour == 8 }}$' <<< "$sout" \
+    && ok "P4-09 status: condition= from task-config verbatim" || bad "P4-09 status: condition missing"
+grep -q '^Gate:' <<< "$sout" && bad "P4-09 status: Gate leaked for non-WAITING managed task" \
+    || ok "P4-09 status: no Gate line when not WAITING"
+# 空值输出空：无 dependency/condition 键 → 输出空
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_empty 2>/dev/null)
+grep -q '^dependency=$' <<< "$sout" && grep -q '^condition=$' <<< "$sout" \
+    && ok "P4-09 status: empty dependency=/condition= for task without keys" \
+    || bad "P4-09 status: t_empty dep=[$(echo "$sout" | grep '^dependency=')] cond=[$(echo "$sout" | grep '^condition=')]"
+# Gate 行：WAITING 运行目录 → 门控状态行（WAITING + 原因）
+mkdir -p "$RUN/t_dep"
+printf 'WAITING\n' > "$RUN/t_dep/state.txt"
+printf '2026-09-04 08:30:00|t_dep|gate_wait|WAITING|||dep unsat: dep_a\n' > "$RUN/t_dep/events.log"
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_dep 2>/dev/null)
+grep -q '^Gate: WAITING (dep unsat: dep_a)$' <<< "$sout" \
+    && ok "P4-09 status: Gate: WAITING (dep unsat: dep_a) emitted (run-dir gate event)" \
+    || bad "P4-09 status: Gate=[$(echo "$sout" | grep '^Gate:')]"
+grep -q '^state=WAITING$' <<< "$sout" \
+    && ok "P4-09 status: state=WAITING from run-dir state.txt" || bad "P4-09 status: state"
+rm -f "$RUN/t_dep/state.txt" "$RUN/t_dep/events.log"
+# 还原 legacy 快照（§6 三态测试依赖 t45_2200 存在 + stale-lock rc 3 路径；
+# §2 曾把 $CFG 改写为 drifted-config，需先还原配置文件再重建快照）
+unset TCFG_DIR || true
+cp tests/fixtures/legacy/config.txt "$CFG"
+TR_LOGGING=0 registry_init "$BASE" "$CFG" >/dev/null 2>&1
 
 # ── 6) 三态错误明确区分 ────────────────────────────────────────────────────
 err=$(task_cli_status_id "$BASE" "$RUN" "" no_such_task 2>&1 >/dev/null)
