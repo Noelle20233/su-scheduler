@@ -728,6 +728,202 @@ else
     ok "P4-06 U: unsupported operator 'contains' rejected (== / != only)"
 fi
 
+# ── §retry-p4-07：Supervisor/Recovery/Retry 联动（FAILED>WAITING 退避接线）────
+# 语义（docs/P4-07.md / dependency-schema.md ADR D23–D26）：
+#   - 任务 FAILED（action_failure 执行失败 或 gate_fail 依赖失败传播）后，retry
+#     策略允许（retry.max>0 且未达上限）→ FAILED>WAITING（cause rearm）进入退避
+#     （retry.interval 秒，retry.until 桩文件）；退避期间不重复执行；到点 + 依赖
+#     满足 + 触发匹配 → WAITING>STARTING（gate_ok）执行重试。
+#   - 依赖失败（gate_fail）任务不 auto-recovery（gate.fail 标记；supervisor 不派发
+#     recovery 动作，依赖失败 ≠ 进程崩溃）。
+#   - WAITING 任务目录在 runtime_prune_tasks 下不误删（P4-04 已豁免，此处断言）。
+#   - daemon 重启后 WAITING + retry.until 保留（退避计时可继续）。
+#   - 退避与依赖满足叠加顺序：退避中依赖满足也不释放（retry 计时先于释放判定）。
+R_BASE="$T/r-base"; R_TCFG="$T/r-tc"; R_TASKS="$T/r-tasks"; R_CFG="$T/r.cfg"
+rm -rf "$R_BASE" "$R_TCFG" "$R_TASKS"; mkdir -p "$R_BASE" "$R_TCFG" "$R_TASKS"
+echo managed > "$R_TCFG/MANAGED"; : > "$R_CFG"
+export TCFG_DIR="$R_TCFG"; export TR_BASE="$R_BASE"; export TASKS_DIR="$R_TASKS"
+R_EXEC="$T/r-exec.log"; : > "$R_EXEC"
+# FAIL_ 前缀命令 → 失败（exit_code=1）；否则成功（exit_code=0）
+execute_task() { id=$1; cmd=$2; ns=$3; ne=$4; msg=$5; itr=$6; tmx=$7
+    d="$TASKS_DIR/$id"; mkdir -p "$d"
+    echo "$cmd" > "$d/command.txt"; echo "RUNNING" > "$d/status.txt"
+    echo "$id|$cmd" >> "$R_EXEC"
+    case "$cmd" in
+        FAIL_*) echo "1" > "$d/exit_code.txt"; echo "FAILED" > "$d/status.txt" ;;
+        *) echo "0" > "$d/exit_code.txt"; echo "SUCCESS" > "$d/status.txt" ;;
+    esac
+    return 0; }
+r_task() {   # <id> <trigger> <cmd> [retry.max] [retry.interval] [recovery.type] [dependency]
+    printf 'schema_version=2\nid=%s\ntrigger=%s\naction.command=%s\nretry.max=%s\nretry.interval=%s\nrecovery.type=%s\ndependency=%s\n' \
+        "$1" "$2" "$3" "${4:-0}" "${5:-60}" "${6:-none}" "${7:-}" > "$R_TCFG/$1.task"
+}
+rtick() {   # <now> → 单次调度周期 + 终态对账
+    scheduler_tick "$R_BASE" "$R_CFG" "$R_TASKS" "$1" >/dev/null 2>&1
+    state_sync_all "$R_TASKS" >/dev/null 2>&1
+}
+rexec_count() { grep -c "$1" "$R_EXEC" 2>/dev/null || echo 0; }
+
+# 版本一致性：RUNTIME_LIB_VERSION = 1.25.0（P4-07 递增，B5 版本线同步）
+[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.25.0" ] \
+    && ok "P4-07 version: RUNTIME_LIB_VERSION=1.25.0 (P4-07 Supervisor/Retry wiring)" \
+    || bad "P4-07 version: RUNTIME_LIB_VERSION=$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')"
+
+# R1) FAILED>WAITING 退避接线：retry.max=1 任务执行失败 → FAILED → 下一 tick 接
+#     FAILED>WAITING（retry.until 落盘 + rearm 事件 + 退避期间不执行）
+r_task r_a 08:50 "FAIL_r_a" 1 1
+SCHED_CYCLE_NOW=202609040850 GATE_NOW=1000 rtick 0850
+[ "$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R1: FAIL_ task materialized FAILED (initial failure)" || bad "P4-07 R1: state=$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)"
+[ "$(rexec_count FAIL_r_a)" -eq 1 ] \
+    && ok "P4-07 R1: initial execution happened (exec=1)" || bad "P4-07 R1: exec=$(rexec_count FAIL_r_a)"
+SCHED_CYCLE_NOW=202609040850 GATE_NOW=1000 rtick 0850
+[ "$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-07 R1: FAILED>WAITING wired (retry backoff entered)" || bad "P4-07 R1: state=$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)"
+[ -f "$R_TASKS/r_a/retry.until" ] && [ "$(cat "$R_TASKS/r_a/retry.until" 2>/dev/null)" = "1001" ] \
+    && ok "P4-07 R1: retry.until stub written (1001 = now+interval)" || bad "P4-07 R1: retry.until=$(cat "$R_TASKS/r_a/retry.until" 2>/dev/null)"
+grep -q '|rearm|WAITING|' "$R_TASKS/r_a/events.log" 2>/dev/null \
+    && grep -q 'retry backoff' "$R_TASKS/r_a/events.log" 2>/dev/null \
+    && ok "P4-07 R1: events.log records rearm→WAITING retry backoff" || bad "P4-07 R1: rearm event missing"
+[ "$(rexec_count FAIL_r_a)" -eq 1 ] \
+    && ok "P4-07 R1: no execution during backoff (exec stays 1)" || bad "P4-07 R1: exec=$(rexec_count FAIL_r_a) during backoff"
+
+# R2) 退避到点 + 触发仍匹配 → WAITING>STARTING（gate_ok）执行重试；再失败 → FAILED
+#     （retry.max=1 已耗尽 → 终态，不再接线）
+SCHED_CYCLE_NOW=202609040851 GATE_NOW=1001 rtick 0851
+[ "$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R2: backoff elapsed → retry executed → failed again → FAILED (retry exhausted)" \
+    || bad "P4-07 R2: state=$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)"
+[ "$(rexec_count FAIL_r_a)" -eq 2 ] \
+    && ok "P4-07 R2: retry executed exactly once after backoff (exec=2)" || bad "P4-07 R2: exec=$(rexec_count FAIL_r_a)"
+grep -q '|gate_ok|STARTING|' "$R_TASKS/r_a/events.log" 2>/dev/null \
+    && ok "P4-07 R2: WAITING>STARTING gate_ok on retry release" || bad "P4-07 R2: gate_ok missing"
+[ ! -f "$R_TASKS/r_a/retry.until" ] \
+    && ok "P4-07 R2: retry.until cleared after backoff elapsed" || bad "P4-07 R2: retry.until still present"
+SCHED_CYCLE_NOW=202609040852 GATE_NOW=1002 rtick 0852
+[ "$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R2: retry.max=1 exhausted → FAILED terminal (no re-arm)" || bad "P4-07 R2: state=$(cat "$R_TASKS/r_a/state.txt" 2>/dev/null)"
+[ "$(rexec_count FAIL_r_a)" -eq 2 ] \
+    && ok "P4-07 R2: exhausted retry NOT re-executed (exec stays 2)" || bad "P4-07 R2: exec=$(rexec_count FAIL_r_a)"
+
+# R3) retry.max=2：两次退避重试后终态；成功重试（命令改成功）→ STOPPED + 退避工件清除
+r_task r_b 09:00 "FAIL_r_b" 2 1
+SCHED_CYCLE_NOW=202609040900 GATE_NOW=2000 rtick 0900
+SCHED_CYCLE_NOW=202609040900 GATE_NOW=2000 rtick 0900     # FAILED>WAITING
+SCHED_CYCLE_NOW=202609040901 GATE_NOW=2001 rtick 0901     # retry1 → FAILED
+SCHED_CYCLE_NOW=202609040901 GATE_NOW=2001 rtick 0901     # FAILED>WAITING
+SCHED_CYCLE_NOW=202609040902 GATE_NOW=2002 rtick 0902     # retry2 → FAILED
+[ "$(rexec_count FAIL_r_b)" -eq 3 ] \
+    && ok "P4-07 R3: retry.max=2 → exactly 2 retries after initial fail (exec=3)" || bad "P4-07 R3: exec=$(rexec_count FAIL_r_b)"
+[ "$(cat "$R_TASKS/r_b/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R3: retries exhausted → FAILED terminal" || bad "P4-07 R3: state=$(cat "$R_TASKS/r_b/state.txt" 2>/dev/null)"
+# 成功重试：先失败进入退避，命令切成功后 retry 成功 → STOPPED（退避工件清除）
+r_task r_c 09:10 "FAIL_r_c" 2 1
+SCHED_CYCLE_NOW=202609040910 GATE_NOW=3000 rtick 0910      # exec1 FAIL → FAILED
+SCHED_CYCLE_NOW=202609040910 GATE_NOW=3000 rtick 0910      # FAILED>WAITING (retry.until=3001)
+[ "$(cat "$R_TASKS/r_c/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-07 R3: retry backoff armed after first failure (WAITING)" || bad "P4-07 R3: state=$(cat "$R_TASKS/r_c/state.txt" 2>/dev/null)"
+r_task r_c 09:10 "OK_r_c" 2 1                              # 命令切成功（触发 reload）
+SCHED_CYCLE_NOW=202609040911 GATE_NOW=3001 rtick 0911      # backoff elapsed → retry OK → SUCCESS
+[ "$(cat "$R_TASKS/r_c/state.txt" 2>/dev/null)" = "STOPPED" ] \
+    && ok "P4-07 R3: successful retry → STOPPED (cycle complete)" || bad "P4-07 R3: state=$(cat "$R_TASKS/r_c/state.txt" 2>/dev/null)"
+[ "$(rexec_count FAIL_r_c)" -eq 1 ] && [ "$(rexec_count OK_r_c)" -eq 1 ] \
+    && ok "P4-07 R3: retry ran once after backoff (FAIL=1, OK=1)" || bad "P4-07 R3: exec FAIL=$(rexec_count FAIL_r_c) OK=$(rexec_count OK_r_c)"
+
+# R4) gate_fail 任务不 auto-recovery：依赖失败传播 FAILED（recovery.type=restart）
+#     不被 supervisor 拉起（gate.fail 标记 + RECOVERING 分支拦截）
+r_task dep_g 23:59 "OK_dep_g" 0 60 none ""
+r_task t_g 09:20 "OK_t_g" 1 1 restart "dep_g"
+mkdir -p "$R_TASKS/dep_g"; echo FAILED > "$R_TASKS/dep_g/state.txt"
+SCHED_CYCLE_NOW=202609040920 GATE_NOW=4000 rtick 0920      # t_g → WAITING
+SCHED_CYCLE_NOW=202609040920 GATE_NOW=4000 rtick 0920      # dep 终态不匹配 → WAITING>FAILED (gate_fail)
+[ "$(cat "$R_TASKS/t_g/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R4: dependency terminal mismatch → WAITING>FAILED (gate_fail)" || bad "P4-07 R4: state=$(cat "$R_TASKS/t_g/state.txt" 2>/dev/null)"
+grep -q 'dep failed' "$R_TASKS/t_g/events.log" 2>/dev/null \
+    && ok "P4-07 R4: gate_fail event with dep-failed reason" || bad "P4-07 R4: gate_fail reason missing"
+[ -f "$R_TASKS/t_g/gate.fail" ] \
+    && ok "P4-07 R4: gate.fail marker written on dependency failure" || bad "P4-07 R4: gate.fail marker missing"
+# RECOVERING 分支拦截（独立 run dir 保证确定性）：gate.fail 标记存在 → 不派发
+# recovery 动作 → FAILED；命令绝不执行
+R4T="$T/r4t"; rm -rf "$R4T"; mkdir -p "$R4T/tasks/t_g"
+echo RECOVERING > "$R4T/tasks/t_g/state.txt"
+echo "restart blocked" > "$R4T/tasks/t_g/gate.fail"
+printf 'schema_version=2\nid=t_g\ntrigger=09:20\naction.command=OK_t_g\nrecovery.type=restart\nretry.max=1\nhealth.type=port\nhealth.target=59990\n' > "$R4T/t_g.task"
+R4TASKS="$R4T/tasks" TASKS_DIR="$R4T/tasks" TCFG_DIR="$R_TCFG" \
+    supervisor_step "$R4T/tasks/t_g" "$R4T/t_g.task" >/dev/null 2>&1
+[ "$(cat "$R4T/tasks/t_g/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R4: supervisor RECOVERING + gate.fail → NOT auto-recovered (FAILED)" \
+    || bad "P4-07 R4: state=$(cat "$R4T/tasks/t_g/state.txt" 2>/dev/null)"
+[ ! -f "$R4T/tasks/t_g/pid.txt" ] \
+    && ok "P4-07 R4: recovery action NOT dispatched (restart not pulled up, no pid)" || bad "P4-07 R4: recovery dispatched"
+
+# R5) WAITING 任务目录不误删（runtime_prune_tasks / runtime_dir_active 豁免）
+P5="$T/prune5"; rm -rf "$P5"; mkdir -p "$P5/tasks"
+# 6 个目录，max=3 → 第 4-6 个（最旧）进入修剪评估：w1(WAITING) 豁免、f1/f2 删除
+mkdir -p "$P5/tasks/w1" "$P5/tasks/f1" "$P5/tasks/f2" "$P5/tasks/k1" "$P5/tasks/k2" "$P5/tasks/k3"
+echo WAITING > "$P5/tasks/w1/state.txt"
+echo FAILED > "$P5/tasks/f1/state.txt"
+echo FAILED > "$P5/tasks/f2/state.txt"
+echo FAILED > "$P5/tasks/k1/state.txt"
+echo FAILED > "$P5/tasks/k2/state.txt"
+echo FAILED > "$P5/tasks/k3/state.txt"
+touch -t 202401010101 "$P5/tasks/w1"
+touch -t 202401010102 "$P5/tasks/f1"
+touch -t 202401010103 "$P5/tasks/f2"
+touch -t 202401010104 "$P5/tasks/k1"
+touch -t 202401010105 "$P5/tasks/k2"
+touch -t 202401010106 "$P5/tasks/k3"
+runtime_prune_tasks "$P5/tasks" 3
+[ -d "$P5/tasks/w1" ] \
+    && ok "P4-07 R5: WAITING dir exempt from prune (w1 kept beyond TASK_DIRS_MAX=3)" || bad "P4-07 R5: WAITING dir wrongly pruned"
+[ ! -d "$P5/tasks/f1" ] && [ ! -d "$P5/tasks/f2" ] \
+    && ok "P4-07 R5: inactive FAILED dirs (f1/f2) pruned" || bad "P4-07 R5: inactive dirs kept"
+[ -d "$P5/tasks/k1" ] && [ -d "$P5/tasks/k2" ] && [ -d "$P5/tasks/k3" ] \
+    && ok "P4-07 R5: 3 newest FAILED dirs kept (max honored)" || bad "P4-07 R5: newest kept set wrong"
+
+# R6) 退避与依赖满足叠加顺序：退避中即使依赖满足也不释放（retry 计时先于释放）
+r_task dep_d 23:59 "OK_dep_d" 0 60 none ""
+r_task t_d 09:30 "FAIL_t_d" 2 1 none "dep_d"
+SCHED_CYCLE_NOW=202609040930 GATE_NOW=5000 rtick 0930      # dep_d 未执行（23:59）→ t_d 依赖不满足 → WAITING（非退避）
+[ "$(cat "$R_TASKS/t_d/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-07 R6: dep unmet → t_d WAITING (gate_wait)" || bad "P4-07 R6: state=$(cat "$R_TASKS/t_d/state.txt" 2>/dev/null)"
+mkdir -p "$R_TASKS/dep_d"; echo STOPPED > "$R_TASKS/dep_d/state.txt"
+SCHED_CYCLE_NOW=202609040930 GATE_NOW=5000 rtick 0930      # 依赖满足 → gate_ok → 执行 → FAILED
+[ "$(cat "$R_TASKS/t_d/state.txt" 2>/dev/null)" = "FAILED" ] \
+    && ok "P4-07 R6: dep released → executed → FAILED" || bad "P4-07 R6: state=$(cat "$R_TASKS/t_d/state.txt" 2>/dev/null)"
+SCHED_CYCLE_NOW=202609040930 GATE_NOW=5000 rtick 0930      # FAILED>WAITING（退避）
+[ -f "$R_TASKS/t_d/retry.until" ] \
+    && ok "P4-07 R6: retry backoff armed after execution failure" || bad "P4-07 R6: retry.until missing"
+# 退避中：依赖仍满足 + 触发仍匹配 + retry.until 未到 → 保持 WAITING（不释放不执行）
+SCHED_CYCLE_NOW=202609040930 GATE_NOW=5000 rtick 0930
+[ "$(cat "$R_TASKS/t_d/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-07 R6: backoff pending → stays WAITING even with deps satisfied" || bad "P4-07 R6: state=$(cat "$R_TASKS/t_d/state.txt" 2>/dev/null)"
+[ "$(rexec_count FAIL_t_d)" -eq 1 ] \
+    && ok "P4-07 R6: no execution during backoff (exec=1)" || bad "P4-07 R6: exec=$(rexec_count FAIL_t_d)"
+SCHED_CYCLE_NOW=202609040931 GATE_NOW=5001 rtick 0931      # 退避到点 → 释放重试
+[ "$(rexec_count FAIL_t_d)" -eq 2 ] \
+    && ok "P4-07 R6: backoff elapsed → retry executed (exec=2)" || bad "P4-07 R6: exec=$(rexec_count FAIL_t_d)"
+
+# R7) daemon 重启后 WAITING + 退避计时保留（重启后继续退避，到点执行）
+r_task t_e 09:40 "FAIL_t_e" 2 1 none ""
+SCHED_CYCLE_NOW=202609040940 GATE_NOW=6000 rtick 0940      # 执行失败 → FAILED
+SCHED_CYCLE_NOW=202609040940 GATE_NOW=6000 rtick 0940      # FAILED>WAITING（retry.until=6001）
+[ "$(cat "$R_TASKS/t_e/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-07 R7: t_e entered retry backoff WAITING (pre-restart)" || bad "P4-07 R7: state=$(cat "$R_TASKS/t_e/state.txt" 2>/dev/null)"
+# 模拟重启：legacy status.txt=RUNNING（剪枝目标）+ state.txt=WAITING → rehydrate 保留
+echo "RUNNING" > "$R_TASKS/t_e/status.txt"
+state_rehydrate_residual "$R_TASKS" >/dev/null 2>&1
+[ "$(cat "$R_TASKS/t_e/state.txt" 2>/dev/null)" = "WAITING" ] \
+    && ok "P4-07 R7: rehydrate PRESERVES WAITING (retry backoff survives restart)" || bad "P4-07 R7: WAITING lost after rehydrate"
+[ -f "$R_TASKS/t_e/retry.until" ] && [ "$(cat "$R_TASKS/t_e/retry.until" 2>/dev/null)" = "6001" ] \
+    && ok "P4-07 R7: retry.until stub persists across restart (backoff continues)" || bad "P4-07 R7: retry.until lost"
+SCHED_CYCLE_NOW=202609040940 GATE_NOW=6000 rtick 0940      # 重启后退避中 → 不执行
+[ "$(rexec_count FAIL_t_e)" -eq 1 ] \
+    && ok "P4-07 R7: post-restart still in backoff → NOT executed" || bad "P4-07 R7: exec=$(rexec_count FAIL_t_e)"
+SCHED_CYCLE_NOW=202609040941 GATE_NOW=6001 rtick 0941      # 到点 → 重试执行
+[ "$(rexec_count FAIL_t_e)" -eq 2 ] \
+    && ok "P4-07 R7: post-restart backoff elapsed → retry executed (exec=2)" || bad "P4-07 R7: exec=$(rexec_count FAIL_t_e)"
+
 # ── §legacy：Legacy 配置零影响 ────────────────────────────────────────────
 # legacy 解析/执行路径无 dependency/condition 新接线（C2/C4 零改动）
 grep -n 'dependency\|condition' "$DAEMON" >/dev/null 2>&1 \

@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.24.0"
+RUNTIME_LIB_VERSION="1.25.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1646,7 +1646,10 @@ state_sync_one() {   # <dir> → 0=ok 1=未完成（无终态可判定）2=硬�
     ec=$(cat "$dir/exit_code.txt" 2>/dev/null)
     cur=$(runtime_current_state "$dir")
     case "$cur" in
-        STARTING|RUNNING|PENDING|WAITING)
+        STARTING|RUNNING|PENDING)
+            # P4-07：WAITING 不在对账列——重试退避/依赖门控中的 WAITING 任务带
+            # 残留 exit_code.txt（上次失败遗留），若被对账会强制回写 FAILED/STOPPED，
+            # 破坏 FAILED>WAITING 退避。WAITING 的解除/终态由 advance 通道负责。
             if [ "$ec" = "0" ]; then
                 state_log_event "$dir" "$id" action_success STOPPED "" "$ec" "exit=$ec" >/dev/null 2>&1
             else
@@ -1654,6 +1657,9 @@ state_sync_one() {   # <dir> → 0=ok 1=未完成（无终态可判定）2=硬�
             fi
             ;;
         STOPPED|FAILED|DISABLED)
+            # P4-07：终态对账后清除重试退避工件（retry.count/retry.until/gate.fail）
+            # ——重试退避只存在于 FAILED>WAITING 期间，终态是新一轮生命周期。
+            rm -f "$dir/retry.count" "$dir/retry.until" "$dir/gate.fail" 2>/dev/null
             if [ ! -f "$dir/state.txt" ]; then
                 # 新源缺失：由旧工件推导的终态 → 物化（旧工件不动）。
                 if [ "$cur" = "STOPPED" ]; then
@@ -2280,6 +2286,15 @@ supervisor_step() {
             state_log_event "$rd" "$id" supervisor RECOVERING "" "" "recovery started" >/dev/null 2>&1 && return 1
             return 0 ;;
         RECOVERING)
+            # P4-07：依赖失败传播（gate_fail）的任务不 auto-recovery——依赖失败 ≠
+            # 进程崩溃。gate.fail 标记存在 → 不派发 recovery 动作（restart/start/
+            # stopstart/script），直接转 FAILED（终态，等待 rearm/人工）。执行期失败
+            # （无 gate.fail）维持既有 recovery 语义。
+            if [ -f "$(sched_retry_gatefail_file "$rd")" ]; then
+                state_log_event "$rd" "$id" supervisor FAILED "" "" "gate-failed task not auto-recovered (dependency failure)" >/dev/null 2>&1
+                rm -f "$(sched_retry_gatefail_file "$rd")" 2>/dev/null
+                return 1
+            fi
             supervisor_policy "$tf"
             # 节奏：retry.interval 秒内不重试（recovery.next = epoch 秒）
             now=$(date +%s)
@@ -3155,6 +3170,90 @@ sched_gate_elapsed() {   # <run_dir> → echo 已等待秒数（无起点 → 0�
     fi
 }
 
+# ────────────────────────────────────────────────────────────────────────
+# §20b P4-07 Supervisor/Recovery/Retry 联动：FAILED>WAITING 重试退避接线
+# ────────────────────────────────────────────────────────────────────────
+# 需求（docs/P4-07.md / dependency-schema.md ADR D23–D26）：
+#   - 接线 FAILED>WAITING（reserved 边，cause rearm）：任务 FAILED（action_failure
+#     执行失败 或 gate_fail 依赖失败传播）后，retry 策略允许（retry.max>0 且未达
+#     上限）→ 按既有 retry 语义进入 WAITING 退避。其余 FAILED 终态保持既有
+#     （FAILED>PENDING rearm 由 sched_execute_one 既有路径维持）。
+#   - 运行目录工件：retry.count（已退避次数，上限 retry.max）、retry.until
+#     （退避截止 epoch 秒，经 sched_gate_epoch 计时，重启后可继续）。退避期间
+#     scheduler 不执行（execute_one 遇 WAITING 保持不执行）；退避结束 + 依赖满足
+#     + 触发仍匹配 → WAITING>STARTING（gate_ok）执行。
+#   - 依赖失败与 Recovery 协调：gate_fail（依赖失败传播）落 FAILED 时写运行目录
+#     标记 gate.fail；supervisor_step 遇 gate.fail → 不 auto-recovery（依赖失败
+#     ≠ 进程崩溃，D25）；重试退避只重跑 action（普通执行），不派发 recovery 动作。
+#   - Cooldown/Crash Loop：crash_guard 进程级不变；retry.cooldown 在重试上限
+#     触达后写 recovery.cooldown_until（supervisor 既有工件），cooldown 内不重接。
+#   - 重启恢复：WAITING 保留（P4-04）；retry.until 桩文件重启后继续计时。
+# 命名空间：sched_retry_*，内部全局 rty_ 前缀。
+# ═══════════════════════════════════════════════════════════════════════════
+sched_retry_count_file()   { echo "$1/retry.count"; }
+sched_retry_until_file()   { echo "$1/retry.until"; }
+sched_retry_gatefail_file() { echo "$1/gate.fail"; }
+
+# FAILED>WAITING 退避接线判定：<run_dir> <task_file> → 0=应进入退避 1=不应
+# （retry.max=0 / 已达上限 / 依赖门控失败任务不接退避 / cooldown 内）。
+rty_policy() {   # 载入 retry 策略到全局（retry_max/retry_interval/retry_cooldown）
+    rty_tf=$1
+    retry_max=$(grep '^retry.max=' "$rty_tf" | head -1 | cut -d= -f2-)
+    retry_interval=$(grep '^retry.interval=' "$rty_tf" | head -1 | cut -d= -f2-)
+    retry_cooldown=$(grep '^retry.cooldown=' "$rty_tf" | head -1 | cut -d= -f2-)
+    case "$retry_max" in ''|*[!0-9]*) retry_max=0 ;; esac
+    [ "$retry_max" -gt 100 ] && retry_max=100
+    case "$retry_interval" in ''|*[!0-9]*) retry_interval=60 ;; esac
+    case "$retry_cooldown" in ''|*[!0-9]*) retry_cooldown=0 ;; esac
+}
+
+# 进入重试退避：<base> <run_dir> <task_file> → 0=已接线 FAILED>WAITING 1=未接线
+#（调用方保证 FAILED；本函数幂等：retry.until 已存在 → 不重复接线）。
+sched_retry_arm() {
+    rty_base=$1; rty_rd=$2; rty_tf=$3
+    [ -f "$(sched_retry_until_file "$rty_rd")" ] && return 1   # 已在退避中
+    # P4-07：依赖门控失败（gate.fail 标记）不接重试退避——依赖失败 ≠ 进程崩溃，
+    # 由 supervisor 不 auto-recovery（D25）协同，等待 rearm/人工/下一窗口。
+    [ -f "$(sched_retry_gatefail_file "$rty_rd")" ] && return 1
+    rty_policy "$rty_tf"
+    [ "$retry_max" -gt 0 ] 2>/dev/null || return 1
+    rty_cnt=$(cat "$(sched_retry_count_file "$rty_rd")" 2>/dev/null)
+    [ -n "$rty_cnt" ] || rty_cnt=0
+    [ "$rty_cnt" -lt "$retry_max" ] 2>/dev/null || {
+        # 已达上限：记基础 cooldown（防失败风暴热循环；复用 supervisor 工件）
+        rty_now=$(sched_gate_epoch)
+        [ "$retry_cooldown" -gt 0 ] 2>/dev/null && \
+            echo $((rty_now + retry_cooldown)) > "$rty_rd/recovery.cooldown_until" 2>/dev/null
+        return 1
+    }
+    # cooldown 未到 → 不接线
+    rty_cdu=$(cat "$rty_rd/recovery.cooldown_until" 2>/dev/null)
+    if [ -n "$rty_cdu" ] && [ "$(sched_gate_epoch)" -lt "$rty_cdu" ] 2>/dev/null; then
+        return 1
+    fi
+    rty_cnt=$((rty_cnt + 1))
+    echo "$rty_cnt" > "$(sched_retry_count_file "$rty_rd")" 2>/dev/null
+    echo $(( $(sched_gate_epoch) + retry_interval )) > "$(sched_retry_until_file "$rty_rd")" 2>/dev/null
+    rty_id=$(basename "$rty_rd")
+    state_log_event "$rty_rd" "$rty_id" rearm WAITING "" "" "retry backoff attempt $rty_cnt/$retry_max (interval=${retry_interval}s)" >/dev/null 2>&1
+    sched_gate_start "$rty_rd"
+    sched_audit "$rty_base" "op=retry|task=$rty_id|action=backoff|attempt=$rty_cnt|max=$retry_max|mode=$(sched_source_mode "$rty_base")"
+    return 0
+}
+
+# 退避判定（advance 复查用）：<run_dir> → 0=不在退避/已到退避截止 1=退避中
+sched_retry_pending() {
+    rty_f=$(sched_retry_until_file "$1")
+    [ -f "$rty_f" ] || return 0
+    rty_u=$(cat "$rty_f" 2>/dev/null)
+    case "$rty_u" in ''|*[!0-9]*) rm -f "$rty_f" 2>/dev/null; return 0 ;; esac
+    if [ "$(sched_gate_epoch)" -ge "$rty_u" ] 2>/dev/null; then
+        rm -f "$rty_f" 2>/dev/null
+        return 0
+    fi
+    return 1
+}
+
 # 依赖满足判定：<tasks_dir> <id> → 0=满足 1=未满足（等待中/缺失/禁用——可等待，
 # 至 WAIT_MAX 超时判失败） 2=未满足且 Required 依赖已终态但不匹配（立即判失败，
 # P4-05 dep failed 传播）；stdout=原因（仅供审计/msg）。
@@ -3277,6 +3376,19 @@ sched_advance_waiting() {
     [ "$(runtime_current_state "$run_dir" 2>/dev/null)" = "WAITING" ] || return 1
     tf=$(registry_task_file "$id" 2>/dev/null) || return 2
     trig=$(sched_task_field "$tf" trigger)
+    # P4-07：重试退避复查——retry.until 存在（FAILED>WAITING 退避中）→ 未到点
+    # 保持 WAITING（不执行、不参与触发/依赖释放）；到点清除桩、本轮强制可执行
+    # （retry 释放不依赖触发窗口——重试针对失败动作本身）。
+    rty_release=0
+    if [ -f "$(sched_retry_until_file "$run_dir")" ]; then
+        # sched_retry_pending：0=已到点/不在退避 1=退避中。
+        if sched_retry_pending "$run_dir"; then
+            rty_release=1
+        else
+            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=keep-retry-backoff|mode=$(sched_source_mode "$base")"
+            return 2
+        fi
+    fi
     gres=$(sched_gate_check "$tasks" "$id")
     grc=$?
     out=$(trigger_decide "$base" "$id" "$now" "$boot" "$base/schedule_state.txt")
@@ -3284,6 +3396,9 @@ sched_advance_waiting() {
         *due=Y*) due=1 ;;
         *) due=0 ;;
     esac
+    # P4-07：重试退避到点 → 本轮强制可执行（重试不依赖触发窗口；trigger_decide
+    # 对已过窗口的触发返回 due=N，但重试是针对失败动作本身的新一轮执行）
+    [ "$rty_release" -eq 1 ] && due=1
     if [ "$grc" -eq 0 ]; then
         # P4-06 条件门控（并列 AND）：依赖满足但条件非空且求值为假/非法（防御）→
         # rearm 回 PENDING（返回 3），下一周期再求值（有界，无永久 WAITING）。
@@ -3297,6 +3412,9 @@ sched_advance_waiting() {
         fi
         # 依赖已满足：触发仍匹配 → WAITING>STARTING → action_run；不再匹配 → rearm
         if [ "$due" -eq 1 ]; then
+            # P4-07：释放执行 = 新一轮真实执行 → 清除 gate.fail 标记（防旧依赖失败
+            # 影响本轮执行后的 recovery 判定）
+            rm -f "$(sched_retry_gatefail_file "$run_dir")" 2>/dev/null
             state_log_event "$run_dir" "$id" gate_ok STARTING "" "" "deps satisfied" >/dev/null 2>&1
             sched_gate_clear "$run_dir"
             cmd=$(sched_task_field "$tf" action.command)
@@ -3329,6 +3447,8 @@ sched_advance_waiting() {
     # 由 sched_execute_one 重新门控）。
     if [ "$grc" -eq 2 ]; then
         sched_gate_clear "$run_dir"
+        # P4-07：依赖失败传播 → 落 FAILED 时标记 gate.fail（supervisor 不 auto-recovery）
+        echo "$gres" > "$(sched_retry_gatefail_file "$run_dir")" 2>/dev/null
         state_log_event "$run_dir" "$id" gate_fail FAILED "" "" "$gres" >/dev/null 2>&1
         sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=fail-dep|reason=$gres|mode=$(sched_source_mode "$base")"
         return 4
@@ -3340,6 +3460,8 @@ sched_advance_waiting() {
         gdv_el=$(sched_gate_elapsed "$run_dir")
         if [ "$gdv_el" -gt "$WAIT_MAX" ] 2>/dev/null; then
             sched_gate_clear "$run_dir"
+            # P4-07：依赖超时 FAILED 亦属 gate_fail 类 → 标记（不 auto-recovery）
+            echo "wait timeout > WAIT_MAX=${WAIT_MAX}s; $gres" > "$(sched_retry_gatefail_file "$run_dir")" 2>/dev/null
             state_log_event "$run_dir" "$id" gate_fail FAILED "" "" "wait timeout > WAIT_MAX=${WAIT_MAX}s; $gres" >/dev/null 2>&1
             sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=fail-timeout|reason=$gres|mode=$(sched_source_mode "$base")"
             return 4
@@ -3376,8 +3498,18 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     run_dir="$tasks/$id"
     gdv_cur=""
     [ -f "$run_dir/state.txt" ] && gdv_cur=$(cat "$run_dir/state.txt" 2>/dev/null)
+    # P4-07：WAITING 由 advance 通道独占管理（依赖门控 + 重试退避）。execute 路径
+    # 对 WAITING 一律不执行（退避期间不得重复执行）；D14「每窗口至多一次」由 advance
+    # 释放时 mark cycle 保证，execute 路径不得再碰 WAITING 任务。
+    if [ "$gdv_cur" = "WAITING" ]; then
+        sched_audit "$base" "op=execute|task=$id|trigger=$trig|blocked=waiting|mode=$(sched_source_mode "$base")"
+        return 3
+    fi
     case "$gdv_cur" in
         STOPPED|FAILED)
+            # P4-07：rearm 进入新执行周期 → 清除 gate.fail 标记（防旧依赖失败
+            # 影响新一轮执行后的 recovery 判定）
+            rm -f "$(sched_retry_gatefail_file "$run_dir")" 2>/dev/null
             state_log_event "$run_dir" "$id" rearm PENDING "" "" "rearm before gate" >/dev/null 2>&1 ;;
         DISABLED) ;;
     esac
@@ -3445,6 +3577,20 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
             esac
         fi
     done
+    # P4-07：FAILED>WAITING 重试退避接线——FAILED 任务（action_failure 执行失败 /
+    # gate_fail 依赖失败传播）按 retry 策略进入 WAITING 退避（retry.until 计时）。
+    # 退避期间 advance 通道保持 WAITING（不执行）；到点 + 依赖满足 + 触发匹配 →
+    # WAITING>STARTING 执行。未接线（retry.max=0 / 达上限 / cooldown）保持 FAILED
+    # （终态，既有 FAILED>PENDING rearm 路径不变）。
+    rty_n=0
+    for id in $(registry_task_ids); do
+        if [ -d "$tasks/$id" ] && [ "$(cat "$tasks/$id/state.txt" 2>/dev/null)" = "FAILED" ]; then
+            rty_tf=$(registry_task_file "$id" 2>/dev/null) || continue
+            if sched_retry_arm "$base" "$tasks/$id" "$rty_tf" >/dev/null 2>&1; then
+                rty_n=$((rty_n + 1))
+            fi
+        fi
+    done
     due=0; execn=0; errn=0
     for id in $(registry_task_ids); do
         if sched_cycle_seen "$base" "$id" "$token"; then
@@ -3458,7 +3604,7 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
         sched_cycle_mark "$base" "$id" "$token"
         [ "$rc" -eq 0 ] && execn=$((execn + 1)) || errn=$((errn + 1))
     done
-    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn|wadv=$w_ok|wfail=$w_err"
+    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn|wadv=$w_ok|wfail=$w_err|retry=$rty_n"
     return 0
 }
 # 启动 boot：registry 中 trigger=boot 的任务（RUNTIME_LOADED=1 启动段调用）
@@ -5402,6 +5548,8 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
                secv_fix_perms secv_effective_timeout runtime_limit_task_log \
                dep_normalize dep_entry_ok dep_validate cond_validate \
                cond_grammar_ok cond_eval \
+               sched_retry_count_file sched_retry_until_file sched_retry_gatefail_file \
+               rty_policy sched_retry_arm sched_retry_pending \
                dep_validate_graph; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done

@@ -157,7 +157,7 @@ legacy → configuration_invalid（提示先 `task-config import`）。只读/�
 
 - 新函数一律 `ipc_` 前缀、内部全局 `ipcv_` 前缀（防覆盖调用方全局，同 P3-03
   教训）；全部注册进 `runtime_lib_selfcheck`。
-- `RUNTIME_LIB_VERSION` 1.14.0 → **1.15.0**（新增 §21）→ … → **1.19.0**（P3-08 §25 加固）→ **1.20.0**（P4-02 新增 §26 Dependency/Condition Schema）→ **1.21.0**（P4-03 §26 依赖图校验/环检测）→ **1.22.0**（P4-04 §20 WAITING 依赖门控）→ **1.23.0**（P4-05 §20 Required/Optional 失败传播）→ **1.24.0**（P4-06 §26b Condition 受限表达式引擎）。
+- `RUNTIME_LIB_VERSION` 1.14.0 → **1.15.0**（新增 §21）→ … → **1.19.0**（P3-08 §25 加固）→ **1.20.0**（P4-02 新增 §26 Dependency/Condition Schema）→ **1.21.0**（P4-03 §26 依赖图校验/环检测）→ **1.22.0**（P4-04 §20 WAITING 依赖门控）→ **1.23.0**（P4-05 §20 Required/Optional 失败传播）→ **1.24.0**（P4-06 §26b Condition 受限表达式引擎）→ **1.25.0**（P4-07 §20b Supervisor/Recovery/Retry 联动）。
 
 ## 客户端入口
 

@@ -346,6 +346,52 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 11. P4-07 增补裁决：Supervisor / Recovery / Retry 联动（ADR D23–D26）
+
+> **状态**：已接受（P4-07 冻结）。接线 **FAILED>WAITING（重试退避）** reserved 边，
+> 使依赖门控与 P3 既有 Supervisor/Recovery/Retry/Cooldown/Crash Loop 协同。
+> **配套实现**：Runtime §20b `sched_retry_arm`/`sched_retry_pending`/`rty_policy`
+> + `scheduler_tick` 接线 + `sched_advance_waiting` 退避复查 + `sched_execute_one`
+> WAITING 屏蔽 + §14 state_sync WAITING 移出对账列 + §17 gate.fail 不 auto-recovery
+> + §18 WAITING prune 豁免。详见 docs/P4-07.md。
+
+### D23 FAILED>WAITING 退避接线
+
+- 任务 FAILED（action_failure 执行失败 或 gate_fail 依赖失败传播）后，retry 策略
+  允许（retry.max>0 且未达上限）→ 进入 WAITING 退避（reserved 边，cause rearm）。
+- 运行目录工件：`retry.count`（已退避次数，≤ retry.max）、`retry.until`（退避截止
+  epoch 秒，经 `sched_gate_epoch` 计时，重启后继续）。退避期间 `sched_execute_one`
+  对 WAITING 一律不执行；到点 + 依赖满足 + 触发匹配 → `WAITING>STARTING`
+  （gate_ok）执行。
+- 未接线（retry.max=0 / 达上限 / cooldown 内）保持 FAILED 终态（既有
+  FAILED>PENDING rearm 不变）。
+
+### D24 退避与门控顺序
+
+- 退避复查先于依赖满足判定：`retry.until` 未到 → 保持 WAITING（即使依赖已满足也
+  不释放、不执行）；到点后**强制可执行**（重试针对失败动作本身，不依赖触发窗口，
+  trigger_decide 对已过窗口的触发返回 due=N 时被 rty_release 覆盖为 due=1）。
+- `sched_retry_pending` 返回契约：0=不在退避/已到截止（释放）；1=退避中（保持）。
+
+### D25 依赖失败不 auto-recovery / 不重试
+
+- gate_fail（依赖失败传播 / 依赖超时）落 FAILED 时写运行目录标记 `gate.fail`。
+- Supervisor RECOVERING 分支遇 `gate.fail` → **不派发 recovery 动作**
+  （restart/start/stopstart/script）→ 直接 FAILED（终态，等待 rearm/人工）。依赖
+  失败 ≠ 进程崩溃。执行期失败（无 gate.fail）维持既有 recovery 语义。
+- `sched_retry_arm` 对 `gate.fail` 任务同样不接退避（依赖门控失败不重试，仅记录
+  原因；与 D15 失败传播矩阵一致）。
+
+### D26 WAITING prune 豁免 / 重启恢复
+
+- `runtime_dir_active` 原不把 WAITING 当活跃 → 会被 `runtime_prune_tasks` 误删。
+  P4-07 改为 WAITING 任务目录在 prune 中**豁免**（门控等待中的活任务，P4-10 复查
+  上限）。
+- 重启后 WAITING 保留（P4-04）且 `retry.until` 桩继续计时（退避可跨重启继续）；
+  终态（STOPPED/FAILED）对账后清除退避工件（retry.count/retry.until/gate.fail）。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -365,4 +411,9 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   state / time.* / env.* 三白名单 / file.exists 受限路径）、运算符仅 ==/!=、三态
   语义（真执行/假跳过无副作用/非法校验期拒绝+运行期防御）、禁止任意 Shell 求值、
   与依赖门控并列 AND（sched_cond_check 独立契约）。重试退避留 P4-07，WebUI 开放
+  编辑留 P4-08，CLI 查询展示留 P4-09。
+- 2026-09-04：P4-07 增补 D23–D26（Supervisor/Recovery/Retry 联动）。接线
+  FAILED>WAITING 重试退避（retry.count/retry.until 工件，GATE_NOW 计时重启可续）；
+  退避先于依赖满足判定、到点强制可执行；gate.fail 标记 → supervisor 不 auto-
+  recovery 且不接退避（依赖失败 ≠ 进程崩溃）；WAITING 目录 prune 豁免。WebUI 开放
   编辑留 P4-08，CLI 查询展示留 P4-09。
