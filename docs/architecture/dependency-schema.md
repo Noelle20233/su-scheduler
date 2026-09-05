@@ -528,6 +528,42 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   + `§obs-p4-09` O（summary waiting 计数有界）。取舍记录见 docs/P4-10.md §5 与
   docs/P4-EXIT-REPORT.md §2 item 3。
 
+## 15. P4-11 增补裁决：真机复验发现的兼容缺陷（ADR D36–D37）
+
+> **状态**：已接受（P4-11 冻结）。本任务是 P4 的设备矩阵与综合回归——在同一台
+> KernelSU × Android 16 真机完整执行 `run_tests.sh --with-device`，首次激活
+> Runtime 1.28.0 后暴露 **D34 同源新面**（mksh `(`-in-pattern 参数展开）与
+> CLI/daemon 实例管理缺陷。前者属本 ADR（Condition 引擎解析层）；后者属
+> CLI/daemon 生命周期层（见 docs/P4-11.md §3 D-B/D-C），非 schema 范畴。
+> **配套实现**：`cond_grammar_ok`/`cond_eval` 的 task.state/file.exists 谓词提取
+> 改 `cut`；daemon 单实例保护拒绝接管；cmd_stop 按 `/proc` cmdline 匹配。
+> 详见 docs/P4-11.md。
+
+### D36 mksh `(`-in-pattern 参数展开（D34 新面，B7/NF-7 回归）
+
+- **缺陷**：P4-06 引入的 `cond_grammar_ok`/`cond_eval` 用
+  `${conde_l#task.state(}` / `${conde_id%)}` 这种 **pattern 含裸 `(`/`)`** 的参数
+  展开提取 `task.state(<id>)` / `file.exists(<path>)` 谓词参数。设备
+  `/system/bin/sh`（mksh R59，Android 16）**无法解析**（`no closing quote`）→
+  Condition 引擎两个函数语法错误 → 整个 Runtime 库（5622 行）source 失败 →
+  daemon 降级 legacy（P4 全功能真机不可用）。bash/dash 正常，故宿主测试无法发现。
+- **修复**：4 处改为
+  `conde_id=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)` ——与 D34 /
+  P3-10 D-IPC 同源手法（`cut` 已在库内 80+ 处使用，C3 合规）；语义不变（id/path
+  字符集受 `secv_id_ok`/`conde_charset_ok` 约束，不含 `(`/`)`，cut 提取等价）。
+- **守护测试**：`tests/p4-dependency/test.sh` §hard-p4-11 静态断言「生产库零裸
+  `(`/`)`-in-pattern 参数展开」（修前 FAIL，修后 PASS）+ 真机 Runtime 1.28.0
+  loaded + p3-device 28 PASS 全绿（FAIL→PASS 证据见 docs/P4-11.md §3 D-A）。
+
+### D37 mksh 兼容面扩展声明（B7/NF-7 复核结论）
+
+- D34 禁 `${var#*|}`/`${var%%|*}`、本 ADR 禁 `${var#...(`/`${var%)}`——复核结论：
+  **Android 16 mksh 对 pattern 中裸 `|`、`(`、`)` 的参数展开均不可靠**（P3-10/
+  P4-10/P4-11 三次真机确认）。新增 P4 代码一律用 `cut -d'<c>' -fN` 切分；写入
+  ADR 决策记录，供 P5+ 引用。
+- `runtime_lib_selfcheck` 已覆盖 cond/dep 函数存在性；宿主 dash -n + 真机
+  `sh -n` 双语法门保持。
+
 ---
 
 ## 附：决策记录
@@ -572,3 +608,10 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   有界终态 + registry 有界 + prune 豁免对象有终态保证，理由与取舍成文）。其余 7 项
   复核通过（DEP_MAX/COND_MAX_LEN 写路径全覆盖、注入/穿越零 exec 零写、POSIX 语法、
   单 daemon 循环、Legacy 零改、无新依赖、无 eval）。版本 1.27.0 → 1.28.0。
+- 2026-09-05：P4-11 增补 D36–D37（真机复验发现的兼容缺陷）。D36：`cond_grammar_ok`/
+  `cond_eval` 的 `${var#task.state(}`/`${var%)}` pattern 含裸 `(`/`)`，Android 16
+  mksh 无法解析 → Runtime 库 source 失败 → daemon 降级 legacy；4 处改
+  `cut -d'(' -f2 | cut -d')' -f1`（D34/P3-10 同源手法）。D37：mksh 对 pattern 中
+  裸 `|`/`(`/`)` 参数展开均不可靠（P3-10/P4-10/P4-11 三次真机确认），P5+ 一律用
+  `cut` 切分。CLI/daemon 实例管理缺陷（cmd_stop pidof / 单实例保护）属生命周期层，
+  记入 docs/P4-11.md §3 D-B/D-C。版本 1.28.0（不变，缺陷修复不 bump）。

@@ -1,22 +1,24 @@
 # Su Scheduler — P4 出口评审报告（P4-EXIT-REPORT）
 
-> **任务**：P4-10 · 安全、资源与兼容性加固 + P4 出口评审
-> **前置**：P4-01..P4-09（全部交付物就绪）；`docs/P4-BASELINE-COMPATIBILITY.md`
+> **任务**：P4-12 · P4 出口评审与发布准备（本报告为 P4 出口冻结终版）
+> **前置**：P4-01..P4-11（全部交付物就绪）；`docs/P4-BASELINE-COMPATIBILITY.md`
 > （B1–B14 冻结契约）、`docs/P4-DEPENDENCY-REQUIREMENTS.md`（NF-1..NF-8、§4 安全
-> 边界）、`docs/architecture/dependency-schema.md`（ADR D1–D35）
-> **版本**：模块 `v1.6.8`（不变）；Runtime 库 `1.27.0 → 1.28.0`（P4-10 D34 修复）
-> **日期**：2026-09-04
-> **入口**：`bash tests/run_tests.sh`（L1+L2+L4，WSL 权威宿主）+ `tests/p4-dependency`
-> 等专项套件（MINGW 本地）
+> 边界）、`docs/architecture/dependency-schema.md`（ADR D1–D37）
+> **版本**：模块 `v1.6.8`（不变）；Runtime 库 `1.28.0`（P4 出口）
+> **日期**：2026-09-04（P4-10 初版）→ 2026-09-05（P4-12 冻结终版，含 P4-11 真机
+> 验证与三缺陷修复）
+> **入口**：`bash tests/run_tests.sh --with-device`（L1+L2+L4+L3，WSL 权威宿主 +
+> 真机）+ `tests/p3-integration` / `tests/p4-dependency` / `tests/p1-build`
+> **签核**：见 §8（人工签核栏）
 
 ---
 
 ## 0. 结论（TL;DR）
 
 **P4（Dependency / Condition / WAITING 任务链）通过出口评审，可进入发布候选与
-P5 规划。**
+P5/P6 规划。P4-11/P4-12 完成真机全链路验证与出口冻结。**
 
-- P4-01..P4-10 全部 TaskIndex 交付物齐备（§1 状态表），Runtime 库随功能递增至
+- P4-01..P4-12 全部 TaskIndex 交付物齐备（§1 状态表），Runtime 库随功能递增至
   **1.28.0**，模块版本 `v1.6.8` 不变（D4 版本策略：内部实现线独立演进）。
 - **8 项安全/资源/兼容性核查（§2）：7 项复核通过、1 项发现并修复生产缺陷**
   ——D34（依赖图邻接表切分使用 mksh `|`-in-pattern 参数展开，B7/NF-7 回归，
@@ -25,14 +27,18 @@ P5 规划。**
   影响，daemon 主循环结构未动（`while true` 恰 1），service.sh 零改动。
 - **P4 范围边界（§4）**：DAG / 云同步 / 多设备 / 第二常驻循环 / 通用 Condition
   求值器零实现；无新增运行期外部依赖；无 `eval`/`sh -c` 拼接执行用户输入。
-- **全量 WSL 门禁最终数字已回填（§5.1）**：**1900 PASS / 0 FAIL**（WSL 权威宿主，
-  `ALL SUITES GREEN`，exit 0）；MINGW 本地专项套件结果已记录。
+- **P4-11 真机验证（§5）**：同一台 KernelSU × Android 16 真机
+  `run_tests.sh --with-device` **全绿**（宿主 3812 PASS / 0 FAIL + p1-device 11
+  PASS + p3-device 28 PASS / 0 FAIL / 0 BLOCKED），并修复 3 个 Runtime 激活后暴露的
+  真机缺陷（D-A mksh `(`-in-pattern / D-B cmd_stop pidof / D-C daemon 单实例保护，
+  详见 `docs/P4-11.md` §3）。
+- **P4-12 出口冻结（§5/§7）**：5 项验收命令全绿；出口条件逐项闭合；人工签核见 §8。
 
 ---
 
 ## 1. P4 阶段总览：TaskIndex 逐项状态
 
-| Task | 内容 | Runtime 版本 | Commit | 门禁结果（MINGW 专项 / WSL 权威） |
+| Task | 内容 | Runtime 版本 | Commit | 门禁结果（WSL 权威 / 真机） |
 | :-- | :-- | :-- | :-- | :-- |
 | P4-01 | P3 发布缺口收口与 P4 基线冻结（D-IPC 真机复验、基线兼容清单、Runtime 版本检查 A/B） | 1.19.0（基线） | `edaf071` | WSL 基线 1631 PASS / 0 FAIL |
 | P4-02 | Dependency/Condition Schema 解析 + 权威校验 + 原子持久化（§26 `dep_*`/`cond_*`，DEP_MAX/COND_MAX_LEN） | 1.20.0 | `ad555b8` | p4-dependency 52/0 |
@@ -41,9 +47,11 @@ P5 规划。**
 | P4-05 | Required/Optional 失败传播（终态不匹配立即 FAILED、缺失/禁用有界等待、force start 跳过门控） | 1.23.0 | `f866c21` | p4-dependency 134/0 |
 | P4-06 | Condition 受限表达式引擎（白名单谓词、==/!=、三态语义、零 shell 求值） | 1.24.0 | `5574b64` | p4-dependency 157/0 |
 | P4-07 | Supervisor/Recovery/Retry 联动（FAILED>WAITING 退避、gate.fail 不 auto-recovery、WAITING prune 豁免） | 1.25.0 | `539720d`（feat）+ `41b42b0`（test 日期敏感修复） | p4-dependency 194/0 |
-| P4-08 | IPC 与 WebUI 依赖编辑器（复用 VALIDATE_TASK/EDIT_TASK，注入拒绝 + B9 原子性） | 1.26.0 | `bb22314` | webui editor 38/0、security 24/0 |
+| P4-08 | IPC 与 WebUI 依赖编辑器（复用 VALIDATE_TASK/EDIT_TASK，注入拒绝 + B9 原子性） | 1.26.0 | `bb22314` | webui editor 41/0、security 27/0 |
 | P4-09 | CLI/日志可观测查询面（dependency=/Gate 行、detail 新字段、summary waiting 计数；只增键） | 1.27.0 | `44a431e` | p4-dependency 207/0 |
-| **P4-10** | **安全/资源/兼容性加固 + P4 出口评审（D34 mksh 修复、D35 WAITING 取舍、本报告）** | **1.28.0** | *本任务 commit* | 见 §5 |
+| P4-10 | 安全/资源/兼容性加固 + D34 mksh `|`-in-pattern 修复 + D35 WAITING 取舍 | 1.28.0 | `f5ff103`+`7bdfb32` | p4-dependency 218/0；全量 1900/0 |
+| **P4-11** | **设备矩阵与综合回归**：真机全链路（KernelSU×Android16）+ D-A/D-B/D-C 三缺陷修复 | 1.28.0 | `284b337`+`e70383d` | `--with-device` 全绿：宿主 3812 + p1-device 11 + p3-device 28（见 §5） |
+| **P4-12** | **出口评审与发布准备**（本报告 + P4-HANDOVER + P4-UPGRADE-ROLLBACK + 候选清单） | 1.28.0 | *本任务 commit* | 见 §5/§7 |
 
 ---
 
@@ -103,66 +111,106 @@ WAITING 数量上限经 D35 裁决「不设显式上限」（理由见 ADR D35 �
 
 ---
 
-## 5. 回归结果
+## 5. 回归结果（P4-12 出口冻结）
 
 ### 5.1 全量 WSL 门禁（权威宿主）
 
-> **已回填（队长复核，2026-09-04）**：`bash tests/run_tests.sh`（L1+L2+L4）在
-> WSL 权威宿主（~/su-scheduler 原生文件系统）最终结果为 **ALL SUITES GREEN**，
-> **PASS=1900 / FAIL=0**，exit 0。P4-01 基线 1631 → P4-10 出口 1900（P4 全期净增
-> 269 断言，0 失败）。trace log：`tests/results/run_tests-20260904-212539.log`。
+> **P4-12 出口复验（2026-09-05，WSL 权威宿主 ~/su-scheduler 原生文件系统）**：
+> `bash tests/run_tests.sh` → **ALL SUITES GREEN**，**PASS=3812 / FAIL=0**，exit 0
+> （45 套件，L1+L2+L4）。P4-01 基线 1631 → P4-12 出口 3812（P4 全期净增
+> 2181 断言，0 失败）。trace log：`tests/results/run_tests-20260905-124936.log`。
 
-| 套件 | MINGW 本地（本任务） | WSL 权威 |
+| 套件 | 结果（WSL 权威） | 备注 |
 | :-- | :-- | :-- |
-| 全量 run_tests.sh | 不跑（AGENTS §4.4：Windows 不跑全量） | **1900 PASS / 0 FAIL**（45 套件全绿，exit 0） |
+| 全量 run_tests.sh | **3812 PASS / 0 FAIL**（45 套件全绿，exit 0） | L1+L2+L4，含 p4-dependency 219 / p3-integration 48 / cli 29 / build 26 |
+| p3-integration（独立） | **48 PASS / 0 FAIL** | P3 综合回归 |
+| p4-dependency（独立） | **219 PASS / 0 FAIL** | P4 核心（P4-10 基线 218 + P4-11 mksh 断言 1） |
+| p1-build/build_check（独立） | **26 PASS / 0 FAIL / 0 SKIP** | 构建 + unzip -t + 八处一致 + Runtime A/B |
 
-### 5.2 重点专项套件（MINGW 本地实测）
+### 5.2 真机设备冒烟（P4-11/P4-12 权威）
 
-| 套件 | 结果 | 备注 |
+> **P4-12 出口复验（2026-09-05）**：`bash tests/run_tests.sh --with-device` →
+> **ALL SUITES GREEN / EXIT=0**（47 套件全绿）。trace log：
+> `tests/results/run_tests-20260905-125433.log` + 设备
+> `tests/results/device-8934ffc4-20260905-130756.log`（259s）。
+
+| 设备冒烟 | 结果 | 备注 |
 | :-- | :-- | :-- |
-| `tests/p4-dependency/test.sh` | **218 PASS / 0 FAIL**（P4-09 基线 207 + §hard-p4-10 新增 11；含 D34 修复） | 本任务核心 |
-| `tests/security/fuzz.sh` | 25 PASS / 0 FAIL | dep/cond 注入零 exec 零写 |
-| `tests/security/path-validation.sh` | 9 PASS / 0 FAIL | 路径穿越/符号链接 |
-| `tests/security/permission.sh` | 5 PASS / 0 FAIL | 权限强制 |
-| `tests/resource/stress.sh` | 10 PASS / 0 FAIL | 上限/单循环/频率限制 |
-| `tests/scheduler-prod/test.sh` | 33 PASS / 0 FAIL | `while true`==1 保持 |
-| `tests/config-v2/test.sh` | 44 PASS / 0 FAIL | 原子性 |
-| `tests/config-v2/validation.sh` | 40 PASS / 0 FAIL | editor 校验 |
-| `tests/ipc/test.sh` | 62 PASS / 2 环境性 FAIL（ipc perms / operation_timeout，基线一致） | 非本任务引入 |
-| `tests/ipc/security.sh` | 14 PASS / 3 环境性 FAIL（procd 时序 / ipc perms / operation_timeout，基线一致） | 非本任务引入 |
-| `tests/legacy/golden.sh` | 8 PASS / 0 FAIL | Legacy 零影响 |
-| `tests/legacy-adapter/test.sh` | 106 PASS / 1 环境性 FAIL（`uncreatable out_dir rc=0`，MINGW 可建 `/nonexistent-parent-xyz`；HEAD 基线复跑同 FAIL） | 非本任务引入 |
-| `tests/cli/test.sh` | 24 PASS / 0 FAIL | Legacy CLI 零影响 |
-| `tests/p3-integration/test.sh` | 46 PASS / 0 FAIL | P3 综合回归 |
-| `tests/p2-integration/test.sh` | 18 PASS / 0 FAIL | P2 综合回归 |
-| `tests/lint/syntax.sh` | 8 PASS / 0 FAIL | 语法层 |
+| `tests/p1-device/smoke.sh` | **11 PASS / 0 FAIL / 2 SKIP** | Legacy 回归（boot/时间任务/run-once-now/--delete/旧 CLI） |
+| `tests/p3-device/smoke.sh --with-device` | **28 PASS / 0 FAIL / 0 BLOCKED** | 18 项全链路（安装/daemon/Runtime 1.28.0/Registry/IPC 7/8/14/Health/CrashLoop/恢复） |
 
-> MINGW 环境性 FAIL 声明：health / lifecycle-prod / p1-build（zip）/ ipc perms /
-> operation_timeout / procd 时序为既有环境性，与 P4-02..P4-09 声明一致，非本任务
-> 引入；`git stash` 基线复跑可证。
+### 5.3 设备矩阵（如实记录）
+
+- **KernelSU × Android 16（`8934ffc4`，Xiaomi 17）**：✅ 全链路真机验证（§5.2）。
+- **未覆盖**：Magisk × Android 12–16、APatch × Android 12–16、KernelSU × 12–15
+  ——无真机/模拟器 → **发布限制**（不伪造通过，见 `docs/P3-DEVICE-MATRIX.md` §4）。
+- P4 必测场景映射见 `docs/P4-11.md` §2（依赖满足/未满足、WAITING→STARTING、
+  Required/Optional 失败、环/未知拒绝、Condition 真/假、daemon 重启恢复、
+  WebUI 编辑校验控制、Legacy 回归）。
 
 ---
 
-## 6. 遗留问题与 P5 移交清单（诚实原则）
+## 6. 遗留问题与 P5/P6 移交清单（诚实原则）
 
-| 项 | 状态 | 说明 / 理由 | P5 建议 |
+> 完整的 P5/P6 候选需求清单见 `docs/P4-HANDOVER.md` §5。下表为出口遗留状态。
+
+| 项 | 状态 | 说明 / 理由 | P5/P6 建议 |
 | :-- | :-- | :-- | :-- |
-| 全量 WSL 门禁最终数字 | ✅ 已回填 | **1900 PASS / 0 FAIL**（WSL 权威宿主，§5.1） | 无需跟进 |
-| L3 设备冒烟（p3-device / Dependency 门控真机链路） | ✅ 已真机验证（P4-11） | P4-11 在同一台 KernelSU × Android 16 真机执行 `run_tests.sh --with-device`：宿主 3812 PASS / 0 FAIL + p1-device 11 PASS + p3-device 28 PASS / 0 FAIL / 0 BLOCKED（含 Runtime 1.28.0 断言与 D-A/D-B/D-C 三缺陷修复，见 `docs/P4-11.md`） | 无（发布限制仍为 Magisk/APatch × Android 12–16 与 KernelSU × 12–15，见 P3-DEVICE-MATRIX §4） |
+| 全量 WSL 门禁最终数字 | ✅ 已回填（P4-12） | **3812 PASS / 0 FAIL**（WSL 权威宿主，§5.1） | 无需跟进 |
+| L3 设备冒烟（p3-device / Dependency 门控真机链路） | ✅ 已真机验证（P4-11/P4-12） | 同一台 KernelSU × Android 16 真机：宿主 3812 PASS + p1-device 11 PASS + p3-device 28 PASS / 0 FAIL / 0 BLOCKED（含 Runtime 1.28.0 断言与 D-A/D-B/D-C 三缺陷修复，见 `docs/P4-11.md`） | 无（发布限制仍为 Magisk/APatch × Android 12–16 与 KernelSU × 12–15，见 P3-DEVICE-MATRIX §4） |
 | WAITING 显式数量上限 | 已裁决不设（D35） | WAIT_MAX 有界终态 + registry 有界 + prune 豁免有终态保证 | 若「注册任务无上限/自动生成依赖链」进入 P5，按 D35 重估 |
-| Condition 运算符扩展（`<`/`>`/`>=`/`<=`/`contains`） | 明确不在 P4 范围（ADR D19） | P4-06 只做 `==`/`!=` | P5 可选 |
-| 通用 DAG / 云同步 / 多设备 | 零实现（P4 边界） | ADR D7/D4、需求 §7 | P5 明确立项后再议 |
+| Condition 运算符扩展（`<`/`>`/`>=`/`<=`/`contains`） | 明确不在 P4 范围（ADR D19） | P4-06 只做 `==`/`!=` | P5 候选（P4-HANDOVER §5） |
+| 通用 DAG / 云同步 / 多设备 | 零实现（P4 边界） | ADR D7/D4、需求 §7 | P5/P6 候选（不提前实现） |
+| mksh 兼容面 | 已修复（D34/D36/D37） | `|`/`(`/`)` in-pattern 参数展开在 Android 16 mksh 不可靠（三次真机确认） | P5+ 新增代码一律 `cut` 切分（ADRR D37） |
 | P4-09 遗留：obs_gate_state 事件原因内联长度上限 | 复核通过（消息来源受控：枚举原因/工件，且 JSON 侧 web_json_str 转义） | — | 无需跟进（如需可做长度截断增强） |
 
 ---
 
 ## 7. P4 出口判定
 
-**满足 P4 出口全部条件**：
-1. P4-01..P4-10 全部 TaskIndex 交付物齐备（§1）；
+**满足 P4 出口全部条件（P4-12 冻结）**：
+1. P4-01..P4-12 全部 TaskIndex 交付物齐备（§1）；
 2. 8 项安全/资源/兼容性核查通过（§2，含 D34 修复与 FAIL→PASS 证据）；
 3. B1–B14 冻结契约全保持（§3）；
 4. C1–C5 / 禁止项审计通过（§4）；
-5. 专项套件 MINGW 全绿（§5.2），全量 WSL 门禁 **1900 PASS / 0 FAIL**（§5.1，
-   出口标准闭合）；
-6. 配置格式零变更、Legacy 零影响、无新依赖、无第二常驻循环。
+5. **5 项验收命令全绿（§5）**：
+   - `bash tests/run_tests.sh` → **3812 PASS / 0 FAIL**（L1+L2+L4，45 套件）；
+   - `bash tests/run_tests.sh --with-device` → **ALL SUITES GREEN**（47 套件；
+     p1-device 11 PASS；p3-device 28 PASS / 0 FAIL / 0 BLOCKED）；
+   - `bash tests/p3-integration/test.sh` → **48 PASS / 0 FAIL**；
+   - `bash tests/p4-dependency/test.sh` → **219 PASS / 0 FAIL**；
+   - `bash tests/p1-build/build_check.sh` → **26 PASS / 0 FAIL / 0 SKIP**。
+6. 配置格式零变更、Legacy 零影响、无新依赖、无第二常驻循环；
+7. **至少一台 Android 设备完成全链路**（KernelSU × Android 16）；设备限制与未覆盖
+   矩阵如实记录（§5.3 / P3-DEVICE-MATRIX §4）。
+
+---
+
+## 8. 交付物清单与人工签核
+
+### 8.1 交付物
+
+| 交付物 | 路径 | 状态 |
+| :-- | :-- | :-- |
+| P4 出口评审报告（本文件） | `docs/P4-EXIT-REPORT.md` | ✅（P4-12 冻结终版） |
+| P4 交接资料 | `docs/P4-HANDOVER.md` | ✅（P5/P6 移交范围 + 候选需求清单） |
+| Dependency/Condition schema 与 ADR | `docs/architecture/dependency-schema.md` | ✅（D1–D37，含 P4-11 增补） |
+| P4 综合测试报告 | 本文件 §5（含全量数字） | ✅ |
+| 设备矩阵报告 | `docs/P3-DEVICE-MATRIX.md` + `docs/P4-11.md` | ✅ |
+| 构建产物和升级回滚验证记录 | `docs/P4-UPGRADE-ROLLBACK.md` | ✅（P4 真机实测） |
+| 下一阶段候选需求清单 | `docs/P4-HANDOVER.md` §5 | ✅ |
+
+### 8.2 人工签核
+
+> P4 出口须经人工签核（AGENTS §7 决策门）。以下由评审人填写：
+
+| 评审项 | 结论（评审人勾选/填写） |
+| :-- | :-- |
+| 5 项验收命令结果核验 | ☐ 通过 / ☐ 不通过（见 §5 trace log） |
+| 设备矩阵如实记录（未覆盖平台标记发布限制） | ☐ 通过 / ☐ 不通过 |
+| 出口条件逐项闭合（§7） | ☐ 通过 / ☐ 不通过 |
+| 遗留问题与候选清单（§6 / P4-HANDOVER §5）可接受 | ☐ 通过 / ☐ 不通过 |
+| **最终签核** | ☐ 放行发布候选 / ☐ 打回（理由：______） |
+
+- 签核人：____________　日期：____________
+- 评审意见：____________________________________________________
