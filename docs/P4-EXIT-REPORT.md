@@ -148,7 +148,7 @@ WAITING 数量上限经 D35 裁决「不设显式上限」（理由见 ADR D35 �
 | 项 | 状态 | 说明 / 理由 | P5 建议 |
 | :-- | :-- | :-- | :-- |
 | 全量 WSL 门禁最终数字 | ✅ 已回填 | **1900 PASS / 0 FAIL**（WSL 权威宿主，§5.1） | 无需跟进 |
-| L3 设备冒烟（p3-device / Dependency 门控真机链路） | ⏳ 待设备 | P4 未增设备用例；D34 mksh 修复需真机 mksh 复验（Android 16） | P5 设备矩阵扩展时执行 `tests/p3-device/smoke.sh --with-device`（含 Runtime 1.28.0 断言） |
+| L3 设备冒烟（p3-device / Dependency 门控真机链路） | ✅ 已真机验证（P4-11） | P4-11 在同一台 KernelSU × Android 16 真机执行 `run_tests.sh --with-device`：宿主 3812 PASS / 0 FAIL + p1-device 11 PASS + p3-device 28 PASS / 0 FAIL / 0 BLOCKED（含 Runtime 1.28.0 断言与 D-A/D-B/D-C 三缺陷修复，见 `docs/P4-11.md`） | 无（发布限制仍为 Magisk/APatch × Android 12–16 与 KernelSU × 12–15，见 P3-DEVICE-MATRIX §4） |
 | WAITING 显式数量上限 | 已裁决不设（D35） | WAIT_MAX 有界终态 + registry 有界 + prune 豁免有终态保证 | 若「注册任务无上限/自动生成依赖链」进入 P5，按 D35 重估 |
 | Condition 运算符扩展（`<`/`>`/`>=`/`<=`/`contains`） | 明确不在 P4 范围（ADR D19） | P4-06 只做 `==`/`!=` | P5 可选 |
 | 通用 DAG / 云同步 / 多设备 | 零实现（P4 边界） | ADR D7/D4、需求 §7 | P5 明确立项后再议 |

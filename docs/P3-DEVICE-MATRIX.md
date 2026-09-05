@@ -1,8 +1,9 @@
 # Su Scheduler — P3 设备矩阵与综合回归（P3-DEVICE-MATRIX）
 
-> **任务**：P3-09 · 设备矩阵与综合回归目标；**P4-01 真机复验**（D-IPC 修复项 7/8/14）
-> **前置**：P3-01 至 P3-08（本文件由 P3-09 执行产出）；P4-01 更新
-> **日期**：2026-09-03（P3-09）；2026-09-04（P4-01 复验）
+> **任务**：P3-09 · 设备矩阵与综合回归目标；**P4-01 真机复验**（D-IPC 修复项 7/8/14）；
+> **P4-11 全链路复验**（Dependency/Condition/WAITING/Retry/WebUI 编辑与控制 + Legacy 回归）
+> **前置**：P3-01 至 P3-08（本文件由 P3-09 执行产出）；P4-01 更新；P4-11 更新
+> **日期**：2026-09-03（P3-09）；2026-09-04（P4-01 复验）；2026-09-05（P4-11 复验）
 > **出口标准**：真机安装/卸载、daemon 开机、Runtime 加载、Legacy 执行、Task v2 导入、
 > Registry 调度、WebUI Dashboard、Task Editor、App Action、Process/Port Health、
 > Restart/Retry/Cooldown、Crash Loop、Task 控制、配置损坏回退、旧 CLI 查询、日志轮转、
@@ -219,6 +220,14 @@ bash tests/run_tests.sh --with-device
 Runtime 版本检查 A/B，R4 关闭）。真机冒烟 `tests/results/device-8934ffc4-20260904-001848.log`
 → **28 PASS / 0 FAIL / 0 BLOCKED**（§3.5）。
 
+**P4-11 全链路复验（2026-09-05）**：`tests/results/run_tests-20260905-121739.log` →
+**ALL SUITES GREEN / EXIT=0**（宿主 3812 PASS / 0 FAIL；p1-device 11 PASS / 0 FAIL / 2 SKIP；
+p3-device 28 PASS / 0 FAIL / 0 BLOCKED）。真机冒烟
+`tests/results/device-8934ffc4-20260905-122945.log` → **28 PASS / 0 FAIL / 0 BLOCKED**
+（346s）。本复验同时确认 P4 全链路（Dependency/Condition/WAITING/Retry/WebUI 编辑
+与控制/Legacy 回归）真机可用，并修复 3 个 Runtime 激活后暴露的兼容缺陷
+（mksh `(`-in-pattern / cmd_stop pidof / daemon 单实例保护，见 `docs/P4-11.md` §3）。
+
 ---
 
 ## 6. 每台设备 trace 与性能统计
@@ -231,6 +240,9 @@ Runtime 版本检查 A/B，R4 关闭）。真机冒烟 `tests/results/device-893
   （D-IPC 三项转 PASS）。最新全量门禁运行（`run_tests.sh --with-device`）trace：
   `tests/results/device-8934ffc4-20260903-183656.log` + `run_tests-20260903-182719.log`
   （**ALL SUITES GREEN / EXIT=0**；p1-device 11 PASS / 0 FAIL / 2 SKIP）。
+  **P4-11 全链路复验（2026-09-05）**：`run_tests-20260905-121739.log`（**宿主 3812
+  PASS / 0 FAIL / EXIT=0**）+ `device-8934ffc4-20260905-122945.log`（**28 PASS / 0 FAIL
+  / 0 BLOCKED**，346s；p1-device 11 PASS / 0 FAIL / 2 SKIP）。
 - 性能统计（P4-01 复验，独立运行、设备冷启动复位后）：
   - 预置复位 + 安装/daemon/Runtime/Legacy 探测：~5s
   - Task v2 导入 + Registry 调度（含 daemon 重启 + boot 执行）：~7s
