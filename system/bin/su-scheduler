@@ -857,13 +857,27 @@ cmd_exec() {
     echo -e "${BOLD}Exit Code:${RESET} $exit_code"
 }
 
+# 🔍 列出所有 su-schedulerd daemon 实例 PID（P4-11 真机缺陷修复：
+#   daemon 是 shebang 脚本、进程名显示为 `sh`，`pidof su-schedulerd` 返回空，
+#   导致 stop/restart 杀不掉 watchdog 拉起的其他实例 → 多实例竞争写
+#   daemon.guard → crash-guard degraded 循环。改用按 cmdline 匹配全部实例。）
+daemon_pids() {
+    for d in /proc/[0-9]*; do
+        [ -r "$d/cmdline" ] || continue
+        cmd=$(cat "$d/cmdline" 2>/dev/null | tr '\0' ' ')
+        case "$cmd" in
+            *su-schedulerd*) echo "${d#/proc/}" ;;
+        esac
+    done
+}
+
 # 💓 Check if the daemon is alive
 # 💓 Check if the daemon is alive
 cmd_status() {
-    pid=$(pidof su-schedulerd)
+    pid=$(daemon_pids | head -1)
     lock_file="/dev/.su_scheduler.lock"
     
-    # Fallback: Check lockfile if pidof fails
+    # Fallback: Check lockfile if scan finds nothing
     if [ -z "$pid" ] && [ -f "$lock_file" ]; then
         stored_pid=$(cat "$lock_file")
         # Check if process with stored PID is actually runnning
@@ -888,16 +902,31 @@ cmd_status() {
 # 🛑 Stop the daemon
 # 🛑 Stop the daemon
 cmd_stop() {
-    pid=$(pidof su-schedulerd)
+    pids=$(daemon_pids)
     lock_file="/dev/.su_scheduler.lock"
     
-    # Fallback to lockfile PID
-    if [ -z "$pid" ] && [ -f "$lock_file" ]; then
-        pid=$(cat "$lock_file")
+    # Fallback to lockfile PID if scan finds nothing
+    if [ -z "$pids" ] && [ -f "$lock_file" ]; then
+        pids=$(cat "$lock_file")
     fi
 
-    if [ -n "$pid" ]; then
-        kill "$pid" 2>/dev/null
+    if [ -n "$pids" ]; then
+        for p in $pids; do
+            kill "$p" 2>/dev/null
+        done
+        # P4-11：kill 后**等待全部实例退出**再删 lock——否则旧 daemon 尚在
+        # 退出中（SIGTERM trap 处理 crash_record_exit）时删 lock，会与
+        # service.sh watchdog（检测 lock 缺失即拉起）竞态产生双实例。
+        i=0
+        while [ "$i" -lt 6 ]; do
+            gone=1
+            for p in $pids; do
+                [ -d "/proc/$p" ] && { gone=0; break; }
+            done
+            [ "$gone" -eq 1 ] && break
+            sleep 1
+            i=$((i + 1))
+        done
         rm -f "$lock_file"
         echo -e "${RED}${BOLD}🛑 Halted.${RESET} The daemon has been stopped."
     else

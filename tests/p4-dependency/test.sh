@@ -1063,6 +1063,16 @@ done | grep -q . && PIPE_PAT=1
 IPCCUT=$(grep -c "cut -d'|' -f2-" "$RTLIB")
 [ "$IPCCUT" -ge 3 ] && ok "P4-10 mksh: IPC/adjacency fields split via cut -d'|' (>=3 call sites, portable)" \
     || bad "P4-10 mksh: cut -d'|' -f2- call sites=$IPCCUT (expect >=3)"
+# ── P4-11 mksh `(`-in-pattern 参数展开（D-IPC 同源新面）────────────────────
+# 设备 mksh 无法解析 `${var#task.state(}`/`${var%)}` 这种 pattern 含裸 `(`/`)`
+# 的参数展开 → cond_grammar_ok/cond_eval 语法错误 → Runtime 库 source 失败 →
+# daemon 降级 legacy（P4-11 真机实测）。修复后改 cut 切分，以下静态断言证明
+# 生产库零裸 `(`/`)`-in-pattern（修前 FAIL，修后 PASS）。
+PAREN_PAT=0
+grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*#[^}]*\(' "$RTLIB" 2>/dev/null | grep -v '^[0-9]*: *#' && PAREN_PAT=1
+grep -nE '\$\{[A-Za-z_][A-Za-z0-9_]*%[^}]*\)' "$RTLIB" 2>/dev/null | grep -v '^[0-9]*: *#' && PAREN_PAT=1
+[ "$PAREN_PAT" -eq 0 ] && ok "P4-11 mksh: zero bare '(' / ')' in param-expansion patterns (\${var#...(/}\${var%...)})" \
+    || bad "P4-11 mksh: bare paren-in-pattern param expansion present (mksh-unsafe, Runtime source fails on device)"
 # ── DEP_MAX 覆盖全部写路径 + 原子性（editor/apply/set）────────────────────
 H="$T/hard"; rm -rf "$H"; mkdir -p "$H"
 export TCFG_DIR="$H/task-config"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"

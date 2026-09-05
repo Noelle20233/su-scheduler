@@ -601,8 +601,14 @@ extract_command() {
     echo "$raw_cmd" | sed 's/[ \t]*;*[ \t]*:[ \t]*--.*//'
 }
 # 🛡️ Single Instance Protection
-# Check multiple times to allow old process to exit during restart
+# Check multiple times to allow old process to exit during restart.
+# P4-11：既有实现等待 5s 后**强制接管**（rm lock 继续启动）→ `su-scheduler
+#   restart` 与 service.sh watchdog 同时拉起两个实例 → 双实例竞争写
+#   daemon.guard 与 IPC 目录 → crash-guard degraded 循环 + IPC operation_timeout
+#   （真机实测：restart 后双 PID 并存）。改为：等待 5s 后旧实例**仍存活** →
+#   本实例退出（严格单实例，不接管）；仅 stale lock（PID 已死）允许清理接管。
 COUNT=0
+LOCK_STILL_ACTIVE=0
 while [ $COUNT -lt 5 ]; do
     if [ -f "$LOCK_FILE" ]; then
         PID=$(cat "$LOCK_FILE")
@@ -612,11 +618,20 @@ while [ $COUNT -lt 5 ]; do
             fi
             sleep 1
             COUNT=$((COUNT + 1))
+            LOCK_STILL_ACTIVE=1
             continue
         fi
     fi
+    LOCK_STILL_ACTIVE=0
     break
 done
+
+# P4-11：等待超时后旧实例仍存活 → 不接管、本实例退出（严格单实例）。避免
+#   restart 与 watchdog 竞态产生的双实例竞争 IPC/guard（真机缺陷，见上）。
+if [ "$LOCK_STILL_ACTIVE" -eq 1 ]; then
+    log_msg "WARNING" "⚠️ Another daemon (PID $(cat "$LOCK_FILE" 2>/dev/null)) still active after 5s; refusing to start (single-instance)"
+    exit 0
+fi
 
 # Force cleanup if process is confirmed dead but lock exists
 [ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"

@@ -5292,8 +5292,9 @@ cond_grammar_ok() {
     [ -n "$conde_l" ] || return 1
     case "$conde_l" in
         task.state\(*\))
-            conde_id=${conde_l#task.state(}
-            conde_id=${conde_id%)}
+            # P4-11：`${var#task.state(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开
+            # （Android 16 mksh 解析失败 → Runtime 库 source 失败）→ 改可移植 cut 切分
+            conde_id=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)
             [ "$conde_l" = "task.state($conde_id)" ] || return 1   # 精确包裹（拒多余 `)`）
             secv_id_ok "$conde_id" || return 1
             [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
@@ -5318,8 +5319,9 @@ cond_grammar_ok() {
             conde_charset_ok "$conde_r" || return 1
             ;;
         file.exists\(*\))
-            conde_path=${conde_l#file.exists(}
-            conde_path=${conde_path%)}
+            # P4-11：`${var#file.exists(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开
+            # （Android 16 mksh 解析失败 → Runtime 库 source 失败）→ 改可移植 cut 切分
+            conde_path=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)
             [ "$conde_l" = "file.exists($conde_path)" ] || return 1
             [ -z "$conde_op" ] || return 1   # file.exists 无比较运算符
             case "$conde_path" in
@@ -5355,8 +5357,9 @@ cond_eval() {
     conde_l=$1; conde_op=${2:-}; conde_r=${3:-}
     case "$conde_l" in
         task.state\(*\))
-            conde_id=${conde_l#task.state(}
-            conde_id=${conde_id%)}
+            # P4-11：`${var#task.state(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开
+            # （Android 16 mksh 解析失败 → Runtime 库 source 失败）→ 改可移植 cut 切分
+            conde_id=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)
             conde_cur=$(runtime_current_state "$conde_tasks/$conde_id" 2>/dev/null)
             if [ "$conde_op" = "==" ]; then
                 [ "$conde_cur" = "$conde_r" ] && return 0 || return 1
@@ -5395,8 +5398,9 @@ cond_eval() {
             fi
             ;;
         file.exists\(*\))
-            conde_path=${conde_l#file.exists(}
-            conde_path=${conde_path%)}
+            # P4-11：`${var#file.exists(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开
+            # （Android 16 mksh 解析失败 → Runtime 库 source 失败）→ 改可移植 cut 切分
+            conde_path=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)
             [ -e "$conde_path" ] && return 0 || return 1
             ;;
         *)

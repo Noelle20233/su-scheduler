@@ -141,6 +141,62 @@ else
     bad "Q4 task-output missing-error (out: $CLI_OUT)"
 fi
 
+# ── P4-11 daemon_pids：status/stop 按 cmdline 匹配（Android 进程名=sh，pidof 失效）──
+# 生产 daemon 是 shebang 脚本，Android 上进程名显示为 `sh`，`pidof su-schedulerd`
+# 返回空 → cmd_stop 杀不掉 watchdog 拉起的实例（P4-11 真机：3 实例存活 + crash-guard
+# degraded 循环）。修复后按 /proc/<pid>/cmdline 匹配全部实例。此处 mock 两个
+# cmdline 含 su-schedulerd 的后台进程，验证 status 能发现、stop 能全部终止。
+MOCKDIR="$T/mock"
+mkdir -p "$MOCKDIR"
+printf '#!/bin/sh\nsleep 30\n' > "$MOCKDIR/su-schedulerd-fake1"
+printf '#!/bin/sh\nsleep 30\n' > "$MOCKDIR/su-schedulerd-fake2"
+chmod +x "$MOCKDIR/su-schedulerd-fake1" "$MOCKDIR/su-schedulerd-fake2"
+"$MOCKDIR/su-schedulerd-fake1" &
+MOCK1=$!
+"$MOCKDIR/su-schedulerd-fake2" &
+MOCK2=$!
+sleep 0.5
+cli_run daemon_pids
+if printf '%s\n' "$CLI_OUT" | grep -qw "$MOCK1" && printf '%s\n' "$CLI_OUT" | grep -qw "$MOCK2"; then
+    ok "P4-11 daemon_pids finds both cmdline-matched instances (pid=$MOCK1 $MOCK2)"
+else
+    bad "P4-11 daemon_pids missing mock (out: $(printf '%s\n' "$CLI_OUT" | tr '\n' ' '))"
+fi
+cli_run cmd_status
+if printf '%s\n' "$CLI_OUT" | grep -q 'Alive'; then
+    ok "P4-11 cmd_status Alive via daemon_pids (not pidof)"
+else
+    bad "P4-11 cmd_status not Alive (out: $CLI_OUT)"
+fi
+cli_run cmd_stop
+sleep 0.5
+if ! kill -0 "$MOCK1" 2>/dev/null && ! kill -0 "$MOCK2" 2>/dev/null; then
+    ok "P4-11 cmd_stop killed ALL instances (multi-instance cleanup)"
+else
+    bad "P4-11 cmd_stop left instances alive (mock1=$([ -d /proc/$MOCK1 ] && echo alive || echo dead) mock2=$([ -d /proc/$MOCK2 ] && echo alive || echo dead))"
+fi
+kill -9 "$MOCK1" "$MOCK2" 2>/dev/null
+
+# ── P4-11 daemon 单实例保护：restart 与 watchdog 竞态修复（静态断言） ────
+# 既有 daemon 单实例保护在等待 5s 后**强制接管**（rm lock 继续启动）→
+# `su-scheduler restart` 与 service.sh watchdog 同时拉起两个实例 → 双实例竞争
+# IPC/guard（真机实测 operation_timeout）。修复后：等待超时旧实例仍存活 →
+# 新实例退出（strict single-instance），仅 stale lock 允许接管。此处对生产
+# daemon 做静态断言（host 无法运行 /system/bin/su-schedulerd 全链路）。
+DAEMON_SCRIPT="$ROOT/system/bin/su-schedulerd"
+if grep -q 'LOCK_STILL_ACTIVE' "$DAEMON_SCRIPT" \
+   && grep -q 'refusing to start (single-instance)' "$DAEMON_SCRIPT"; then
+    ok "P4-11 single-instance: daemon refuses to start when old instance alive (strict single-instance)"
+else
+    bad "P4-11 single-instance: daemon still force-takes-over after wait (dual-instance race, P4-11 device)"
+fi
+# cmd_stop 等待实例退出后再删 lock（消除 watchdog 竞态窗口）
+if grep -q 'gone=1' "$CLI_SCRIPT" && grep -q 'while \[ "\$i" -lt 6 \]' "$CLI_SCRIPT"; then
+    ok "P4-11 single-instance: cmd_stop waits for all instances to exit before removing lock"
+else
+    bad "P4-11 single-instance: cmd_stop removes lock without waiting (watchdog race)"
+fi
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "cli tests: PASS=$PASS FAIL=$FAIL"
