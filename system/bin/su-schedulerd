@@ -66,6 +66,15 @@ else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Runtime library unavailable ($RUNTIME_LIB); legacy mode active" >> "$LOG_FILE" 2>/dev/null
 fi
 
+# 🛡️ TERM/INT/HUP trap（D-P5-01 加固）：**在启动最前面注册**（早于单实例仲裁与
+#   crash_guard_enter）。否则快速重启风暴中 cmd_stop 的 TERM 可能在实例处于
+#   仲裁等待/guard 记账阶段（未注册 trap）时到达 → 默认信号退出 → 不留 last_clean=1
+#   → 下一实例误判崩溃 → crash_seq 假累加 → 假降级。此处无论实例处于启动哪个
+#   阶段，优雅信号一律记 last_clean=1（graceful kill，非崩溃）。
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    trap 'crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
+fi
+
 # 📝 Function to log events with pretty timestamps and colors
 log_msg() {
     local level="$1"
@@ -622,8 +631,9 @@ fi
 # ⚙️ Crash Loop 保护（P2-14，D-P5-01 重排）：**单实例仲裁之后**才登记本次启动 /
 #   评估前次异常——被拒/竞态落败实例在触碰 guard 前退出，不再留下"无退出记录的
 #   脏启动"导致 crash_seq 假累加。降级（rc 2）或节流（rc 3）→ 记 WARNING、释放
-#   已占锁后快速退出；优雅退出经 trap 记 last_clean=1。参数默认值：CRASH_WINDOW=60
-#   CRASH_THRESHOLD=3 CRASH_MIN_UPTIME=30 CRASH_COOLDOWN=300 CRASH_MIN_START_INTERVAL=10。
+#   已占锁后快速退出。TERM/INT/HUP trap（记 last_clean=1）已在启动最前面注册。
+#   参数默认值：CRASH_WINDOW=60 CRASH_THRESHOLD=3 CRASH_MIN_UPTIME=30
+#   CRASH_COOLDOWN=300 CRASH_MIN_START_INTERVAL=10。
 if [ "$RUNTIME_LOADED" -eq 1 ]; then
     crash_guard_enter "$DATA_DIR" >/dev/null 2>&1
     if [ "$?" -ne 0 ]; then
@@ -631,7 +641,6 @@ if [ "$RUNTIME_LOADED" -eq 1 ]; then
         rm -f "$LOCK_FILE" 2>/dev/null
         exit 0
     fi
-    trap 'crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
 fi
 
 # ⚙️ 调度来源启动（P3-03）：Managed 模式 → sched_reload（task-config 权威快照，不再重扫

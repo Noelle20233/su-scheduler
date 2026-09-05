@@ -2414,6 +2414,7 @@ crash_guard_enter() {
     exits=$(crash_read "$gf" exits);        [ -n "$exits" ] || exits=0
     last_start=$(crash_read "$gf" last_start)
     last_exit=$(crash_read "$gf" last_exit)
+    last_exit_rc=$(crash_read "$gf" last_exit_rc)
     last_clean=$(crash_read "$gf" last_clean);  [ -n "$last_clean" ] || last_clean=0
     eval_start=$(crash_read "$gf" eval_start);  [ -n "$eval_start" ] || eval_start=0
     crash_seq=$(crash_read "$gf" crash_seq);    [ -n "$crash_seq" ] || crash_seq=0
@@ -2430,10 +2431,36 @@ crash_guard_enter() {
     if [ -n "$last_start" ] && [ "$eval_start" -lt "$starts" ]; then
         abnormal=0
         if [ "$last_clean" != "1" ]; then
-            # 无退出记录（SIGKILL）或退出早于启动，或存活 ≤ CRASH_MIN_UPTIME → 异常
-            if [ -z "$last_exit" ] || [ "$last_exit" -lt "$last_start" ] || \
-               [ $((last_exit - last_start)) -le "$CRASH_MIN_UPTIME" ]; then
-                abnormal=1
+            # ① 有效优雅退出记录（exit ≥ start 且 rc=0）→ 干净。last_clean 可能因新旧
+            #    实例并发写 guard 丢更新（D-P5-01 真机取证 last_exit_rc=0 与
+            #    last_clean=0 并存），不能作为唯一"非优雅"判据。
+            grace=0
+            if [ -n "$last_exit" ] && [ "$last_exit" -ge "$last_start" ] && \
+               [ "$last_exit_rc" = "0" ]; then
+                grace=1
+            fi
+            if [ "$grace" -eq 0 ]; then
+                # ② 无有效退出记录：可能是崩溃，也可能是旧实例仍在 trap 退出中
+                #    （快速重启重叠，cmd_stop 等待期间旧 trap 未写完）→ 有界重读
+                #    guard 等 trap 写完再判，避免假崩溃计数（D-P5-01）。
+                _c=0
+                while [ "$_c" -lt 2 ] && { [ -z "$last_exit" ] || [ "$last_exit" -lt "$last_start" ]; }; do
+                    sleep 1; _c=$((_c + 1))
+                    last_exit=$(crash_read "$gf" last_exit)
+                    last_exit_rc=$(crash_read "$gf" last_exit_rc)
+                    if [ -n "$last_exit" ] && [ "$last_exit" -ge "$last_start" ] && \
+                       [ "$last_exit_rc" = "0" ]; then
+                        grace=1
+                        break
+                    fi
+                done
+            fi
+            if [ "$grace" -eq 0 ]; then
+                # 无退出记录（SIGKILL）或退出早于启动，或存活 ≤ CRASH_MIN_UPTIME → 异常
+                if [ -z "$last_exit" ] || [ "$last_exit" -lt "$last_start" ] || \
+                   [ $((last_exit - last_start)) -le "$CRASH_MIN_UPTIME" ]; then
+                    abnormal=1
+                fi
             fi
         fi
         if [ "$abnormal" -eq 1 ]; then
@@ -2483,10 +2510,23 @@ crash_record_exit() {
     now=$(date +%s)
     exits=$(crash_read "$gf" exits);  [ -n "$exits" ] || exits=0
     exits=$((exits + 1))
-    crash_write "$gf" exits "$exits"
-    crash_write "$gf" last_exit "$now"
-    crash_write "$gf" last_exit_rc "$rc"
-    crash_write "$gf" last_clean 1
+    # D-P5-01：一次原子写完成全部退出记录（temp+mv），避免 4 次读-改-写与并发
+    # crash_guard_enter 的丢失更新/部分写入（真机取证 last_exit_rc=0 与
+    # last_clean=0 并存），同时显著缩短 trap 延迟、缩小 cmd_stop 等待竞态窗口。
+    mkdir -p "$(dirname "$gf")" 2>/dev/null
+    t="$gf.tmp.$$"
+    if [ -f "$gf" ]; then
+        awk '!/^(exits|last_exit|last_exit_rc|last_clean)=/' "$gf" > "$t" 2>/dev/null
+    else
+        : > "$t"
+    fi
+    {
+        printf 'exits=%s\n' "$exits"
+        printf 'last_exit=%s\n' "$now"
+        printf 'last_exit_rc=%s\n' "$rc"
+        printf 'last_clean=1\n'
+    } >> "$t" 2>/dev/null
+    mv "$t" "$gf" 2>/dev/null || rm -f "$t" 2>/dev/null
     return 0
 }
 
