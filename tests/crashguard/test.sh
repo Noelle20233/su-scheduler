@@ -385,6 +385,124 @@ else
     bash -n "$PWD/$RTLIB" && ok "P2-14 POSIX: bash -n ok (dash unavailable)" || bad "P2-14 POSIX: bash -n failed"
 fi
 
+# ── 13) D-P5-01：仲裁先于 guard —— 被拒/并发实例不污染 daemon.guard ────────
+# 根因（设备取证）：daemon 中 crash_guard_enter（登记 last_start/last_clean=0）
+# 先于单实例仲裁执行 → watchdog 与 CLI 同时拉起实例时，被拒实例以**非信号退出**
+# （exit 0）结束、TERM trap 不触发 → 留下"无退出记录的脏启动"→ 下一实例 eval
+# 判为崩溃 → crash_seq 假累加 → 假降级 → 重启风暴。修复：仲裁（noclobber 原子
+# 接管）先于 crash_guard_enter。此处用 fake daemon 模型化新启动序并断言：
+#   ① 存活实例持有锁时，重复启动被拒且**不触碰 guard**（starts/last_clean 不变）；
+#   ② 优雅 TERM 后再次启动 → crash_seq=0（无假崩溃计数）；
+#   ③ 并发双启动 → 仅一方接管，guard 只记 1 次 starts。
+FAKE3="$T/fake-daemon-arb.sh"
+cat > "$FAKE3" <<'EOF'
+#!/usr/bin/env bash
+# 模拟 D-P5-01 新启动序：单实例仲裁（noclobber 原子接管）→ crash_guard_enter
+#   → 装 record_exit trap → 常驻。args: $1=cd dir $2=lib $3=base $4=lock
+#   $5=rcfile $6=pidfile $7=cpidfile
+set -u
+cd "$1" || exit 2
+. ./"$2" || exit 2
+base="$3"; lock="$4"; rcfile="$5"; pidfile="$6"; cpidfile="$7"
+# 单实例仲裁：存活锁持有者 → 拒绝（不触碰 guard）；接管前不 rm 锁文件
+# （否则会删掉并发实例刚创建的空锁导致双实例都通过，D-P5-01）；空锁让位轮询。
+if ( set -C; : > "$lock" ) 2>/dev/null; then
+    echo "$$" > "$lock"
+else
+    NPID=$(cat "$lock" 2>/dev/null)
+    _c=0
+    while [ -z "$NPID" ] && [ "$_c" -lt 3 ]; do
+        sleep 1; _c=$((_c + 1)); NPID=$(cat "$lock" 2>/dev/null)
+    done
+    if [ -n "$NPID" ] && [ -d "/proc/$NPID" ]; then
+        echo "refused" > "$rcfile"
+        exit 0
+    fi
+    rm -f "$lock" 2>/dev/null
+    ( set -C; : > "$lock" ) 2>/dev/null || { echo "refused" > "$rcfile"; exit 0; }
+    echo "$$" > "$lock"
+fi
+crash_guard_enter "$base" >/dev/null 2>&1
+rc=$?
+echo "$rc" > "$rcfile"
+[ "$rc" -ne 0 ] && { rm -f "$lock" 2>/dev/null; exit "$rc"; }
+echo "$$" > "$pidfile"
+trap 'crash_record_exit "$base" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
+sleep 30 &
+echo "$!" > "$cpidfile"
+wait
+EOF
+chmod +x "$FAKE3"
+ARB="$T/arb/base"; mkdir -p "$ARB"
+ARBLOCK="$T/arb.lock"
+export CRASH_MIN_START_INTERVAL=0
+export CRASH_THRESHOLD=3
+launch_arb() {   # <tag> → 等待 rc（refused / rc 值）/ pid 就绪，回显 rc
+    n=$1
+    bash "$FAKE3" "$PWD" "$RTLIB" "$ARB" "$ARBLOCK" "$T/arb.rc.$n" "$T/arb.pid.$n" "$T/arb.cp.$n" >/dev/null 2>&1 &
+    i=0; r=""
+    while [ "$i" -lt 150 ]; do
+        r=$(cat "$T/arb.rc.$n" 2>/dev/null)
+        if [ -n "$r" ]; then
+            if [ "$r" = "refused" ] || [ "$r" != "0" ] || [ -s "$T/arb.pid.$n" ]; then break; fi
+        fi
+        sleep 0.1; i=$((i + 1))
+    done
+    echo "$r"
+}
+rm -f "$ARBLOCK" "$(crash_guard_file "$ARB")" "$T"/arb.rc.* "$T"/arb.pid.* "$T"/arb.cp.*
+# ① 实例 A 接管并登记 start；存活期间重复实例 B 被拒且不触碰 guard
+rA=$(launch_arb a)
+PA=$(cat "$T/arb.pid.a" 2>/dev/null)
+g=$(crash_guard_file "$ARB")
+[ "$rA" = "0" ] && [ "$(crash_read "$g" starts)" = "1" ] \
+    && ok "D-P5-01 arb: winner A entered guard (starts=1)" || bad "D-P5-01 arb: A rA=$rA starts=$(crash_read "$g" starts)"
+rB=$(launch_arb b)
+[ "$rB" = "refused" ] && ok "D-P5-01 arb: duplicate B refused (single-instance)" || bad "D-P5-01 arb: B rB=$rB (expect refused)"
+[ "$(crash_read "$g" starts)" = "1" ] && ok "D-P5-01 arb: refused B did NOT touch guard (starts=1)" || bad "D-P5-01 arb: starts=$(crash_read "$g" starts)"
+# ② 优雅 TERM A → 新实例 C 启动 → crash_seq=0（无假崩溃计数）
+kill -TERM "$PA" 2>/dev/null
+i=0; while [ "$i" -lt 30 ] && [ -d "/proc/$PA" ] 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+rC=$(launch_arb c)
+PC=$(cat "$T/arb.pid.c" 2>/dev/null); CC=$(cat "$T/arb.cp.c" 2>/dev/null)
+[ "$rC" = "0" ] && [ "$(crash_read "$g" crash_seq)" = "0" ] \
+    && ok "D-P5-01 arb: after clean TERM + C start, crash_seq=0 (no false crash)" || bad "D-P5-01 arb: rC=$rC crash_seq=$(crash_read "$g" crash_seq)"
+kill -TERM "$PC" 2>/dev/null
+i=0; while [ "$i" -lt 30 ] && [ -d "/proc/$PC" ] 2>/dev/null; do sleep 0.1; i=$((i + 1)); done
+kill -9 "$CC" "$PA" 2>/dev/null
+# ③ 并发双启动：仅一方接管，guard 只记 1 次 starts
+rm -f "$ARBLOCK" "$(crash_guard_file "$ARB")" "$T"/arb.rc.* "$T"/arb.pid.* "$T"/arb.cp.*
+bash "$FAKE3" "$PWD" "$RTLIB" "$ARB" "$ARBLOCK" "$T/arb.rc.x" "$T/arb.pid.x" "$T/arb.cp.x" >/dev/null 2>&1 &
+bash "$FAKE3" "$PWD" "$RTLIB" "$ARB" "$ARBLOCK" "$T/arb.rc.y" "$T/arb.pid.y" "$T/arb.cp.y" >/dev/null 2>&1 &
+  i=0
+  while [ "$i" -lt 150 ]; do
+    rx=$(cat "$T/arb.rc.x" 2>/dev/null); ry=$(cat "$T/arb.rc.y" 2>/dev/null)
+    { [ -n "$rx" ] && [ -n "$ry" ]; } && break
+    sleep 0.1; i=$((i + 1))
+  done
+{ printf '%s\n' "$rx" "$ry" | grep -q '^0$'; } \
+    && { printf '%s\n' "$rx" "$ry" | grep -q 'refused'; } \
+    && ok "D-P5-01 arb: concurrent dual-launch → one winner + one refused" || bad "D-P5-01 arb: rx=$rx ry=$ry"
+g2=$(crash_guard_file "$ARB")
+[ "$(crash_read "$g2" starts)" = "1" ] && ok "D-P5-01 arb: concurrent guard records exactly 1 start" || bad "D-P5-01 arb: starts=$(crash_read "$g2" starts)"
+kill -9 "$(cat "$T/arb.pid.x" 2>/dev/null)" "$(cat "$T/arb.pid.y" 2>/dev/null)" \
+        "$(cat "$T/arb.cp.x" 2>/dev/null)" "$(cat "$T/arb.cp.y" 2>/dev/null)" 2>/dev/null
+
+# ── 14) D-P5-01 静态断言：daemon 启动序 = 仲裁 → guard（防回归）──────────────
+# 修复后 crash_guard_enter 调用必须位于单实例仲裁（LOCK_STILL_ACTIVE /
+# refusing to start）与原子接管（set -C）之后——否则被拒实例先写 guard 再
+# exit 0 → 假崩溃记录（D-P5-01 根因，防回退到旧序）。
+guard_ln=$(grep -n 'crash_guard_enter "\$DATA_DIR"' "$DAEMON" | head -1 | cut -d: -f1)
+refuse_ln=$(grep -n 'refusing to start (single-instance)' "$DAEMON" | head -1 | cut -d: -f1)
+lock_ln=$(grep -n 'LOCK_STILL_ACTIVE' "$DAEMON" | head -1 | cut -d: -f1)
+claim_ln=$(grep -n 'set -C' "$DAEMON" | head -1 | cut -d: -f1)
+[ -n "$guard_ln" ] && [ -n "$refuse_ln" ] && [ -n "$lock_ln" ] \
+    && [ "$guard_ln" -gt "$refuse_ln" ] && [ "$guard_ln" -gt "$lock_ln" ] \
+    && ok "D-P5-01 order: crash_guard_enter (L$guard_ln) after single-instance arbitration (refuse L$refuse_ln / lock L$lock_ln)" \
+    || bad "D-P5-01 order: guard_ln=$guard_ln refuse_ln=$refuse_ln lock_ln=$lock_ln (expect guard after arbitration)"
+[ -n "$claim_ln" ] && ok "D-P5-01 order: noclobber atomic claim present (set -C L$claim_ln)" \
+    || bad "D-P5-01 order: set -C atomic claim missing"
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "crashguard tests: PASS=$PASS FAIL=$FAIL"

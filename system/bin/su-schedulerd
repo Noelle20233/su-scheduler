@@ -66,44 +66,6 @@ else
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Runtime library unavailable ($RUNTIME_LIB); legacy mode active" >> "$LOG_FILE" 2>/dev/null
 fi
 
-# ⚙️ Crash Loop 保护（P2-14）：进入任何启动工作前先登记本次启动 / 评估前次异常
-#   退出。降级（rc 2）或节流（rc 3）→ 记 WARNING 后快速退出（不写锁、不建
-#   registry、不跑 boot 任务）；优雅退出经 trap 记 last_clean=1（CLI stop/restart
-#   不受影响）。参数默认值：CRASH_WINDOW=60 CRASH_THRESHOLD=3 CRASH_MIN_UPTIME=30
-#   CRASH_COOLDOWN=300 CRASH_MIN_START_INTERVAL=10。
-if [ "$RUNTIME_LOADED" -eq 1 ]; then
-    crash_guard_enter "$DATA_DIR" >/dev/null 2>&1
-    if [ "$?" -ne 0 ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Crash-guard throttle/degraded; fast-exit" >> "$LOG_FILE" 2>/dev/null
-        exit 0
-    fi
-    trap 'crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
-fi
-
-# ⚙️ 调度来源启动（P3-03）：Managed 模式 → sched_reload（task-config 权威快照，不再重扫
-#   config.txt）；Legacy 模式 → shadow_init + 生命周期 Registry 引导（P2-09，KEPT 回退）。
-# 🗺️ Canonical↔Legacy Run ID 映射（P2-04）：建映射供新 ID 查询；**不碰旧运行目录**
-if [ "$RUNTIME_LOADED" -eq 1 ]; then
-    if tcfg_is_managed; then
-        sched_reload "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
-    else
-        shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
-        # ⚙️ 生命周期 Registry 引导（P2-09）：shadow_init 之后补**最后有效快照**回退
-        #   （config 缺失 → registry_attach 只读挂载历史快照；KEPT 语义，不重扫配置）
-        lifecycle_startup_registry "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
-    fi
-    runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
-    for tid in $(registry_task_ids); do
-        trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "${TRIGGER_BOOT_CONTEXT:-0}" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
-    done
-    # ⚙️ 本地 IPC 控制面（P3-04）：建 0700 请求/响应目录 + daemon.pid 存活标记
-    ipc_server_init "$DATA_DIR" >/dev/null 2>&1
-    # ⚙️ 安全与资源加固（P3-08）：权限强制（ipc 0700 / task-config 600 /
-    #   运行目录 700 / 文件 600）+ 请求频率限制状态重置（每 daemon 启动新窗）
-    secv_fix_perms "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
-    rm -f "$(ipc_dir "$DATA_DIR")/rate.state" 2>/dev/null
-fi
-
 # 📝 Function to log events with pretty timestamps and colors
 log_msg() {
     local level="$1"
@@ -633,8 +595,68 @@ if [ "$LOCK_STILL_ACTIVE" -eq 1 ]; then
     exit 0
 fi
 
-# Force cleanup if process is confirmed dead but lock exists
-[ -f "$LOCK_FILE" ] && rm -f "$LOCK_FILE"
+# 🔒 原子接管（D-P5-01）：watchdog 与 CLI 可能同时拉起实例，仅"检查后再写 PID"
+#   存在 TOCTOU 窗口（两实例都可能通过 LOCK_STILL_ACTIVE 判定）。改用 noclobber
+#   原子创建锁文件——仅一个实例能成功；竞态落败者重新判定存活后拒绝退出。
+#   注意：接管前**不**无条件 rm 锁文件（会删掉并发实例刚创建的空锁 → 双实例）。
+#   空锁 = 并发实例正在写 PID → 让位轮询（至多 ~3s），不立即 rm；仅对"死 PID"
+#   或"长时间仍空（崩溃残留）"的锁清理后重试一次。
+if ( set -C; : > "$LOCK_FILE" ) 2>/dev/null; then
+    echo $$ > "$LOCK_FILE"
+else
+    NPID=$(cat "$LOCK_FILE" 2>/dev/null)
+    _c=0
+    while [ -z "$NPID" ] && [ "$_c" -lt 3 ]; do
+        sleep 1; _c=$((_c + 1)); NPID=$(cat "$LOCK_FILE" 2>/dev/null)
+    done
+    if [ -n "$NPID" ] && [ -d "/proc/$NPID" ]; then
+        log_msg "WARNING" "⚠️ Another daemon (PID $NPID) holds the lock; refusing to start (single-instance)"
+        exit 0
+    fi
+    # stale（死 PID）或 3s 仍空（崩溃残留空锁）→ 清理后重试一次
+    rm -f "$LOCK_FILE" 2>/dev/null
+    ( set -C; : > "$LOCK_FILE" ) 2>/dev/null || { log_msg "WARNING" "⚠️ Lock claim failed; refusing to start (single-instance)"; exit 0; }
+    echo $$ > "$LOCK_FILE"
+fi
+
+# ⚙️ Crash Loop 保护（P2-14，D-P5-01 重排）：**单实例仲裁之后**才登记本次启动 /
+#   评估前次异常——被拒/竞态落败实例在触碰 guard 前退出，不再留下"无退出记录的
+#   脏启动"导致 crash_seq 假累加。降级（rc 2）或节流（rc 3）→ 记 WARNING、释放
+#   已占锁后快速退出；优雅退出经 trap 记 last_clean=1。参数默认值：CRASH_WINDOW=60
+#   CRASH_THRESHOLD=3 CRASH_MIN_UPTIME=30 CRASH_COOLDOWN=300 CRASH_MIN_START_INTERVAL=10。
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    crash_guard_enter "$DATA_DIR" >/dev/null 2>&1
+    if [ "$?" -ne 0 ]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] ⚠️ Crash-guard throttle/degraded; fast-exit" >> "$LOG_FILE" 2>/dev/null
+        rm -f "$LOCK_FILE" 2>/dev/null
+        exit 0
+    fi
+    trap 'crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1; exit 0' TERM INT HUP
+fi
+
+# ⚙️ 调度来源启动（P3-03）：Managed 模式 → sched_reload（task-config 权威快照，不再重扫
+#   config.txt）；Legacy 模式 → shadow_init + 生命周期 Registry 引导（P2-09，KEPT 回退）。
+# 🗺️ Canonical↔Legacy Run ID 映射（P2-04）：建映射供新 ID 查询；**不碰旧运行目录**
+if [ "$RUNTIME_LOADED" -eq 1 ]; then
+    if tcfg_is_managed; then
+        sched_reload "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
+    else
+        shadow_init "$DATA_DIR" "$CONFIG_FILE" "$DATA_DIR/shadow/shadow.log" >/dev/null 2>&1
+        # ⚙️ 生命周期 Registry 引导（P2-09）：shadow_init 之后补**最后有效快照**回退
+        #   （config 缺失 → registry_attach 只读挂载历史快照；KEPT 语义，不重扫配置）
+        lifecycle_startup_registry "$DATA_DIR" "$CONFIG_FILE" >/dev/null 2>&1
+    fi
+    runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+    for tid in $(registry_task_ids); do
+        trigger_decide "$DATA_DIR" "$tid" "$(date +%H%M)" "${TRIGGER_BOOT_CONTEXT:-0}" "$DATA_DIR/schedule_state.txt" >> "$DATA_DIR/shadow/shadow.log" 2>/dev/null
+    done
+    # ⚙️ 本地 IPC 控制面（P3-04）：建 0700 请求/响应目录 + daemon.pid 存活标记
+    ipc_server_init "$DATA_DIR" >/dev/null 2>&1
+    # ⚙️ 安全与资源加固（P3-08）：权限强制（ipc 0700 / task-config 600 /
+    #   运行目录 700 / 文件 600）+ 请求频率限制状态重置（每 daemon 启动新窗）
+    secv_fix_perms "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
+    rm -f "$(ipc_dir "$DATA_DIR")/rate.state" 2>/dev/null
+fi
 
 # 🧹 Clean slate: Mark ALL 'orphaned' tasks from previous runs as 'ZOMBIE_CRASHED'
 # Since this daemon instance just started, it cannot have any truly active tasks yet.

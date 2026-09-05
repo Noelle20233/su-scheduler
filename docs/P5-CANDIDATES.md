@@ -10,10 +10,12 @@
 
 | ID | 位置 | 现象（证据） | 触发 | 建议最小修复 | Sign-off |
 | :-- | :--- | :--- | :--- | :--- | :-- |
-| **D-P5-01** | `su-scheduler-runtime` `crash_guard_enter`（~L2409）/`crash_record_exit`（TERM trap）+ `su-schedulerd` 75-78、658-659 | daemon 快速重启恢复路径间歇失败：p1-device run-once-now/prune/--delete（legacy 修剪管道）、p3-device 18-restore（ghost RUNNING + 事件缺失）、偶发 14-control/7-webui `operation_timeout`。**根因**：新旧 daemon 对 `daemon.guard` 文件写竞争（无串行化）→ crash_seq 累加 → 300s 降级窗口 fast-exit（不跑 main loop/不执行 ron/不修剪/不再水合）→ watchdog 反复拉起 → 崩溃循环。**证据**：6 轮冒烟 6 轮命中；events.log `[Service] Daemon not running` 按日 9/3=1101、9/4=6、9/5=5234；设备 daemon sha256 与仓库 HEAD 逐字节一致 | 60s `CRASH_WINDOW` 内密集 `su-scheduler restart`（boot→time→ron→delete 连续用例） | `crash_guard_enter`/`crash_record_exit`/`cmd_stop` 间 guard 写竞争加串行化（或旧 daemon TERM trap 完成后再允许下一实例接管）；降级期抑制 watchdog 风暴侧 | **是**（P4-11 同类残留，P5 后续任务或决策门裁决） |
+| **D-P5-01** | `su-schedulerd` 单实例仲裁（原 L610-637）+ `crash_guard_enter`（原 L75 调用点） | daemon 快速重启恢复路径间歇失败：p1-device run-once-now/prune/--delete、p3-device 18-restore（ghost RUNNING + 事件缺失）、偶发 14-control/7-webui `operation_timeout`。**根因（已修复）**：`crash_guard_enter` 先于单实例仲裁执行 → watchdog 与 CLI 同时拉起实例时，被拒实例以非信号 `exit 0` 结束、TERM trap 不触发 → 留下"无退出记录的脏启动"（last_start + last_clean=0 无 last_exit）→ 下一实例判为崩溃 → crash_seq 假累加 → 300s 假降级 → fast-exit 风暴。**设备取证**：guard `starts=2 exits=2 crash_seq=2 last_exit_rc=0`（两次优雅退出被计为 2 次崩溃）；events.log 同秒双条 `[Service] Daemon not running`（≥2 个 watchdog 循环）；当日 8711 条 | 60s `CRASH_WINDOW` 内密集 `su-scheduler restart` | **已修复**：仲裁（noclobber 原子接管，`set -C : >`）先于 crash_guard_enter / heavy init；被拒/竞态落败实例在触碰 guard 前退出；rc2/3 早退释放已占锁；空锁让位轮询不立即 rm。`service.sh`/Runtime §18 函数零改动 | ~~是~~ → **已裁决+已修复**（P0 最小修复） |
+| **D-P5-02** | 宿主回归环境（WSL，非生产代码） | `tests/providers/test.sh` 与 `tests/execution/action-run/test.sh` 在本会话 WSL 环境**挂起**（>60s 无输出），两者均 **0 引用 su-schedulerd**（`grep -c` 为 0），且 2026-09-05 13:46 全量回归（45 套件 1906 PASS）中均通过 → 判定为**既有环境/时间敏感 flake，非本构建回归**。疑似与当日时间（providers nweekly 用例，P4-06 已注日期敏感）或 WSL 进程/管道行为相关 | 本会话 22:2x / 23:4x 直接运行 | 复跑定位 + 时间/环境隔离修复；D-P5-01 修复的回归验证改为"daemon 相关 8 套件 + state-machine + p4-dependency 共 662 断言全绿" | 待定（非本任务范围） |
 
-> **判定**：D-P5-01 为 **P4-11（284b337）已知同类竞态残留，非本构建回归**。P4-11 只修了
-> CLI 侧（等待退出、严格单实例），未关闭 guard 文件写竞争与降级期 watchdog 风暴侧。
+> **判定**：D-P5-01 为 **P4-11（284b337）已知同类竞态残留，非本构建回归**，已于本次 P0
+> 最小修复关闭（见 §1 行内"已修复"说明）；D-P5-02 为独立的环境层候选缺陷，不影响
+> D-P5-01 修复结论。
 
 ## 2. P5 候选需求（源自 P4-HANDOVER §5 + P5 TaskIndex，仅登记不实现）
 
