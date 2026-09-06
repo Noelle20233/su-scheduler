@@ -1188,8 +1188,8 @@ cmd_task() {
         restart) shift; cmd_task_restart "$@" ;;
         check) shift; cmd_task_check "$@" ;;
         logs) shift; cmd_task_logs "$@" ;;
-        ""|-h|--help) echo "Usage: su-scheduler task {list | status <id> | enable <id> | disable <id> | start <id> | stop <id> | restart <id> | check <id> | logs <id> [lines]}" >&2; return 0 ;;
-        *) echo "ERROR: unknown task subcommand: $sub (usage: task list | task status <id> | task {enable|disable|start|stop|restart|check|logs} <id>)" >&2; return 1 ;;
+        ""|-h|--help) echo "Usage: su-scheduler task {list | status <id> | enable <id> [<id>...] | disable <id> [<id>...] | start <id> [<id>...] | stop <id> [<id>...] | restart <id> [<id>...] | check <id> [<id>...] | logs <id> [lines]}" >&2; return 0 ;;
+        *) echo "ERROR: unknown task subcommand: $sub (usage: task list | task status <id> | task {enable|disable|start|stop|restart|check|logs} <id> [<id>...])" >&2; return 1 ;;
     esac
 }
 cmd_task_list() {
@@ -1225,35 +1225,59 @@ task_ctl_send() {   # <op> <id> → rc；stdout=响应载荷（去首行）；�
     fi
     return "$rc"
 }
+# 批量控制（P5-07）：<op> <id...> → 单 id = 既有 task_ctl_send 行为（格式/退出码
+# 不变）；多 id = CLI 层循环既有单任务 op（B7：不新增 IPC op），逐任务输出
+# `<id>: <result>`（result=载荷或错误摘要），聚合退出码：全成功 → 0，任一失败
+# → 1（stderr 打印 `FAILED: <id>` 清单）。每个 id 独立原子操作，单任务失败
+# 不影响其他任务与 config（B19）。
+task_ctl_multi() {
+    local op="$1"; shift
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task <op> <id> [<id>...]" >&2; return 1; }
+    if [ $# -eq 1 ]; then
+        task_ctl_send "$op" "$1"
+        return $?
+    fi
+    local id rc out line failed=""
+    for id in "$@"; do
+        out=$(task_ctl_send "$op" "$id" 2>&1)
+        rc=$?
+        line=$(printf '%s\n' "$out" | sed 's/^ERROR: //' | tail -1)
+        if [ "$rc" -eq 0 ]; then
+            printf '%s: %s\n' "$id" "$line"
+        else
+            printf '%s: ERROR: %s\n' "$id" "$line"
+            failed="$failed $id"
+        fi
+    done
+    if [ -n "$failed" ]; then
+        echo "FAILED:$failed" >&2
+        return 1
+    fi
+    return 0
+}
 cmd_task_enable() {
-    local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task enable <id>" >&2; return 1; }
-    task_ctl_send ENABLE_TASK "$id"
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task enable <id> [<id>...]" >&2; return 1; }
+    task_ctl_multi ENABLE_TASK "$@"
 }
 cmd_task_disable() {
-    local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task disable <id>" >&2; return 1; }
-    task_ctl_send DISABLE_TASK "$id"
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task disable <id> [<id>...]" >&2; return 1; }
+    task_ctl_multi DISABLE_TASK "$@"
 }
 cmd_task_start() {
-    local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task start <id>" >&2; return 1; }
-    task_ctl_send START_TASK "$id"
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task start <id> [<id>...]" >&2; return 1; }
+    task_ctl_multi START_TASK "$@"
 }
 cmd_task_stop() {
-    local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task stop <id>" >&2; return 1; }
-    task_ctl_send STOP_TASK "$id"
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task stop <id> [<id>...]" >&2; return 1; }
+    task_ctl_multi STOP_TASK "$@"
 }
 cmd_task_restart() {
-    local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task restart <id>" >&2; return 1; }
-    task_ctl_send RESTART_TASK "$id"
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task restart <id> [<id>...]" >&2; return 1; }
+    task_ctl_multi RESTART_TASK "$@"
 }
 cmd_task_check() {
-    local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task check <id>" >&2; return 1; }
-    task_ctl_send CHECK_TASK "$id"
+    [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task check <id> [<id>...]" >&2; return 1; }
+    task_ctl_multi CHECK_TASK "$@"
 }
 cmd_task_logs() {
     local id="${1:-}" lines="${2:-50}"

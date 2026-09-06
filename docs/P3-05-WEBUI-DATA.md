@@ -76,8 +76,13 @@ su-scheduler webui GET_SUMMARY
       "health": "none",
       "last_run": "2026-09-02 08:30:01",
       "restart_count": 0,
-      "has_run_dir": 1
+      "has_run_dir": 1,
+      "dependency": "t_boot,?t_watch:FAILED"
     }
+  ],
+  "dep_errors": [
+    "unknown dependency 'ghost' in 't_dc'",
+    "cycle: t_da->t_db->t_da"
   ]
 }
 ```
@@ -98,6 +103,8 @@ su-scheduler webui GET_SUMMARY
 | `tasks[].health` | str | 健康族状态（HEALTHY/UNHEALTHY/UNKNOWN/RECOVERING）或 health.type（none/process/port） |
 | `tasks[].last_run` | str | start_time.txt 或 runtime.last_start |
 | `tasks[].restart_count` | int | 运行目录 recovery.count（缺省 0） |
+| `tasks[].dependency` | str | 依赖原字符串（task-config `dependency`，空=空串；`?` 前缀=Optional，P5-07 只增键 B8） |
+| `dep_errors` | str[] | 依赖图只读错误收集（P5-07 `dep_graph_read` 调 `dep_validate_graph` 捕获 stderr）：unknown dependency / self-dependency / cycle 消息逐条；图有效或 task-config 目录不存在 → `[]` |
 
 ### 3.2 GET_TASK_DETAIL（Task Detail）
 
@@ -234,6 +241,6 @@ CLI Reader 经 `web_task_log_to_json` 归一为与 §3.4 相同 JSON Schema
 
 ## 6. 版本与命名空间
 
-- Runtime 库版本 `RUNTIME_LIB_VERSION=1.29.0`（P5-06 递增；只增键不删字段，B8 契约重申：本文档各 op Schema 均为**向下兼容追加**，既有字段名/类型/顺序永不删改）。
+- Runtime 库版本 `RUNTIME_LIB_VERSION=1.29.0`（P5-06 递增；只增键不删字段，B8 契约重申：本文档各 op Schema 均为**向下兼容追加**，既有字段名/类型/顺序永不删改）。P5-07 继续只增：GET_SUMMARY `tasks[].dependency` + 顶层 `dep_errors`（版本号不变，纯后端只读增量）。
 - 新 IPC op 白名单计数：12（P3-04）+ 4（P3-05 只读）= **16**。
 - 函数前缀：`web_`（函数）/ `webv_`（内部全局）；注册进 `runtime_lib_selfcheck`。

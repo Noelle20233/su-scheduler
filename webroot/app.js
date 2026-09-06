@@ -129,6 +129,128 @@
     return Math.floor(ms / 1000);
   }
 
+  /* ── P5-07 依赖可视化 + 批量操作 ─────────────────────────────────────── */
+  function depEntries(depStr) {
+    return String(depStr || "").split(/[, ]+/).filter(function (s) { return s; });
+  }
+  function depBadges(depStr) {
+    var wrap = el("span", { class: "deps" });
+    depEntries(depStr).forEach(function (e) {
+      var b = el("span", { class: "dep-badge" + (e.charAt(0) === "?" ? " optional" : "") });
+      b.textContent = e;
+      wrap.appendChild(b);
+    });
+    return wrap;
+  }
+  function depCell(t) {
+    var td = el("td", { class: "deps-cell" });
+    var deps = depEntries(t.dependency);
+    td.appendChild(deps.length ? depBadges(t.dependency) : el("span", { class: "dep-none", text: "-" }));
+    return td;
+  }
+  function selectedIds() {
+    var ids = [];
+    document.querySelectorAll(".batch-cb:checked").forEach(function (cb) {
+      ids.push(cb.getAttribute("data-id"));
+    });
+    return ids;
+  }
+  function renderBatchResults(box, op, results) {
+    box.textContent = "";
+    box.appendChild(el("p", { class: "batch-title", text: op + " 批量结果：" }));
+    var fails = 0;
+    results.forEach(function (r) {
+      if (!r.ok) { fails++; }
+      var line = el("div", { class: "batch-item" + (r.ok ? " ok" : " fail") });
+      line.textContent = (r.ok ? "OK  " : "FAILED  ") + r.id + "  rc=" + r.rc + (r.error ? "  " + r.error : "");
+      box.appendChild(line);
+    });
+    box.appendChild(el("p", { class: "batch-sum" + (fails ? " fail" : " ok"),
+      text: "成功 " + (results.length - fails) + " / " + results.length + (fails ? "，失败 " + fails : "（全部成功）") }));
+  }
+  function runBatch(op, label, box) {
+    var ids = selectedIds();
+    if (!ids.length) { box.textContent = "未选中任务"; return; }
+    box.textContent = "";
+    var pending = ids.length;
+    var results = [];
+    ids.forEach(function (id) {
+      write(op, { id: id }).then(function (res) {
+        results.push({ id: id, rc: (res && res.rc === undefined) ? "?" : (res && res.rc), error: (res && res.error) || "", ok: !!(res && res.ok) });
+        pending--;
+        if (pending === 0) { renderBatchResults(box, op, results); }
+      });
+    });
+  }
+  function batchBar() {
+    var bar = el("div", { class: "batchbar" });
+    var cbAll = el("input", { type: "checkbox", class: "batch-all", title: "全选" });
+    cbAll.addEventListener("change", function () {
+      document.querySelectorAll(".batch-cb").forEach(function (cb) { cb.checked = cbAll.checked; });
+    });
+    bar.appendChild(cbAll);
+    bar.appendChild(el("span", { class: "batch-hint", text: "全选" }));
+    var box = el("div", { class: "batch-results" });
+    [["Start", "START_TASK"], ["Stop", "STOP_TASK"], ["Restart", "RESTART_TASK"],
+     ["Check", "CHECK_TASK"], ["Enable", "ENABLE_TASK"], ["Disable", "DISABLE_TASK"]].forEach(function (pair) {
+      var b = el("button", { class: "batch-btn", text: pair[0], "data-op": pair[1] });
+      b.addEventListener("click", function () { runBatch(pair[1], pair[0], box); });
+      bar.appendChild(b);
+    });
+    bar.appendChild(box);
+    return bar;
+  }
+  function renderDepView(data) {
+    var block = el("div", { class: "depview" });
+    block.appendChild(el("h2", { text: "依赖关系" }));
+    var errs = data.dep_errors || [];
+    var errBox = el("div", { class: "dep-errors" });
+    if (errs.length) {
+      errBox.className = "dep-errors has-errors";
+      errBox.appendChild(el("p", { class: "dep-errors-title", text: "依赖图错误（环 / 无效依赖）：" }));
+      errs.forEach(function (e) { errBox.appendChild(el("div", { class: "dep-error", text: e })); });
+    } else {
+      errBox.appendChild(el("p", { class: "dep-errors-ok", text: "依赖图无环 / 无无效依赖错误。" }));
+    }
+    block.appendChild(errBox);
+    var fwd = el("div", { class: "dep-col" });
+    fwd.appendChild(el("h3", { text: "正向依赖（任务 → 依赖）" }));
+    var rev = el("div", { class: "dep-col" });
+    rev.appendChild(el("h3", { text: "反向依赖（谁依赖我）" }));
+    var revMap = {};
+    (data.tasks || []).forEach(function (t) {
+      depEntries(t.dependency).forEach(function (e) {
+        var target = e;
+        if (target.charAt(0) === "?") { target = target.slice(1); }
+        if (target.indexOf(":") >= 0) { target = target.slice(0, target.indexOf(":")); }
+        revMap[target] = revMap[target] || [];
+        revMap[target].push(t.id);
+      });
+    });
+    (data.tasks || []).forEach(function (t) {
+      var row = el("div", { class: "dep-row" });
+      row.appendChild(el("span", { class: "dep-from", text: t.id }));
+      var deps = depEntries(t.dependency);
+      row.appendChild(deps.length ? depBadges(t.dependency) : el("span", { class: "dep-none", text: "（无依赖）" }));
+      fwd.appendChild(row);
+    });
+    var revKeys = Object.keys(revMap);
+    if (!revKeys.length) {
+      rev.appendChild(el("p", { class: "dep-none", text: "（无任务依赖本任务）" }));
+    } else {
+      revKeys.forEach(function (k) {
+        var row = el("div", { class: "dep-row" });
+        row.appendChild(el("span", { class: "dep-from", text: k }));
+        row.appendChild(el("span", { class: "dep-revlist", text: revMap[k].join(", ") }));
+        rev.appendChild(row);
+      });
+    }
+    var cols = el("div", { class: "dep-cols" });
+    cols.appendChild(fwd); cols.appendChild(rev);
+    block.appendChild(cols);
+    return block;
+  }
+
   /* ── 视图：Dashboard ────────────────────────────────────────────────── */
   function renderDashboard(data) {
     var view = document.getElementById("view");
@@ -154,14 +276,17 @@
 
     var h = el("h2", { text: "Tasks" });
     view.appendChild(h);
+    view.appendChild(batchBar());
     var list = el("table", { class: "tbl" });
     var thead = el("tr");
-    ["ID", "名称", "状态", "Trigger", "Action", "Health", "最近运行", "重启次数"].forEach(function (t) {
+    ["", "ID", "名称", "状态", "Trigger", "Action", "Health", "最近运行", "重启次数", "依赖"].forEach(function (t) {
       thead.appendChild(el("th", { text: t }));
     });
     list.appendChild(thead);
     (data.tasks || []).forEach(function (t) {
       var tr = el("tr");
+      var cb = el("input", { type: "checkbox", class: "batch-cb", "data-id": t.id });
+      var tdSel = el("td"); tdSel.appendChild(cb); tr.appendChild(tdSel);
       var a = el("a", { href: "#task/" + encodeURIComponent(t.id), text: escText(t.id) });
       var td0 = el("td"); td0.appendChild(a); tr.appendChild(td0);
       tr.appendChild(el("td", { text: escText(t.name) }));
@@ -171,12 +296,14 @@
       tr.appendChild(el("td", { text: escText(t.health) }));
       tr.appendChild(el("td", { text: escText(t.last_run) }));
       tr.appendChild(el("td", { text: escText(t.restart_count) }));
+      tr.appendChild(depCell(t));
       list.appendChild(tr);
     });
     view.appendChild(list);
     if (!(data.tasks || []).length) {
       view.appendChild(el("p", { class: "empty", text: "（空：暂无任务）" }));
     }
+    view.appendChild(renderDepView(data));
   }
 
   /* ── 视图：Task List ────────────────────────────────────────────────── */
@@ -189,14 +316,17 @@
     updateIndicator(view, "上次更新 " + lastUpdatedTime());
     var h = el("h2", { text: "Task List" });
     view.appendChild(h);
+    view.appendChild(batchBar());
     var list = el("table", { class: "tbl" });
     var thead = el("tr");
-    ["ID", "名称", "状态", "Trigger", "Action", "Health", "最近运行", "重启次数", "启用"].forEach(function (t) {
+    ["", "ID", "名称", "状态", "Trigger", "Action", "Health", "最近运行", "重启次数", "启用", "依赖"].forEach(function (t) {
       thead.appendChild(el("th", { text: t }));
     });
     list.appendChild(thead);
     (data.tasks || []).forEach(function (t) {
       var tr = el("tr");
+      var cb = el("input", { type: "checkbox", class: "batch-cb", "data-id": t.id });
+      var tdSel = el("td"); tdSel.appendChild(cb); tr.appendChild(tdSel);
       var a = el("a", { href: "#task/" + encodeURIComponent(t.id), text: escText(t.id) });
       var td0 = el("td"); td0.appendChild(a); tr.appendChild(td0);
       tr.appendChild(el("td", { text: escText(t.name) }));
@@ -207,6 +337,7 @@
       tr.appendChild(el("td", { text: escText(t.last_run) }));
       tr.appendChild(el("td", { text: escText(t.restart_count) }));
       tr.appendChild(el("td", { text: escText(t.enabled) }));
+      tr.appendChild(depCell(t));
       list.appendChild(tr);
     });
     view.appendChild(list);

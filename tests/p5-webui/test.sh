@@ -187,6 +187,77 @@ printf '%s\n' "$r" | grep -q '"source":' && ok "P5-06 contract: detail source ob
     || bad "P5-06 contract: source object missing"
 
 # ═══════════════════════════════════════════════════════════════════════════
+# §dep-view（P5-07）— GET_SUMMARY tasks[].dependency + dep_errors（B8 只增键）
+# ═══════════════════════════════════════════════════════════════════════════
+tcfg_new_task t_da "14:00" "echo da" >/dev/null 2>&1
+tcfg_new_task t_db "15:00" "echo db" >/dev/null 2>&1
+tcfg_new_task t_dc "16:00" "echo dc" >/dev/null 2>&1
+tcfg_set_field t_da dependency "t_db,?t_dc" >/dev/null 2>&1   # 必选 t_db + 可选(?)t_dc
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+
+r=$(send_req "dp1" "dp1|GET_SUMMARY|")
+rc=$(resp_rc "$r")
+payload=$(printf '%s\n' "$r" | tail -n +2)
+[ "$rc" = "0" ] && printf '%s' "$payload" | grep -q '"dependency":"t_db,?t_dc"' \
+    && ok "P5-07 dep: GET_SUMMARY tasks[] carries dependency raw string (incl. optional ?)" \
+    || bad "P5-07 dep: dependency key rc=$rc payload=$payload"
+[ "$rc" = "0" ] && printf '%s' "$payload" | grep -q '"dep_errors":\[\]' \
+    && ok "P5-07 dep: dep_errors empty array when dependency graph valid" \
+    || bad "P5-07 dep: dep_errors(valid) rc=$rc payload=$payload"
+printf '%s' "$payload" | grep -q '"tasks":' && printf '%s' "$payload" | grep -q '"counts":' \
+    && ok "P5-07 dep: existing GET_SUMMARY keys coexist with dep_errors (B8)" \
+    || bad "P5-07 dep: B8 contract broken"
+
+# 直写 task-config 注入环/未知依赖（绕过后端写路径校验，模拟损坏配置）→ dep_errors 报告
+set_file_field "$TCFG_DIR/t_db.task" dependency "t_da"      # 环：t_da->t_db->t_da
+set_file_field "$TCFG_DIR/t_dc.task" dependency "ghost"     # 未知依赖 ghost
+r=$(send_req "dp2" "dp2|GET_SUMMARY|")
+rc=$(resp_rc "$r")
+payload=$(printf '%s\n' "$r" | tail -n +2)
+[ "$rc" = "0" ] && printf '%s' "$payload" | grep -q "unknown dependency 'ghost' in 't_dc'" \
+    && printf '%s' "$payload" | grep -q 'cycle:' \
+    && ok "P5-07 dep: dep_errors reports unknown dependency + cycle (read-only)" \
+    || bad "P5-07 dep: dep_errors(invalid) rc=$rc payload=$payload"
+# dep_errors 读取只读：零 exec、task-config 不被改写（仅测试自身 set_file_field 的注入）
+grep -q "dependency=t_da" "$TCFG_DIR/t_db.task" && grep -q "dependency=ghost" "$TCFG_DIR/t_dc.task" \
+    && ok "P5-07 dep: injected files intact (dep_errors is read-only)" \
+    || bad "P5-07 dep: task-config mutated by read"
+
+# 前端依赖视图静态断言（P5-07 §dep-view）
+grep -q '依赖关系' webroot/app.js && ok "P5-07 dep: app.js 依赖关系 view" || bad "P5-07 dep: 依赖关系 missing"
+grep -q '正向依赖' webroot/app.js && ok "P5-07 dep: forward-dep list" || bad "P5-07 dep: 正向依赖 missing"
+grep -q '反向依赖' webroot/app.js && ok "P5-07 dep: reverse-dep list" || bad "P5-07 dep: 反向依赖 missing"
+grep -q 'dep-badge' webroot/app.js && grep -q 'optional' webroot/app.js \
+    && ok "P5-07 dep: Required/Optional dep-badge (optional mark)" || bad "P5-07 dep: dep-badge/optional missing"
+grep -q 'dep_errors' webroot/app.js && ok "P5-07 dep: app.js renders dep_errors (textContent)" \
+    || bad "P5-07 dep: dep_errors rendering missing"
+grep -q '"依赖"' webroot/app.js && ok "P5-07 dep: task table has 依赖 column" || bad "P5-07 dep: 依赖 column missing"
+grep -q '\.dep-badge.optional' webroot/style.css && ok "P5-07 dep: .dep-badge.optional style" \
+    || bad "P5-07 dep: .dep-badge.optional style missing"
+grep -q '\.dep-error' webroot/style.css && ok "P5-07 dep: .dep-error style" || bad "P5-07 dep: .dep-error style missing"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §batch-ui（P5-07）— 批量 UI 复用既有 WRITE_OPS（B7 不新增 op）
+# ═══════════════════════════════════════════════════════════════════════════
+grep -q 'batchBar' webroot/app.js && ok "P5-07 batch-ui: batch bar helper" || bad "P5-07 batch-ui: batchBar missing"
+grep -q 'batch-cb' webroot/app.js && ok "P5-07 batch-ui: per-row checkbox (batch-cb)" || bad "P5-07 batch-ui: batch-cb missing"
+grep -q 'batch-btn' webroot/app.js && ok "P5-07 batch-ui: batch action buttons" || bad "P5-07 batch-ui: batch-btn missing"
+grep -q 'write(op, { id: id })' webroot/app.js \
+    && ok "P5-07 batch-ui: batch loops call write(op,{id}) — reuses existing WRITE_OPS (B7)" \
+    || bad "P5-07 batch-ui: batch write loop missing"
+bb_miss=0
+for op in START_TASK STOP_TASK RESTART_TASK CHECK_TASK ENABLE_TASK DISABLE_TASK; do
+    grep -q "$op" webroot/app.js || { bb_miss=$((bb_miss + 1)); echo "  missing batch op: $op"; }
+done
+[ "$bb_miss" -eq 0 ] && ok "P5-07 batch-ui: batch buttons use the existing 6 control ops (no new op)" \
+    || bad "P5-07 batch-ui: $bb_miss control ops missing"
+grep -q 'var WRITE_OPS' webroot/app.js && ok "P5-07 batch-ui: WRITE_OPS constant intact" \
+    || bad "P5-07 batch-ui: WRITE_OPS regressed"
+grep -q 'batch-results' webroot/app.js && ok "P5-07 batch-ui: aggregated [{id,rc,error}] results render" \
+    || bad "P5-07 batch-ui: batch-results missing"
+grep -q '\.batch-btn' webroot/style.css && ok "P5-07 batch-ui: .batch-btn style" || bad "P5-07 batch-ui: .batch-btn style missing"
+
+# ═══════════════════════════════════════════════════════════════════════════
 # §frontend（静态特征断言；行为经 grep + 后端 JSON 双覆盖）
 # ═══════════════════════════════════════════════════════════════════════════
 grep -q 'setInterval' webroot/app.js && ok "P5-06 front: app.js uses setInterval (periodic refresh)" \

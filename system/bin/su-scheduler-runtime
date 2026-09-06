@@ -4624,7 +4624,10 @@ web_task_row() {   # <tasks_dir> <task_file> <id>
     webv_ht=$(sched_task_field "$webv_f" health.type); [ -z "$webv_ht" ] && webv_ht=none
     webv_health=$webv_ht
     case "$webv_st" in HEALTHY|UNHEALTHY|UNKNOWN|RECOVERING) webv_health=$webv_st ;; esac
-    printf '{"id":%s,"name":%s,"status":%s,"trigger":%s,"action":%s,"enabled":%s,"health":%s,"last_run":%s,"restart_count":%s,"has_run_dir":%s}' \
+    # P5-07：只增 `dependency` 键（B8）——读任务文件 dependency 原串，空=空串；
+    # 前端据此聚合正向/反向依赖关系，无需 N 次 IPC（B7 不新增 op）。
+    webv_dep=$(sched_task_field "$webv_f" dependency)
+    printf '{"id":%s,"name":%s,"status":%s,"trigger":%s,"action":%s,"enabled":%s,"health":%s,"last_run":%s,"restart_count":%s,"has_run_dir":%s,"dependency":%s}' \
         "$(web_json_str "$webv_id")" \
         "$(web_json_str "$(sched_task_field "$webv_f" name)")" \
         "$(web_json_str "$webv_st")" \
@@ -4633,7 +4636,8 @@ web_task_row() {   # <tasks_dir> <task_file> <id>
         "$(web_json_str "$webv_en")" \
         "$(web_json_str "$webv_health")" \
         "$(web_json_str "$webv_last")" \
-        "$webv_rcount" "$webv_hasrun"
+        "$webv_rcount" "$webv_hasrun" \
+        "$(web_json_str "$webv_dep")"
 }
 # ── GET_SUMMARY：计数 + 任务紧凑列表（Dashboard + Task List 单调用）────────
 web_agg_summary() {   # <base> <tasks> → 单行 JSON
@@ -4660,10 +4664,24 @@ web_agg_summary() {   # <base> <tasks> → 单行 JSON
         webv_sep=","
     done
     webv_mode=$(sched_source_mode "$webv_base")
-    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s,"recovering":%s},"tasks":[%s]}' \
+    # P5-07：只读依赖图错误聚合（B8 只增 `dep_errors` 键，B7 不新增 op）。
+    # 目录缺失（未 managed / task-config 不存在）→ 空数组（只读容错）。
+    webv_deperr="[]"
+    webv_depdir=$(tcfg_dir)
+    if [ -d "$webv_depdir" ]; then
+        webv_errs=$(dep_graph_read "$webv_depdir")
+        if [ -n "$webv_errs" ]; then
+            webv_darr=$(webv_dsep="" ; printf '%s\n' "$webv_errs" | while IFS= read -r webv_line; do
+                printf '%s%s' "$webv_dsep" "$(web_json_str "$webv_line")"
+                webv_dsep=","
+            done)
+            webv_deperr="[$webv_darr]"
+        fi
+    fi
+    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s,"recovering":%s},"tasks":[%s],"dep_errors":%s}' \
         "$(web_json_str "$webv_mode")" \
         "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" "$webv_waiting" "$webv_recovering" \
-        "$webv_rows"
+        "$webv_rows" "$webv_deperr"
 }
 # ── GET_TASK_DETAIL：完整任务详情（Task Detail 页）─────────────────────────
 web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
@@ -6001,6 +6019,19 @@ depg_dfs() {
     depg_done="$depg_done $depg_x"
     return 0
 }
+# ── P5-07 只读依赖图错误收集（环/无效依赖展示数据面）───────────────────────
+# 只读封装 dep_validate_graph：捕获其 stderr 错误消息（unknown dependency /
+# self-dependency / cycle），逐条 echo 到 stdout（每条一行）；无错误 → 无输出。
+# **不改写路径的 dep_validate_graph 本身**（C2：逐字节保留；本函数只读调用并
+# 收集其输出）。<skip_id> 透传为覆盖节点 id（无 <content> 时不生效，仅占位）。
+dep_graph_read() {   # <dir> [<skip_id>] → stdout 逐条错误消息；无错误无输出
+    dgr_dir=$1; dgr_skip=${2:-}
+    dgr_errs=$(dep_validate_graph "$dgr_dir" "$dgr_skip" "" "[task-config] ERROR:" 2>&1)
+    if [ -n "$dgr_errs" ]; then
+        printf '%s\n' "$dgr_errs"
+    fi
+    return 0
+}
 # ────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
@@ -6044,7 +6075,7 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
                cond_grammar_ok cond_eval \
                sched_retry_count_file sched_retry_until_file sched_retry_gatefail_file \
                rty_policy sched_retry_arm sched_retry_pending \
-               dep_validate_graph; do
+               dep_validate_graph dep_graph_read; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

@@ -323,6 +323,78 @@ cli_run cmd_task status t1
     && ok "P3-07 cli: task status t1 -> documented rc 3 daemon-not-running (old CLI intact)" \
     || bad "P3-07 cli: task status rc=$CLI_RC out=$CLI_OUT"
 
+# ── 13) 批量控制（P5-07）：多 id 循环 + 逐任务输出 + 聚合退出码 + 部分失败不破坏配置 ──
+tcfg_new_task t_b1 "12:00" "echo b1" >/dev/null 2>&1
+tcfg_new_task t_b2 "13:00" "echo b2" >/dev/null 2>&1
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+
+# 批量 start：逐任务 `<id>: started <id>` + rc 0 + 每任务 1 exec
+: > "$EXEC_LOG"
+cli_run cmd_task start t_b1 t_b2
+[ "$CLI_RC" -eq 0 ] && echo "$CLI_OUT" | grep -q 't_b1: started t_b1' \
+    && echo "$CLI_OUT" | grep -q 't_b2: started t_b2' \
+    && [ "$(wc -l < "$EXEC_LOG")" -eq 2 ] \
+    && ok "P5-07 batch: start t_b1 t_b2 -> per-task 'id: started' + rc 0 + 2 exec" \
+    || bad "P5-07 batch: start rc=$CLI_RC out=$CLI_OUT exec=$(wc -l < "$EXEC_LOG")"
+
+# 批量 stop：逐任务 `<id>: stopped <id>`
+cli_run cmd_task stop t_b1 t_b2
+[ "$CLI_RC" -eq 0 ] && echo "$CLI_OUT" | grep -q 't_b1: stopped t_b1' \
+    && echo "$CLI_OUT" | grep -q 't_b2: stopped t_b2' \
+    && ok "P5-07 batch: stop t_b1 t_b2 -> per-task 'id: stopped' + rc 0" \
+    || bad "P5-07 batch: stop rc=$CLI_RC out=$CLI_OUT"
+
+# 批量 restart：每任务 stop+force-start → 2 exec
+: > "$EXEC_LOG"
+cli_run cmd_task restart t_b1 t_b2
+[ "$CLI_RC" -eq 0 ] && [ "$(wc -l < "$EXEC_LOG")" -eq 2 ] \
+    && ok "P5-07 batch: restart t_b1 t_b2 -> 2 exec + rc 0" \
+    || bad "P5-07 batch: restart rc=$CLI_RC exec=$(wc -l < "$EXEC_LOG")"
+
+# 批量 check（无 health → no_health_configured，tctl rc 5 → IPC rc 0 ok）
+cli_run cmd_task check t_b1 t_b2
+[ "$CLI_RC" -eq 0 ] && echo "$CLI_OUT" | grep -q 't_b1: no_health_configured t_b1' \
+    && echo "$CLI_OUT" | grep -q 't_b2: no_health_configured t_b2' \
+    && ok "P5-07 batch: check t_b1 t_b2 -> per-task no_health_configured + rc 0" \
+    || bad "P5-07 batch: check rc=$CLI_RC out=$CLI_OUT"
+
+# 批量 disable/enable（managed 配置原子写）
+cli_run cmd_task disable t_b1 t_b2
+[ "$CLI_RC" -eq 0 ] && grep -q '^enabled=0$' "$TCFG_DIR/t_b1.task" \
+    && grep -q '^enabled=0$' "$TCFG_DIR/t_b2.task" \
+    && ok "P5-07 batch: disable t_b1 t_b2 -> both enabled=0 in config" \
+    || bad "P5-07 batch: disable rc=$CLI_RC"
+cli_run cmd_task enable t_b1 t_b2
+[ "$CLI_RC" -eq 0 ] && grep -q '^enabled=1$' "$TCFG_DIR/t_b1.task" \
+    && grep -q '^enabled=1$' "$TCFG_DIR/t_b2.task" \
+    && ok "P5-07 batch: enable t_b1 t_b2 -> both enabled=1 in config" \
+    || bad "P5-07 batch: enable rc=$CLI_RC"
+
+# 部分失败（不存在 id ghost）：成功任务正常执行、失败任务报错、聚合 rc 1 + FAILED 清单
+tctl_stop "$BASE" "$TASKS_DIR" t_b1 >/dev/null 2>&1
+tctl_stop "$BASE" "$TASKS_DIR" t_b2 >/dev/null 2>&1
+SNAP_B=$(tc_snap)
+: > "$EXEC_LOG"
+cli_run cmd_task start t_b1 ghost t_b2
+[ "$CLI_RC" -eq 1 ] && echo "$CLI_OUT" | grep -q 't_b1: started t_b1' \
+    && echo "$CLI_OUT" | grep -q 'ghost: ERROR:' \
+    && echo "$CLI_OUT" | grep -q 't_b2: started t_b2' \
+    && echo "$CLI_OUT" | grep -q 'FAILED: ghost' \
+    && [ "$(wc -l < "$EXEC_LOG")" -eq 2 ] \
+    && ok "P5-07 batch: partial failure (ghost) -> per-task results + FAILED list + rc 1" \
+    || bad "P5-07 batch: partial rc=$CLI_RC out=$CLI_OUT exec=$(wc -l < "$EXEC_LOG")"
+[ "$(tc_snap)" = "$SNAP_B" ] && ok "P5-07 batch: config byte-identical after partial failure (B19)" \
+    || bad "P5-07 batch: config mutated after partial failure"
+[ "$(cat "$TASKS_DIR/t_b1/state.txt" 2>/dev/null)" = "RUNNING" ] \
+    && ok "P5-07 batch: other task t_b1 executed normally (state RUNNING)" \
+    || bad "P5-07 batch: t_b1 state=$(cat "$TASKS_DIR/t_b1/state.txt" 2>/dev/null)"
+
+# 批量与单任务行为一致：单 id 保持既有格式（无 `<id>: ` 前缀）
+cli_run cmd_task stop t_b1
+[ "$CLI_RC" -eq 0 ] && echo "$CLI_OUT" | grep -q '^stopped t_b1$' \
+    && ok "P5-07 batch: single-id stop keeps legacy format (no prefix)" \
+    || bad "P5-07 batch: single-id rc=$CLI_RC out=$CLI_OUT"
+
 kill "$DLOOP" 2>/dev/null
 wait "$DLOOP" 2>/dev/null
 

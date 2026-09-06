@@ -236,6 +236,73 @@ done
 [ "$badpat2" -eq 0 ] && ok "P4-08 sec: app.js still free of Root-exec / eval / innerHTML" \
     || bad "P4-08 sec: app.js forbidden pattern detected"
 
+# ── P5-07 批量相关注入：恶意多 id 参数 → 零 exec、零 config 写（B7 不新增 op）──
+# CLI 批量控制（task start/stop <id>...）在 CLI 层循环既有单任务 op；每个 id 仍经
+# ipc_b64enc + daemon 侧 secv_id_ok 校验 → 恶意 id 独立失败，绝不执行、绝不写 config。
+ipc_server_init "$BASE" >/dev/null 2>&1
+echo "$$" > "$BASE/ipc/daemon.pid"
+( while :; do ipc_server_poll "$BASE" "$CFG" "$TASKS_DIR" >/dev/null 2>&1; sleep 0.1; done ) &
+SEC_DLOOP=$!
+ROOT="$(pwd)"
+CLI="system/bin/su-scheduler"
+cli_body() {
+    sed '/^# 🚦 Main Dispatcher/,$d' "$CLI" \
+      | tr -d '\r' \
+      | sed '/^unset /d; /^export PATH=/d' \
+      | sed "s#RUNTIME_LIB=\"/system/bin/su-scheduler-runtime\"#RUNTIME_LIB=\"$ROOT/system/bin/su-scheduler-runtime\"#"
+}
+cli_run() {   # <args...> → CLI_OUT / CLI_RC
+    local tmp="$T/cli"
+    mkdir -p "$tmp/tasks" "$tmp/shells"
+    CLI_OUT=$( {
+        set +u
+        eval "$(cli_body)"
+        CONFIG_FILE="$tmp/config.txt"
+        LOG_FILE="$tmp/su-scheduler.log"
+        TASKS_DIR="$tmp/tasks"
+        SHELLS_DIR="$tmp/shells"
+        DATA_DIR="$BASE"
+        TCFG_DIR="$BASE/task-config"
+        "$@"
+    } 2>&1 )
+    CLI_RC=$?
+}
+
+# 恶意 id 批量 start：真实任务 + 注入 id → 注入 id 报错、聚合 rc 1、零 exec 零写
+: > "$EXEC_LOG"
+SNAP_BATCH=$(tc_snap)
+cli_run cmd_task start tsec 'x;touch '$T'/pwn'
+[ "$CLI_RC" -eq 1 ] && echo "$CLI_OUT" | grep -q 'x;touch' \
+    && ok "P5-07 sec: batch start with malicious id -> rc 1 (per-task error, no crash)" \
+    || bad "P5-07 sec: batch start malicious rc=$CLI_RC out=$CLI_OUT"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P5-07 sec: batch malicious id ZERO exec" \
+    || bad "P5-07 sec: batch malicious id exec leaked ($(wc -l < "$EXEC_LOG"))"
+[ "$(tc_snap)" = "$SNAP_BATCH" ] && ok "P5-07 sec: task-config byte-identical after batch malicious id" \
+    || bad "P5-07 sec: task-config mutated by batch malicious id"
+
+# 恶意多 id 混合（路径穿越 + 命令替换）批量 stop：真实任务照常、恶意 id 独立失败
+: > "$EXEC_LOG"
+cli_run cmd_task stop tsec '../etc/passwd' '$($(id))'
+[ "$CLI_RC" -eq 1 ] && echo "$CLI_OUT" | grep -q 'FAILED:' \
+    && ok "P5-07 sec: batch stop mixed malicious ids -> rc 1 + FAILED list" \
+    || bad "P5-07 sec: batch stop mixed rc=$CLI_RC out=$CLI_OUT"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P5-07 sec: batch stop mixed ZERO exec" \
+    || bad "P5-07 sec: batch stop mixed exec leaked ($(wc -l < "$EXEC_LOG"))"
+[ "$(tc_snap)" = "$SNAP_BATCH" ] && ok "P5-07 sec: config byte-identical after batch stop mixed" \
+    || bad "P5-07 sec: config mutated after batch stop mixed"
+
+# 单 id 注入路径零回退（既有校验不因批量支持而绕过）
+: > "$EXEC_LOG"
+cli_run cmd_task enable 'a;echo PWN >'$T'/pwn2'
+[ "$CLI_RC" -ne 0 ] && [ "$(wc -l < "$EXEC_LOG")" -eq 0 ] \
+    && [ ! -f "$T/pwn2" ] \
+    && ok "P5-07 sec: single-id enable with injection -> rc non-0, ZERO exec, no file" \
+    || bad "P5-07 sec: single-id enable injection rc=$CLI_RC exec=$(wc -l < "$EXEC_LOG")"
+[ "$(tc_snap)" = "$SNAP_BATCH" ] && ok "P5-07 sec: config byte-identical after single-id injection" \
+    || bad "P5-07 sec: config mutated by single-id injection"
+kill "$SEC_DLOOP" 2>/dev/null
+wait "$SEC_DLOOP" 2>/dev/null
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "webui security tests: PASS=$PASS FAIL=$FAIL"
