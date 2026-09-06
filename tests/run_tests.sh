@@ -109,16 +109,20 @@ ok=1
 # 全量回归挂起。现在改为输出落临时文件 + 超时强杀，任何套件挂起最多阻塞一个超时上限。
 SUITE_TIMEOUT=${SUITE_TIMEOUT:-300}
 
-run_suite() {   # <path>：捕获输出，判 [FAIL] 计数与退出码；超时则强杀并记 FAIL
+run_suite() {   # <path> [<timeout>]：捕获输出，计数 [FAIL] 与退出码；超时强杀记 FAIL
+    # D-P5-04：设备套件（p1-device 含 2×150s 睡眠等）可超过通用 300s 上限，经第 2 参
+    # 覆盖超时（默认 SUITE_TIMEOUT）。p1-device 在 --with-device 组合跑时被 300s 强杀
+    # 致必 FAIL（standalone 全绿）——测试基建问题，非产品缺陷。
+    suite_to=${2:-$SUITE_TIMEOUT}
     echo "== $1 ==" | tee -a "$LOG"
     tmp=$(mktemp "$RESULT_DIR/.suite.XXXXXX") || { ok=0; echo "[FAIL] mktemp failed" | tee -a "$LOG"; echo "" >> "$LOG"; return; }
     bash "$1" > "$tmp" 2>&1 &
     spid=$!
     i=0
-    while [ "$i" -lt "$SUITE_TIMEOUT" ] && kill -0 "$spid" 2>/dev/null; do
+    while [ "$i" -lt "$suite_to" ] && kill -0 "$spid" 2>/dev/null; do
         sleep 1; i=$((i + 1))
     done
-    if [ "$i" -ge "$SUITE_TIMEOUT" ] && kill -0 "$spid" 2>/dev/null; then
+    if [ "$i" -ge "$suite_to" ] && kill -0 "$spid" 2>/dev/null; then
         kill "$spid" 2>/dev/null
         j=0
         while [ "$j" -lt 5 ] && kill -0 "$spid" 2>/dev/null; do
@@ -126,13 +130,13 @@ run_suite() {   # <path>：捕获输出，判 [FAIL] 计数与退出码；超时
         done
         if kill -0 "$spid" 2>/dev/null; then
             kill -9 "$spid" 2>/dev/null
-            # 不 wait：进程若陷于不可中断阻塞（如 FIFO open D-state），wait 可能永久
-            # 挂起；僵尸由本脚本退出时回收，先放行后续套件。
+            # �� wait�����������ڲ����ж��������� FIFO open D-state����wait ��������
+            # ���𣻽�ʬ�ɱ��ű��˳�ʱ���գ��ȷ��к����׼���
         else
             wait "$spid" 2>/dev/null
         fi
         ok=0
-        echo "[FAIL] suite TIMEOUT after ${SUITE_TIMEOUT}s: $1" | tee -a "$LOG"
+        echo "[FAIL] suite TIMEOUT after ${suite_to}s: $1" | tee -a "$LOG"
         echo "--- last lines of output ---" | tee -a "$LOG"
         tail -20 "$tmp" | tee -a "$LOG"
         rm -f "$tmp"
@@ -207,8 +211,10 @@ else
         run_suite "$suite"
     done
     if [ "$WITH_DEVICE" -eq 1 ]; then
-        run_suite "tests/p1-device/smoke.sh"
-        run_suite "tests/p3-device/smoke.sh"
+        # D-P5-04：设备套件超时放大（p1-device 含 2×150s 睡眠、p3-device 多轮 daemon
+        # 重启），默认 300s 组合跑必强杀 → 单独给足 900s。
+        run_suite "tests/p1-device/smoke.sh" 900
+        run_suite "tests/p3-device/smoke.sh" 900
     fi
 fi
 
