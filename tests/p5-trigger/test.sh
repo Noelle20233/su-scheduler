@@ -18,6 +18,9 @@
 #                  （Editor 权威校验，写盘前拦截）；
 #   §legacy-zero   B16：新 Trigger 仅 Managed；legacy 模式（无 MANAGED）下
 #                  tcfg_new_task/tcfg_apply_task 全拒绝，零 task 文件、标记不动；
+#   §sched         P5-05：新 Trigger 调度接线（trigger_decide 各家族 due/N +
+#                  oneshot 执行自删 + interval last-run rearm + cron 日级去重 +
+#                  boot_completed 上下文去重 + scheduler_tick 端到端）；
 #   §posix         dash -n。
 # 本套件**零生产改动**：只读 source Runtime 库（`. ./$RTLIB`，TCFG_DIR 先 export
 #   隔离，同 config-v2/p5-condition 套件），只调用 tcfg_* 纯校验/存储函数。
@@ -212,6 +215,148 @@ tcfg_apply_task task_lt "id=task_lt" >/dev/null 2>&1 \
     && bad "P5-04 legacy-zero: apply allowed in legacy" || ok "P5-04 legacy-zero: tcfg_apply_task rejected in legacy (B16)"
 [ -z "$(ls "$LEG_DIR"/*.task 2>/dev/null)" ] && ok "P5-04 legacy-zero: zero task files in legacy dir" || bad "P5-04 legacy-zero: task files present"
 [ "$(tcfg_mode)" = "legacy" ] && ok "P5-04 legacy-zero: mode stays legacy (MANAGED untouched)" || bad "P5-04 legacy-zero: MANAGED written"
+
+# ── §sched：新 Trigger 调度接线（P5-05，trigger_decide + scheduler_tick）─────
+# 断言（docs/P5-05.md §3.C.10）：oneshot 精确分钟 due + 执行自删；delay 首 tick
+# 建基准不执行、N 分钟后 due、执行后（dlx 标记）不再 due；interval 首 tick due、
+# 同分钟不重复（cycle 去重）、N 分钟后再次 due；cron 全字段匹配 due=Y、同日重复
+# tick 不重复（cn_ 键）、不匹配分钟 due=N；boot_completed 上下文=0 due=N、=1
+# 首 tick due=Y、再 tick 不重复（bc_ 键）。注入 TRIGGER_EPOCH_MIN/TRIGGER_TODAY/
+# TRIGGER_STATE_FILE/TRIGGER_TASK_ID/TRIGGER_BOOT_COMPLETED_CONTEXT 保证确定性。
+SCHED_T="$T/p5sched"
+SCHED_BASE="$SCHED_T/base"; SCHED_CFG="$SCHED_T/config.txt"
+SCHED_TASKS="$SCHED_T/tasks"; SCHED_SF="$SCHED_BASE/schedule_state.txt"
+mkdir -p "$SCHED_TASKS" "$SCHED_BASE"
+SCHED_EXEC_LOG="$SCHED_T/exec.log"; : > "$SCHED_EXEC_LOG"
+TASKS_DIR="$SCHED_TASKS"
+execute_task() {   # 7 参 shim：id cmd ns ne msg itr tmx（镜像 daemon 工件）
+    id=$1; cmd=$2
+    d="$SCHED_TASKS/$id"
+    mkdir -p "$d"
+    echo "$cmd" > "$d/command.txt"
+    date "+%Y-%m-%d %H:%M:%S" > "$d/start_time.txt"
+    echo "SYSTEM" > "$d/exec_mode.txt"
+    echo "0" > "$d/exit_code.txt"
+    echo "SUCCESS" > "$d/status.txt"
+    echo "$id|$cmd" >> "$SCHED_EXEC_LOG"
+    return 0
+}
+export TCFG_DIR="$SCHED_T/tsks"
+mkdir -p "$TCFG_DIR"
+echo managed > "$TCFG_DIR/MANAGED"
+tcfg_new_task s_os  oneshot:0830        "echo oneshot-run"  >/dev/null 2>&1
+tcfg_new_task s_ose oneshot:0830        "echo oneshot-e2e"  >/dev/null 2>&1
+tcfg_new_task s_dl  delay:30            "echo delay-run"    >/dev/null 2>&1
+tcfg_new_task s_iv  interval:15         "echo interval-run" >/dev/null 2>&1
+tcfg_new_task s_cr  'cron:0 0 6 9 *'    "echo cron-run"     >/dev/null 2>&1
+tcfg_new_task s_crx 'cron:30 0 6 9 *'   "echo cron-miss"    >/dev/null 2>&1
+tcfg_new_task s_bc  boot_completed      "echo bootcomp-run" >/dev/null 2>&1
+: > "$SCHED_CFG"
+sched_reload "$SCHED_BASE" "$SCHED_CFG" >/dev/null 2>&1
+[ "$(registry_task_ids | grep -c '^s_')" -ge 7 ] && ok "P5-05 sched: managed snapshot holds 7 new-trigger tasks" || bad "P5-05 sched: snapshot tasks=$(registry_task_ids | grep -c '^s_')"
+
+# ── trigger_decide 直接断言（独立状态文件隔离 e2e）───────────────────────
+DSF="$SCHED_T/direct_state.txt"; : > "$DSF"
+# oneshot：精确分钟 due=Y / 非精确分钟 due=N
+out=$(trigger_decide "$SCHED_BASE" s_os 0830 0 "$DSF")
+echo "$out" | grep -q 'task=s_os.*due=Y.*cause=oneshot' && ok "P5-05 sched: oneshot due=Y at exact minute 08:30" || bad "P5-05 sched: oneshot due: $out"
+out=$(trigger_decide "$SCHED_BASE" s_os 0831 0 "$DSF")
+echo "$out" | grep -q 'task=s_os.*due=N' && ok "P5-05 sched: oneshot due=N at off minute 08:31" || bad "P5-05 sched: oneshot off: $out"
+
+# delay：缺失基准 → 写 dl_ 基准 + due=N；未到 N 分钟 due=N；到达 N 分钟 due=Y；dlx 后不再 due
+out=$(TRIGGER_EPOCH_MIN=5000 trigger_decide "$SCHED_BASE" s_dl 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_dl.*due=N' && ok "P5-05 sched: delay first decide arms base (due=N)" || bad "P5-05 sched: delay arm: $out"
+[ "$(TRIGGER_STATE_FILE="$DSF" tpr_trigger_state_read dl_s_dl)" = "5000" ] && ok "P5-05 sched: delay base dl_s_dl=5000 persisted" || bad "P5-05 sched: delay base key wrong"
+out=$(TRIGGER_EPOCH_MIN=5029 trigger_decide "$SCHED_BASE" s_dl 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_dl.*due=N' && ok "P5-05 sched: delay due=N before N min (29<30)" || bad "P5-05 sched: delay early: $out"
+out=$(TRIGGER_EPOCH_MIN=5030 trigger_decide "$SCHED_BASE" s_dl 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_dl.*due=Y.*cause=delay' && ok "P5-05 sched: delay due=Y at N min elapsed" || bad "P5-05 sched: delay due: $out"
+TRIGGER_STATE_FILE="$DSF" tpr_trigger_state_write dlx_s_dl 1 >/dev/null 2>&1
+out=$(TRIGGER_EPOCH_MIN=5040 trigger_decide "$SCHED_BASE" s_dl 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_dl.*due=N' && ok "P5-05 sched: delay not due after once (dlx marker)" || bad "P5-05 sched: delay after once: $out"
+
+# interval：首 tick due=Y（无 last-run）；写 last-run 后同 epoch due=N；N 分钟到 due=Y
+out=$(TRIGGER_EPOCH_MIN=6000 trigger_decide "$SCHED_BASE" s_iv 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_iv.*due=Y.*cause=interval' && ok "P5-05 sched: interval first decide due=Y (no last-run)" || bad "P5-05 sched: interval first: $out"
+TRIGGER_STATE_FILE="$DSF" tpr_trigger_state_write iv_s_iv 6000 >/dev/null 2>&1
+out=$(TRIGGER_EPOCH_MIN=6000 trigger_decide "$SCHED_BASE" s_iv 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_iv.*due=N' && ok "P5-05 sched: interval due=N same epoch (last-run=now)" || bad "P5-05 sched: interval same epoch: $out"
+out=$(TRIGGER_EPOCH_MIN=6014 trigger_decide "$SCHED_BASE" s_iv 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_iv.*due=N' && ok "P5-05 sched: interval due=N before 15min (14<15)" || bad "P5-05 sched: interval 14: $out"
+out=$(TRIGGER_EPOCH_MIN=6015 trigger_decide "$SCHED_BASE" s_iv 0900 0 "$DSF")
+echo "$out" | grep -q 'task=s_iv.*due=Y.*cause=interval' && ok "P5-05 sched: interval due=Y at 15min elapsed" || bad "P5-05 sched: interval 15: $out"
+
+# cron：全字段匹配 due=Y / 非匹配分钟 due=N / cn_ 键存在 due=N（同日去重）
+out=$(TRIGGER_TODAY=20260906 trigger_decide "$SCHED_BASE" s_cr 0000 0 "$DSF")
+echo "$out" | grep -q 'task=s_cr.*due=Y.*cause=cron' && ok "P5-05 sched: cron due=Y when all 5 fields match (2026-09-06 00:00)" || bad "P5-05 sched: cron match: $out"
+out=$(TRIGGER_TODAY=20260906 trigger_decide "$SCHED_BASE" s_crx 0000 0 "$DSF")
+echo "$out" | grep -q 'task=s_crx.*due=N' && ok "P5-05 sched: cron due=N on non-matching minute (30≠00)" || bad "P5-05 sched: cron miss: $out"
+TRIGGER_STATE_FILE="$DSF" tpr_trigger_state_write cn_s_cr 20260906 >/dev/null 2>&1
+out=$(TRIGGER_TODAY=20260906 trigger_decide "$SCHED_BASE" s_cr 0000 0 "$DSF")
+echo "$out" | grep -q 'task=s_cr.*due=N' && ok "P5-05 sched: cron due=N after cn_ key (same-day dedup)" || bad "P5-05 sched: cron dedup: $out"
+
+# boot_completed：上下文=0 due=N；=1 due=Y；bc_ 键存在 due=N
+out=$(TRIGGER_BOOT_COMPLETED_CONTEXT=0 trigger_decide "$SCHED_BASE" s_bc 0700 0 "$DSF")
+echo "$out" | grep -q 'task=s_bc.*due=N' && ok "P5-05 sched: boot_completed due=N when context=0" || bad "P5-05 sched: bc ctx0: $out"
+out=$(TRIGGER_BOOT_COMPLETED_CONTEXT=1 trigger_decide "$SCHED_BASE" s_bc 0700 0 "$DSF")
+echo "$out" | grep -q 'task=s_bc.*due=Y.*cause=boot_completed' && ok "P5-05 sched: boot_completed due=Y when context=1" || bad "P5-05 sched: bc ctx1: $out"
+TRIGGER_STATE_FILE="$DSF" tpr_trigger_state_write bc_s_bc 20260906 >/dev/null 2>&1
+out=$(TRIGGER_BOOT_COMPLETED_CONTEXT=1 trigger_decide "$SCHED_BASE" s_bc 0700 0 "$DSF")
+echo "$out" | grep -q 'task=s_bc.*due=N' && ok "P5-05 sched: boot_completed due=N after bc_ key (once per boot)" || bad "P5-05 sched: bc dedup: $out"
+
+# ── scheduler_tick 端到端：oneshot 自删 + rearm 持久化 + cycle 去重 ────────
+# oneshot：执行 → 任务自删（sched_execute_one 后置）
+: > "$SCHED_EXEC_LOG"
+SCHED_CYCLE_NOW=202609060830 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0830" >/dev/null 2>&1
+grep -q '^s_ose|echo oneshot-e2e$' "$SCHED_EXEC_LOG" && ok "P5-05 sched: oneshot executed via scheduler_tick at 08:30" || bad "P5-05 sched: oneshot e2e exec missing (log=$(cat "$SCHED_EXEC_LOG"))"
+registry_has_task s_ose && bad "P5-05 sched: oneshot task still present after exec (self-delete missing)" || ok "P5-05 sched: oneshot self-delete after execution"
+
+# delay：首 tick 建基准不执行；N 分钟后执行一次；执行后不再执行（dlx 键）
+rm -f "$SCHED_SF"
+: > "$SCHED_EXEC_LOG"
+SCHED_CYCLE_NOW=202609060900 TRIGGER_EPOCH_MIN=1000 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0900" >/dev/null 2>&1
+grep -q '^s_dl|' "$SCHED_EXEC_LOG" && bad "P5-05 sched: delay executed on first tick (must arm)" || ok "P5-05 sched: delay first tick arms base, not executed"
+[ "$(TRIGGER_STATE_FILE="$SCHED_SF" tpr_trigger_state_read dl_s_dl)" = "1000" ] && ok "P5-05 sched: delay base dl_s_dl=1000 persisted (e2e)" || bad "P5-05 sched: delay base e2e missing"
+SCHED_CYCLE_NOW=202609061029 TRIGGER_EPOCH_MIN=1029 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0900" >/dev/null 2>&1
+grep -q '^s_dl|' "$SCHED_EXEC_LOG" && bad "P5-05 sched: delay executed before N min (29<30)" || ok "P5-05 sched: delay not due before N min (e2e)"
+SCHED_CYCLE_NOW=202609061030 TRIGGER_EPOCH_MIN=1030 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0900" >/dev/null 2>&1
+grep -q '^s_dl|echo delay-run$' "$SCHED_EXEC_LOG" && ok "P5-05 sched: delay executed once at N min elapsed (e2e)" || bad "P5-05 sched: delay e2e exec missing (log=$(cat "$SCHED_EXEC_LOG"))"
+SCHED_CYCLE_NOW=202609061040 TRIGGER_EPOCH_MIN=1040 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0900" >/dev/null 2>&1
+[ "$(grep -c '^s_dl|' "$SCHED_EXEC_LOG")" -eq 1 ] && ok "P5-05 sched: delay not re-executed after once (dlx, e2e)" || bad "P5-05 sched: delay re-exec count=$(grep -c '^s_dl|' "$SCHED_EXEC_LOG")"
+
+# interval：首 tick 执行；同分钟再 tick 不重复（cycle 去重 + iv 键）；N 分钟后再执行
+rm -f "$SCHED_SF"
+: > "$SCHED_EXEC_LOG"
+SCHED_CYCLE_NOW=202609061000 TRIGGER_EPOCH_MIN=7000 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "1000" >/dev/null 2>&1
+grep -q '^s_iv|echo interval-run$' "$SCHED_EXEC_LOG" && ok "P5-05 sched: interval executed on first tick" || bad "P5-05 sched: interval first exec missing"
+[ "$(TRIGGER_STATE_FILE="$SCHED_SF" tpr_trigger_state_read iv_s_iv)" = "7000" ] && ok "P5-05 sched: interval last-run iv_s_iv=7000 persisted" || bad "P5-05 sched: interval iv key missing"
+SCHED_CYCLE_NOW=202609061000 TRIGGER_EPOCH_MIN=7000 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "1000" >/dev/null 2>&1
+[ "$(grep -c '^s_iv|' "$SCHED_EXEC_LOG")" -eq 1 ] && ok "P5-05 sched: interval not re-executed same cycle (sched_cycle_seen + iv key)" || bad "P5-05 sched: interval same-cycle re-exec (count=$(grep -c '^s_iv|' "$SCHED_EXEC_LOG"))"
+SCHED_CYCLE_NOW=202609061015 TRIGGER_EPOCH_MIN=7015 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "1015" >/dev/null 2>&1
+[ "$(grep -c '^s_iv|' "$SCHED_EXEC_LOG")" -eq 2 ] && ok "P5-05 sched: interval re-executed after N min elapsed" || bad "P5-05 sched: interval re-exec count=$(grep -c '^s_iv|' "$SCHED_EXEC_LOG")"
+
+# cron：全字段匹配首 tick 执行；同日再 tick（跨 cycle token）不重复（cn_ 键）
+rm -f "$SCHED_SF"
+: > "$SCHED_EXEC_LOG"
+SCHED_CYCLE_NOW=202609060000 TRIGGER_TODAY=20260906 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0000" >/dev/null 2>&1
+grep -q '^s_cr|echo cron-run$' "$SCHED_EXEC_LOG" && ok "P5-05 sched: cron executed when all 5 fields match (TRIGGER_TODAY=20260906)" || bad "P5-05 sched: cron first exec missing"
+[ "$(TRIGGER_STATE_FILE="$SCHED_SF" tpr_trigger_state_read cn_s_cr)" = "20260906" ] && ok "P5-05 sched: cron cn_s_cr=20260906 persisted (day-level dedup key)" || bad "P5-05 sched: cron cn key missing"
+SCHED_CYCLE_NOW=202609060001 TRIGGER_TODAY=20260906 scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0001" >/dev/null 2>&1
+[ "$(grep -c '^s_cr|' "$SCHED_EXEC_LOG")" -eq 1 ] && ok "P5-05 sched: cron not re-executed same day (cn_ key, cycle bypassed)" || bad "P5-05 sched: cron re-exec same day (count=$(grep -c '^s_cr|' "$SCHED_EXEC_LOG"))"
+
+# boot_completed：上下文=0 不执行；=1 首 tick 执行；再 tick 不重复（bc_ 键）
+rm -f "$SCHED_SF"
+: > "$SCHED_EXEC_LOG"
+SCHED_CYCLE_NOW=202609060700 TRIGGER_BOOT_COMPLETED_CONTEXT=0 TRIGGER_TODAY=20260906 \
+    scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0700" >/dev/null 2>&1
+grep -q '^s_bc|' "$SCHED_EXEC_LOG" && bad "P5-05 sched: boot_completed executed with context=0 (forbidden)" || ok "P5-05 sched: boot_completed not executed with context=0"
+SCHED_CYCLE_NOW=202609060701 TRIGGER_BOOT_COMPLETED_CONTEXT=1 TRIGGER_TODAY=20260906 \
+    scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0701" >/dev/null 2>&1
+grep -q '^s_bc|echo bootcomp-run$' "$SCHED_EXEC_LOG" && ok "P5-05 sched: boot_completed executed with context=1" || bad "P5-05 sched: boot_completed not executed (log=$(cat "$SCHED_EXEC_LOG"))"
+[ "$(TRIGGER_STATE_FILE="$SCHED_SF" tpr_trigger_state_read bc_s_bc)" = "20260906" ] && ok "P5-05 sched: boot_completed bc_s_bc=20260906 persisted (once key)" || bad "P5-05 sched: bc key missing"
+SCHED_CYCLE_NOW=202609060702 TRIGGER_BOOT_COMPLETED_CONTEXT=1 TRIGGER_TODAY=20260906 \
+    scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0702" >/dev/null 2>&1
+[ "$(grep -c '^s_bc|' "$SCHED_EXEC_LOG")" -eq 1 ] && ok "P5-05 sched: boot_completed not re-executed across ticks (bc_ key)" || bad "P5-05 sched: boot_completed re-exec (count=$(grep -c '^s_bc|' "$SCHED_EXEC_LOG"))"
 
 # ── §posix ────────────────────────────────────────────────────────────────
 if command -v dash >/dev/null 2>&1; then

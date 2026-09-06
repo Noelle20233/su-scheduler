@@ -6,14 +6,16 @@
 # 覆盖（P2-05 出口：新旧触发结果一致 + 触发逻辑单一正式入口）：
 #   1) 正式入口唯一：registry 任务经 trigger_decide（内部一律经
 #      provider_dispatch trigger <family> matches）——lib 中 dispatch-trigger
-#      调用恰 3 处（boot/time/advanced），且 trigger_decide 仅定义 1 次。
+#      调用恰 8 处（boot/time/advanced/oneshot/delay/interval/cron/bootcompleted，
+#      P5-05 新增 5 家族），且 trigger_decide 仅定义 1 次。
 #   2) boot / time / advanced 三家族决策正确（含 heredoc 块任务同触发器语义）。
 #   3) --run-once-now 保留：首扫即 due（cause=manual_exec）；零修剪（配置行
 #      原样——修剪动作仍归执行层）。
 #   4) --delete 保留：仅动作语义（本层零删行；action.delete=1 仍在任务镜像）。
 #   5) 既有去重状态保留：advanced 决策**只读**状态文件（决策前后逐字节不变）。
-#   6) 不引入 Dependency / Condition / 新 Trigger（lib §10 零 dependency/
-#      condition 判定；trigger 家族仅 boot/time/advanced）。
+#   6) 不引入 Dependency / Condition 门控（lib §10 零 dependency/condition
+#      判定）；P5-05 新增 trigger 家族（oneshot/delay/interval/cron/
+#      bootcompleted）已注册（计数断言见 §1）。
 #   7) 新旧触发结果一致：registry 侧（trigger_decide）vs legacy 行镜像
 #      （测试侧同 Provider 集合镜像）全量比对 → agree=Y。
 #   8) 接线：su-schedulerd 启动与主循环旁路块经 trigger_decide 旁路决策记录
@@ -47,8 +49,8 @@ SF="$T/state.txt"
 : > "$SF"
 
 # ── 1) 正式入口唯一（lib 级）──────────────────────────────────────────────
-n=$(grep -cE 'provider_dispatch trigger (boot|time|advanced) matches' "$RTLIB")
-[ "$n" -eq 3 ] && ok "P2-05 entry: provider_dispatch trigger called exactly 3x (boot/time/advanced)" || bad "P2-05 entry: dispatch trigger count=$n (expect 3)"
+n=$(grep -cE 'provider_dispatch trigger (boot|time|advanced|oneshot|delay|interval|cron|bootcompleted) matches' "$RTLIB")
+[ "$n" -eq 8 ] && ok "P2-05 entry: provider_dispatch trigger called exactly 8x (boot/time/advanced/oneshot/delay/interval/cron/bootcompleted)" || bad "P2-05 entry: dispatch trigger count=$n (expect 8)"
 [ "$(grep -c 'trigger_decide()' "$RTLIB")" -eq 1 ] && ok "P2-05 entry: trigger_decide defined exactly once (single formal entry)" || bad "P2-05 entry: trigger_decide count != 1"
 
 # ── 2) boot / time / advanced 决策（registry 任务）───────────────────────

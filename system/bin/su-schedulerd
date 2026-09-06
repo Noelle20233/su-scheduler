@@ -738,8 +738,14 @@ while true; do
     current_time=$(date "+%H%M")
 
     if [ "$RUNTIME_LOADED" -eq 1 ]; then
+        # P5-05：boot_completed 上下文（系统启动完成后置 1，一次检测保持；经前缀
+        # 变量注入 scheduler_tick → trigger_decide → bootcompleted Provider）
+        if [ "${BOOT_COMPLETED_CTX:-0}" != "1" ] && [ "$(getprop sys.boot_completed 2>/dev/null)" = "1" ]; then
+            BOOT_COMPLETED_CTX=1
+        fi
         # ⚙️ Registry 正式调度（P3-03）：TriggerProvider→ActionProvider→Supervisor
-        scheduler_tick "$DATA_DIR" "$CONFIG_FILE" "$TASKS_DIR" "$current_time" >/dev/null 2>&1
+        TRIGGER_BOOT_COMPLETED_CONTEXT=${BOOT_COMPLETED_CTX:-0} \
+            scheduler_tick "$DATA_DIR" "$CONFIG_FILE" "$TASKS_DIR" "$current_time" >/dev/null 2>&1
         # 🗺️ ID 映射随快照刷新（P2-04，幂等；不重命名旧运行目录）
         runtime_map_refresh "$DATA_DIR" "$TASKS_DIR" >/dev/null 2>&1
         # ⚙️ legacy 模式（无 MANAGED）保留 shadow 旁路比对（P2-03/P2-04）

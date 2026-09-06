@@ -513,6 +513,192 @@ tpr_trigger_advanced_next_due() {
     return 1
 }
 
+# ── P5-05 上下文助手（epoch 分钟 + schedule_state 读写）──────────────────────
+tpr_ctx_epoch_min() {   # → 当前 epoch 分钟（TRIGGER_EPOCH_MIN 可覆盖，测试确定性）
+    echo "${TRIGGER_EPOCH_MIN:-$(( $(date +%s) / 60 ))}"
+}
+tpr_trigger_state_read() {   # <key> → 值（缺失 → 空）
+    key=$1
+    sf=$(tpr_ctx_state_file)
+    [ -f "$sf" ] || return 1
+    grep "^${key}=" "$sf" 2>/dev/null | tail -1 | cut -d= -f2
+}
+tpr_trigger_state_write() {   # <key> <value> → 0（原子 tmp+mv：追加或更新 <key>=<value>）
+    key=$1; val=$2
+    sf=$(tpr_ctx_state_file)
+    mkdir -p "$(dirname "$sf")" 2>/dev/null
+    t="$sf.tmp.$$"
+    if [ -f "$sf" ] && grep -q "^${key}=" "$sf" 2>/dev/null; then
+        awk -v k="$key" -v v="$val" '{ if (index($0, k"=")==1) print k"="v; else print }' "$sf" > "$t" 2>/dev/null
+    else
+        [ -f "$sf" ] && cat "$sf" > "$t" 2>/dev/null
+        printf '%s=%s\n' "$key" "$val" >> "$t" 2>/dev/null
+    fi
+    mv "$t" "$sf" 2>/dev/null || { rm -f "$t" 2>/dev/null; return 1; }
+    return 0
+}
+
+# ── TriggerProvider: boot_completed（P5-05，系统启动完成后执行一次）──────────
+tpr_trigger_bootcompleted_validate() {
+    [ "$1" = "boot_completed" ] && return 0 || return 1
+}
+tpr_trigger_bootcompleted_parse() { echo "kind=bootcompleted"; }
+tpr_trigger_bootcompleted_matches() {
+    [ "${TRIGGER_BOOT_COMPLETED_CONTEXT:-0}" = "1" ] || return 1
+    tid=${TRIGGER_TASK_ID:-x}
+    sf=$(tpr_ctx_state_file)
+    if [ -f "$sf" ] && grep -qF "bc_${tid}=" "$sf" 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+tpr_trigger_bootcompleted_next_due() {
+    if tpr_trigger_bootcompleted_matches; then echo 0; return 0; fi
+    return 1
+}
+
+# ── TriggerProvider: oneshot（P5-05，HHMM 精确分钟一次）─────────────────────
+tpr_trigger_oneshot_validate() {
+    case "$1" in
+        oneshot:[0-9][0-9][0-9][0-9]) tcfg_trigger_extra_ok "$1" ;;
+        *) return 1 ;;
+    esac
+}
+tpr_trigger_oneshot_parse() {
+    echo "kind=oneshot;time=$(echo "$1" | cut -d: -f2)"
+}
+tpr_trigger_oneshot_matches() {
+    [ -n "$1" ] || return 1
+    [ "$(echo "$1" | cut -d: -f2)" = "$(tpr_ctx_now)" ] && return 0 || return 1
+}
+tpr_trigger_oneshot_next_due() {
+    if tpr_trigger_oneshot_matches "$1"; then echo 0; return 0; fi
+    return 1
+}
+
+# ── TriggerProvider: delay（P5-05，创建后延迟 N 分钟执行一次）────────────────
+tpr_trigger_delay_validate() {
+    case "$1" in
+        delay:*) tcfg_trigger_extra_ok "$1" ;;
+        *) return 1 ;;
+    esac
+}
+tpr_trigger_delay_parse() {
+    echo "kind=delay;minutes=$(echo "$1" | cut -d: -f2)"
+}
+tpr_trigger_delay_matches() {
+    [ -n "$1" ] || return 1
+    tid=${TRIGGER_TASK_ID:-x}
+    n=$(echo "$1" | cut -d: -f2)
+    now=$(tpr_ctx_epoch_min)
+    base=$(tpr_trigger_state_read "dl_$tid")
+    if [ -z "$base" ]; then
+        # 首轮：写入基准=当前 epoch 分钟，开始计时；本轮不执行
+        tpr_trigger_state_write "dl_$tid" "$now"
+        return 1
+    fi
+    [ "$(tpr_trigger_state_read "dlx_$tid")" = "1" ] && return 1
+    [ $((now - base)) -ge "$n" ] && return 0 || return 1
+}
+tpr_trigger_delay_next_due() {
+    if tpr_trigger_delay_matches "$1"; then echo 0; return 0; fi
+    return 1
+}
+
+# ── TriggerProvider: interval（P5-05，每 N 分钟重复）────────────────────────
+tpr_trigger_interval_validate() {
+    case "$1" in
+        interval:*) tcfg_trigger_extra_ok "$1" ;;
+        *) return 1 ;;
+    esac
+}
+tpr_trigger_interval_parse() {
+    echo "kind=interval;minutes=$(echo "$1" | cut -d: -f2)"
+}
+tpr_trigger_interval_matches() {
+    [ -n "$1" ] || return 1
+    tid=${TRIGGER_TASK_ID:-x}
+    n=$(echo "$1" | cut -d: -f2)
+    now=$(tpr_ctx_epoch_min)
+    last=$(tpr_trigger_state_read "iv_$tid")
+    if [ -z "$last" ]; then
+        return 0
+    fi
+    [ $((now - last)) -ge "$n" ] && return 0 || return 1
+}
+tpr_trigger_interval_next_due() {
+    if tpr_trigger_interval_matches "$1"; then echo 0; return 0; fi
+    return 1
+}
+
+# ── TriggerProvider: cron（P5-05，五段全匹配 + 日级去重；严格 AND）───────────
+tpr_trigger_cron_validate() {
+    case "$1" in
+        cron:*) tcfg_trigger_extra_ok "$1" ;;
+        *) return 1 ;;
+    esac
+}
+tpr_trigger_cron_parse() {
+    echo "kind=cron;spec=${1#cron:}"
+}
+tpr_trigger_cron_list_match() {   # <list> <value> → 0=列表含 value（逗号分隔）
+    tl_rest=$1; tl_v=$2
+    while :; do
+        case "$tl_rest" in
+            *,*) tl_item=${tl_rest%%,*}; tl_rest=${tl_rest#*,} ;;
+            *)   tl_item=$tl_rest; tl_rest="" ;;
+        esac
+        if [ "$tl_item" = "$tl_v" ]; then return 0; fi
+        [ -n "$tl_rest" ] || break
+    done
+    return 1
+}
+tpr_trigger_cron_field_match() {   # <field> <value> → 0=段匹配（* / */N / 列表 / 单数字）
+    tf_f=$1; tf_v=$2
+    case "$tf_f" in
+        '*') return 0 ;;
+        '*/'*)
+            tf_n=${tf_f#\*/}
+            case "$tf_n" in ''|*[!0-9]*) return 1 ;; esac
+            [ $((tf_v % tf_n)) -eq 0 ] && return 0 || return 1 ;;
+        *,*) tpr_trigger_cron_list_match "$tf_f" "$tf_v" ;;
+        *)
+            tf_fz=$(echo "$tf_f" | sed 's/^0*//'); [ -z "$tf_fz" ] && tf_fz=0
+            [ "$tf_fz" = "$tf_v" ] && return 0 || return 1 ;;
+    esac
+}
+tpr_trigger_cron_matches() {
+    [ -n "$1" ] || return 1
+    tid=${TRIGGER_TASK_ID:-x}
+    sf=$(tpr_ctx_state_file)
+    if [ -f "$sf" ] && grep -qF "cn_${tid}=" "$sf" 2>/dev/null; then
+        return 1
+    fi
+    param=${1#cron:}
+    tc_ifs=$IFS; IFS=' '
+    tc_f=$-; case "$tc_f" in *f*) ;; *) set -f ;; esac
+    set -- $param
+    IFS=$tc_ifs
+    case "$tc_f" in *f*) ;; *) set +f ;; esac
+    [ $# -eq 5 ] || return 1
+    now_min=$(tpr_ctx_date %M | sed 's/^0*//'); [ -z "$now_min" ] && now_min=0
+    now_hour=$(tpr_ctx_date %H | sed 's/^0*//'); [ -z "$now_hour" ] && now_hour=0
+    now_dom=$(tpr_ctx_date %d | sed 's/^0*//'); [ -z "$now_dom" ] && now_dom=0
+    now_mon=$(tpr_ctx_date %m | sed 's/^0*//'); [ -z "$now_mon" ] && now_mon=0
+    now_dow=$(tpr_ctx_date %u | sed 's/^0*//'); [ -z "$now_dow" ] && now_dow=0
+    now_dow=$((now_dow % 7))   # %u 1-7(Mon-Sun) → cron 0-6(Sun-Sat)；%u==7(Sun)→0
+    tpr_trigger_cron_field_match "$1" "$now_min" || return 1
+    tpr_trigger_cron_field_match "$2" "$now_hour" || return 1
+    tpr_trigger_cron_field_match "$3" "$now_dom" || return 1
+    tpr_trigger_cron_field_match "$4" "$now_mon" || return 1
+    tpr_trigger_cron_field_match "$5" "$now_dow" || return 1
+    return 0
+}
+tpr_trigger_cron_next_due() {
+    if tpr_trigger_cron_matches "$1"; then echo 0; return 0; fi
+    return 1
+}
+
 # ── ActionProvider: command（P1-08 全模式，镜像 execute_task）──────────────
 tpr_action_command_dir() { echo "${TPR_ACTION_DIR:-/tmp/su-scheduler-actions}/$1"; }
 tpr_action_command_validate() { [ -n "$1" ] && return 0 || return 1; }
@@ -648,6 +834,11 @@ tpr_recovery_builtin_recover() { echo "none"; return 0; }
 provider_register trigger boot     tpr_trigger_boot
 provider_register trigger time     tpr_trigger_time
 provider_register trigger advanced tpr_trigger_advanced
+provider_register trigger oneshot      tpr_trigger_oneshot
+provider_register trigger delay        tpr_trigger_delay
+provider_register trigger interval     tpr_trigger_interval
+provider_register trigger cron         tpr_trigger_cron
+provider_register trigger bootcompleted tpr_trigger_bootcompleted
 provider_register action command   tpr_action_command
 provider_register action app       tpr_action_app
 provider_register health builtin   tpr_health_builtin
@@ -1437,7 +1628,8 @@ runtime_map_lookup() {      # <base> <tasks_dir> <id>：双向自动识别
 #   - --delete：action.delete 仅是执行层动作语义，本层决策不含删除、不改配置；
 #   - 既有去重状态：advanced 家族只**读**状态文件（tpr_trigger_advanced_matches
 #     内部既有键检查）；键的**写**仍归 legacy 执行路径（本层零写入）。
-# 不引入：Dependency / Condition / 新 Trigger（仅 boot/time/advanced 三家族）。
+# 不引入：Dependency / Condition（P5-05 起新 Trigger 家族 oneshot/delay/
+# interval/cron/boot_completed 已注册并在下方 case 分流；仅 Managed 模式）。
 # ═══════════════════════════════════════════════════════════════════════════
 trigger_ctx_now()   { echo "${TRIGGER_DECISION_NOW:-$(date +%H%M)}"; }
 trigger_ctx_boot()  { echo "${TRIGGER_BOOT_CONTEXT:-0}"; }
@@ -1483,6 +1675,48 @@ trigger_decide() {
         boot)
             if TRIGGER_BOOT_CONTEXT=$boot provider_dispatch trigger boot matches >/dev/null 2>&1; then
                 echo "task=$tid|trigger=$trig|due=Y|cause=boot"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        boot_completed)
+            # P5-05：上下文经 daemon 主循环注入（TRIGGER_BOOT_COMPLETED_CONTEXT），
+            # 不复用第 4 参 boot（最小侵入；读环境变量默认 0）。
+            if TRIGGER_BOOT_COMPLETED_CONTEXT=${TRIGGER_BOOT_COMPLETED_CONTEXT:-0} \
+               TRIGGER_STATE_FILE=$sf TRIGGER_TASK_ID=$tid \
+               provider_dispatch trigger bootcompleted matches >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=boot_completed"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        oneshot:[0-9][0-9][0-9][0-9])
+            if TRIGGER_DECISION_NOW=$now provider_dispatch trigger oneshot matches "$trig" >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=oneshot"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        delay:*)
+            if TRIGGER_STATE_FILE=$sf TRIGGER_TASK_ID=$tid \
+               provider_dispatch trigger delay matches "$trig" >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=delay"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        interval:*)
+            if TRIGGER_STATE_FILE=$sf TRIGGER_TASK_ID=$tid \
+               provider_dispatch trigger interval matches "$trig" >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=interval"
+                return 0
+            fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        cron:*)
+            if TRIGGER_STATE_FILE=$sf TRIGGER_TASK_ID=$tid TRIGGER_TODAY=${TRIGGER_TODAY:-} \
+               provider_dispatch trigger cron matches "$trig" >/dev/null 2>&1; then
+                echo "task=$tid|trigger=$trig|due=Y|cause=cron"
                 return 0
             fi
             echo "task=$tid|trigger=$trig|due=N|cause="
@@ -3478,10 +3712,27 @@ sched_advance_waiting() {
             [ -d "$run_dir" ] && cp "$tf" "$run_dir/task.v2" 2>/dev/null
             ron=$(sched_task_field "$tf" action.run_once_now)
             del=$(sched_task_field "$tf" action.delete)
+            # P5-05：interval/delay/cron/boot_completed last-run 键在自删前更新（任务删后键无意义）
+            case "$trig" in
+                interval:*)
+                    TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                        tpr_trigger_state_write "iv_$id" "$(tpr_ctx_epoch_min)" ;;
+                delay:*)
+                    TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                        tpr_trigger_state_write "dlx_$id" "1" ;;
+                cron:*)
+                    TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                        tpr_trigger_state_write "cn_$id" "$(TRIGGER_TODAY=${TRIGGER_TODAY:-} tpr_ctx_date %Y%m%d)" ;;
+                boot_completed)
+                    TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                        tpr_trigger_state_write "bc_$id" "$(tpr_ctx_date %Y%m%d)" ;;
+            esac
             if [ "$del" = "1" ]; then
                 sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
             elif [ "$ron" = "1" ]; then
                 sched_prune_ron "$base" "$config" "$id" >/dev/null 2>&1
+            elif case "$trig" in oneshot:*) true ;; *) false ;; esac; then
+                sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
             fi
             sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=start|rc=$arc|mode=$(sched_source_mode "$base")"
             return 0
@@ -3595,10 +3846,27 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     fi
     ron=$(sched_task_field "$tf" action.run_once_now)
     del=$(sched_task_field "$tf" action.delete)
+    # P5-05：interval/delay/cron/boot_completed last-run 键在自删前更新（任务删后键无意义）
+    case "$trig" in
+        interval:*)
+            TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                tpr_trigger_state_write "iv_$id" "$(tpr_ctx_epoch_min)" ;;
+        delay:*)
+            TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                tpr_trigger_state_write "dlx_$id" "1" ;;
+        cron:*)
+            TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                tpr_trigger_state_write "cn_$id" "$(TRIGGER_TODAY=${TRIGGER_TODAY:-} tpr_ctx_date %Y%m%d)" ;;
+        boot_completed)
+            TRIGGER_STATE_FILE="$base/schedule_state.txt" TRIGGER_TASK_ID="$id" \
+                tpr_trigger_state_write "bc_$id" "$(tpr_ctx_date %Y%m%d)" ;;
+    esac
     if [ "$del" = "1" ]; then
         sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
     elif [ "$ron" = "1" ]; then
         sched_prune_ron "$base" "$config" "$id" >/dev/null 2>&1
+    elif case "$trig" in oneshot:*) true ;; *) false ;; esac; then
+        sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
     fi
     sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del"
     return "$arc"
