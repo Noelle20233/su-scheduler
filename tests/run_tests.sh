@@ -70,6 +70,10 @@
 #       权威校验、非法拒绝且原文件逐字节不变、依赖图未知/自依赖/环拒绝、
 #       前向引用允许、Optional 参与环校验、apply/set/import/snapshot 接入、
 #       Legacy 零影响、POSIX）
+#   L2  tests/p5-condition/test.sh P5-02 Condition 运算符扩展语法冻结（新运算符
+#       < > <= >=（仅 time.*）/ contains（仅 task.state/env.*）适用矩阵、类型与
+#       空值/非法值语义、注入面新规则；positive/negative/positive-p5 fixtures；
+#       生产代码零改动，新运算符实现与既有断言反转归 P5-03）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -192,6 +196,7 @@ else
         "tests/resource/stress.sh" \
         "tests/p3-integration/test.sh" \
         "tests/p4-dependency/test.sh" \
+        "tests/p5-condition/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"

@@ -1,0 +1,10 @@
+{{ time.hour == 8 }}
+{{ time.hour != 23 }}
+{{ time.minute == 30 }}
+{{ time.wday == 0 }}
+{{ time.wday != 6 }}
+{{ task.state(task_a) == RUNNING }}
+{{ task.state(task_b) != FAILED }}
+{{ env.CONFIG_FILE == /sdcard/Documents/su-scheduler/config.txt }}
+{{ env.TASKS_DIR == /data/adb/su-scheduler/tasks }}
+{{ file.exists(/data/adb/su-scheduler/tasks) }}

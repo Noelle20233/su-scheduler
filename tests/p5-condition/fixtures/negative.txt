@@ -1,0 +1,25 @@
+{{ time.hour == 8; rm -rf / }}  # 注入：; 命令拼接
+{{ time.hour == $(id) }}  # 注入：$() 命令替换
+{{ time.hour == `id` }}  # 注入：反引号命令替换
+{{ task.state(x) == RUNNING & } }  # 注入：& 后台符 + 包裹破损
+{{ time.hour == 8 | cat }}  # 注入：管道到命令
+{{ sh -c id }}  # 注入：sh -c 执行
+{{ time.hour == 8 < /etc/passwd }}  # 注入：输入重定向
+{{ time.hour < }}  # 类型/越界：运算符后无右值（且 < 当前为注入字符）
+{{ time.hour > }}  # 类型/越界：运算符后无右值（且 > 当前为注入字符）
+{{ time.hour <= 99 }}  # 越界：hour 上限 23（且 < 当前为注入字符）
+{{ time.hour >= 24 }}  # 越界：hour 上限 23（且 > 当前为注入字符）
+{{ time.minute > 60 }}  # 越界：minute 上限 59（且 > 当前为注入字符）
+{{ time.minute < -1 }}  # 越界：负数非法（且 < 当前为注入字符）
+{{ time.wday >= 7 }}  # 越界：wday 上限 6（且 > 当前为注入字符）
+{{ time.hour contains 8 }}  # 适用矩阵：time.* 无 contains
+{{ task.state(x) < RUNNING }}  # 运算符误用：task.state 无序关系
+{{ task.state(x) >= STOPPED }}  # 运算符误用：task.state 无 >=
+{{ env.CONFIG_FILE > /etc }}  # 运算符误用：env.* 无序关系
+{{ env.DATA_DIR <= /data }}  # 运算符误用：env.* 无 <=
+{{ env.HOME == /root }}  # 未授权 env：HOME 不在 COND_ENV_ALLOW
+{{ foo >= 1 }}  # 未知谓词 + 注入 >
+time.hour == 8  # 未包裹：缺 {{ }}
+{{ }}  # 空表达式：包裹内为空
+{{ task.state() == RUNNING }}  # 空 id：task.state() 无任务 id
+{{ task.state(x) == SLEEPING }}  # 非法 STATE：SLEEPING 不在 11 态

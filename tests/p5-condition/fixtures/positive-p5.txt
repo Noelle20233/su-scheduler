@@ -1,0 +1,12 @@
+{{ time.hour < 8 }}
+{{ time.hour > 8 }}
+{{ time.hour <= 8 }}
+{{ time.hour >= 8 }}
+{{ time.minute < 30 }}
+{{ time.minute >= 45 }}
+{{ time.wday > 0 }}
+{{ time.wday <= 5 }}
+{{ task.state(task_a) contains RUNN }}
+{{ task.state(task_b) contains FAIL }}
+{{ env.CONFIG_FILE contains su-scheduler }}
+{{ env.DATA_DIR contains adb }}
