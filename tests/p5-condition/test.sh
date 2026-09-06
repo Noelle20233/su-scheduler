@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════════════
-# test.sh — P5-02 Condition 运算符扩展语法冻结（tests/p5-condition）
+# test.sh — P5-03 Condition 运算符实现验收（tests/p5-condition；P5-02 冻结语法，§pos5-active 反转）
 # ═══════════════════════════════════════════════════════════════════════════
 # 判定（AGENTS §4）：每项 [PASS]/[FAIL]；出现 [FAIL] → exit 非 0。
 # 覆盖（P5-02 交付，docs/P5-02.md §6；语法决策 docs/P5-02.md §3/§4 与
@@ -15,9 +15,9 @@
 #   §boundary       cond_eval 对 negative.txt 前 5 条返回 rc=2（运行期非法防御）；
 #                   COND_MAX_LEN 边界：256 字符通过 / 257 字符被 cond_validate 拒绝
 #                   （参照 p4-dependency cond-max 用例）；
-#   §pos5-notactive positive-p5.txt（P5-03 实现目标登记）当前被 cond_grammar_ok
-#                   拒绝——生产未实现新运算符，这是预期，如实记录为 P5-03 反转点；
-#                   若某行当前意外通过 → FAIL。
+#   §pos5-active    positive-p5.txt（P5-03 < > <= >= 数值域 / contains 字符串域）全部
+#                   经 cond_grammar_ok 通过（FAIL→PASS 门禁，P5-02 §5 反转清单正式
+#                   执行）；若某行当前意外被拒 → FAIL。
 # 本套件**零生产改动**：只读 source Runtime 库（`. ./$RTLIB`，TCFG_DIR 先 export
 #   隔离，同 p4-dependency/test.sh），只调用纯函数 cond_grammar_ok/cond_validate/
 #   cond_eval（文法校验无副作用，不写文件、不读任务状态）。
@@ -135,15 +135,15 @@ cond_validate "$LONG257" \
     && bad "P5-02 boundary: cond_validate 257 chars accepted (must reject)" \
     || ok "P5-02 boundary: cond_validate 257 chars rejected (> COND_MAX_LEN)"
 
-# ── §pos5-notactive：P5-03 实现目标登记，当前拒绝即预期（反转点）────────
-# 生产未实现 < > <= >= contains → 下列冻结语法表达式当前被拒是**如实反映**。
-# P5-03 实现后本段将从「拒绝」转「接受」（FAIL→PASS 门禁锚点）。
+# ── §pos5-active：P5-03 新运算符（< > <= >= 数值域 / contains 字符串域）────────
+# P5-03 已实现；positive-p5.txt 全部表达式现在必须被接受（FAIL→PASS 门禁锚点，
+# P5-02 §5 反转清单正式执行）。任何一行被拒 → FAIL（打印表达式便于定位）。
 while IFS= read -r line; do
     [ -n "$line" ] || continue
     if cond_grammar_ok "$line"; then
-        bad "P5-02 pos5-notactive: '$line' unexpectedly ACCEPTED (P5-03 新运算符未实现，当前应拒绝)"
+        ok "P5-03 pos5-active: '$line' accepted"
     else
-        ok "P5-02 pos5-notactive: '$line' rejected (P5-03 反转点)"
+        bad "P5-03 pos5-active: '$line' REJECTED (must accept)"
     fi
 done < "$P5POS"
 

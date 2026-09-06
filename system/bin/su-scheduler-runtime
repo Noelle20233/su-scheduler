@@ -4644,7 +4644,7 @@ tcfg_editor_validate_payload() {   # <content>
             condition)
                 cond_validate "$tedv_val" || { echo "[editor] ERROR: condition invalid (got '$tedv_val'; printable ASCII, <= $COND_MAX_LEN chars)" >&2; tedv_err=1; }
                 if [ -n "$tedv_val" ] && ! cond_grammar_ok "$tedv_val"; then
-                    echo "[editor] ERROR: condition expression illegal (got '$tedv_val'; whitelisted predicates only: task.state/time.hour/time.minute/time.wday/env.<CONFIG_FILE|DATA_DIR|TASKS_DIR>/file.exists, ops ==/!=)" >&2; tedv_err=1
+                    echo "[editor] ERROR: condition expression illegal (got '$tedv_val'; whitelisted predicates only: task.state/time.hour/time.minute/time.wday/env.<CONFIG_FILE|DATA_DIR|TASKS_DIR>/file.exists, ops ==/!=/</>/<=/>=/contains)" >&2; tedv_err=1
                 fi ;;
             source.*|runtime.*) : ;;   # 只读保留字段（编辑器不可改）
             *) echo "[editor] ERROR: unknown key '$tedv_key' (editor schema)" >&2; tedv_err=1 ;;
@@ -5252,8 +5252,10 @@ cond_validate() {
 #                                       TASKS_DIR（其余 env.<X> → 非法拒绝）
 #   file.exists(<绝对路径>)             文件存在性；路径仅允许 CONFIG_FILE 同目录 或
 #                                       DATA_DIR 下；禁止 `..`/`//` 穿越；只读探测
-# 比较运算符（P4-06 决策，勿改）：`==`（等于）/ `!=`（不等于）两个即可；`<`/`>`/
-# `>=`/`<=`/`contains` 不在 P4-06 范围（P5 可扩）。
+# 比较运算符（P4-06 起 `==`/`!=`；P5-03 D38 扩展，勿改）：
+#   - 数值域 time.hour/minute/wday：`==`/`!=`/`<`/`>`/`<=`/`>=`（纯数字+去前导零+范围校验）
+#   - 字符串域 task.state/env.*：`==`/`!=`/`contains`（contains 子串匹配，右值安全字符集）
+#   - file.exists 无比较运算符（存在即真）；contains 对 time.* 拒绝（适用矩阵 D38/D39）。
 # 三态语义：cond_eval rc 0=真 1=假 2=非法。
 #   - 校验期：cond_grammar_ok 只做文法/白名单/越界/注入检查（不读文件、不读状态），
 #     用于 tcfg/editor/apply/set/import 写路径——非法 → 写盘前拒绝，旧配置逐字节
@@ -5325,15 +5327,18 @@ cond_grammar_ok() {
     [ -n "$conde_expr" ] || return 1
     conde_in=$(conde_inner "$conde_expr") || return 1
     [ -n "$conde_in" ] || return 1
-    # 顶层注入面：单谓词表达式内不得出现命令拼接痕迹（防御，与下文字符集双保险）
+    # 顶层注入面：单谓词表达式内不得出现命令拼接痕迹（防御，与下文字符集双保险）。
+    # P5-03：`<`/`>` 现为合法数值比较运算符 token（D38），不再在顶层整体拒绝，
+    # 改为按字段位置判定（conde_op 运算符白名单 + conde_l/conde_r 注入复查）。
     case "$conde_in" in
-        *";"*|*'`'*|*"\$("*|*"sh -c"*|*"|"*|*"&"*|*">"*|*"<"*) return 1 ;;
+        *";"*|*'`'*|*"\$("*|*"sh -c"*|*"|"*|*"&"*) return 1 ;;
     esac
     conde_oldifs=$IFS; IFS=' '
     set -- $conde_in
     IFS=$conde_oldifs
     conde_l=$1; conde_op=${2:-}; conde_r=${3:-}
     [ -n "$conde_l" ] || return 1
+    [ $# -le 3 ] || return 1   # P5-03：单谓词至多三字段（拒多余 token 混入，防 `</>` 注入位）
     case "$conde_l" in
         task.state\(*\))
             # P4-11：`${var#task.state(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开
@@ -5341,11 +5346,18 @@ cond_grammar_ok() {
             conde_id=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)
             [ "$conde_l" = "task.state($conde_id)" ] || return 1   # 精确包裹（拒多余 `)`）
             secv_id_ok "$conde_id" || return 1
-            [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
-            conde_state_ok "$conde_r" || return 1
+            case "$conde_op" in
+                ==|!=) conde_state_ok "$conde_r" || return 1 ;;
+                contains) conde_charset_ok "$conde_r" || return 1 ;;   # D39：非空+安全字符集
+                *) return 1 ;;
+            esac
             ;;
         time.hour|time.minute|time.wday)
-            [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
+            # D38：数值比较运算符白名单（== != < > <= >=）；contains 拒绝（D39 适用矩阵）
+            case "$conde_op" in
+                ==|!=|'<'|'>'|'<='|'>=') ;;
+                *) return 1 ;;
+            esac
             case "$conde_r" in
                 ''|*[!0-9]*) return 1 ;;
             esac
@@ -5359,8 +5371,11 @@ cond_grammar_ok() {
         env.*)
             conde_name=${conde_l#env.}
             case " $COND_ENV_ALLOW " in *" $conde_name "*) ;; *) return 1 ;; esac   # 未授权 env
-            [ "$conde_op" = "==" ] || [ "$conde_op" = "!=" ] || return 1
-            conde_charset_ok "$conde_r" || return 1
+            # D38：== != contains（字符串域）；右值非空 + 安全字符集
+            case "$conde_op" in
+                ==|!=|contains) [ -n "$conde_r" ] && conde_charset_ok "$conde_r" || return 1 ;;
+                *) return 1 ;;
+            esac
             ;;
         file.exists\(*\))
             # P4-11：`${var#file.exists(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开
@@ -5405,11 +5420,11 @@ cond_eval() {
             # （Android 16 mksh 解析失败 → Runtime 库 source 失败）→ 改可移植 cut 切分
             conde_id=$(printf '%s' "$conde_l" | cut -d'(' -f2 | cut -d')' -f1)
             conde_cur=$(runtime_current_state "$conde_tasks/$conde_id" 2>/dev/null)
-            if [ "$conde_op" = "==" ]; then
-                [ "$conde_cur" = "$conde_r" ] && return 0 || return 1
-            else
-                [ "$conde_cur" != "$conde_r" ] && return 0 || return 1
-            fi
+            case "$conde_op" in
+                ==)        [ "$conde_cur" = "$conde_r" ] && return 0 || return 1 ;;
+                !=)        [ "$conde_cur" != "$conde_r" ] && return 0 || return 1 ;;
+                contains)  case "$conde_cur" in *"$conde_r"*) return 0 ;; *) return 1 ;; esac ;;
+            esac
             ;;
         time.hour|time.minute|time.wday)
             case "$conde_l" in
@@ -5419,11 +5434,14 @@ cond_eval() {
             esac
             conde_curn=$(conde_unzero "$conde_cur")
             conde_rn=$(conde_unzero "$conde_r")
-            if [ "$conde_op" = "==" ]; then
-                [ "$conde_curn" -eq "$conde_rn" ] 2>/dev/null && return 0 || return 1
-            else
-                [ "$conde_curn" -ne "$conde_rn" ] 2>/dev/null && return 0 || return 1
-            fi
+            case "$conde_op" in
+                ==) [ "$conde_curn" -eq "$conde_rn" ] 2>/dev/null && return 0 || return 1 ;;
+                !=) [ "$conde_curn" -ne "$conde_rn" ] 2>/dev/null && return 0 || return 1 ;;
+                '<') [ "$conde_curn" -lt "$conde_rn" ] 2>/dev/null && return 0 || return 1 ;;
+                '>') [ "$conde_curn" -gt "$conde_rn" ] 2>/dev/null && return 0 || return 1 ;;
+                '<=') [ "$conde_curn" -le "$conde_rn" ] 2>/dev/null && return 0 || return 1 ;;
+                '>=') [ "$conde_curn" -ge "$conde_rn" ] 2>/dev/null && return 0 || return 1 ;;
+            esac
             ;;
         env.*)
             conde_name=${conde_l#env.}
@@ -5435,11 +5453,11 @@ cond_eval() {
                 TASKS_DIR)   conde_val=${TASKS_DIR:-$conde_datadir/tasks} ;;
                 *) echo "condition illegal (env not allowed)"; return 2 ;;
             esac
-            if [ "$conde_op" = "==" ]; then
-                [ "$conde_val" = "$conde_r" ] && return 0 || return 1
-            else
-                [ "$conde_val" != "$conde_r" ] && return 0 || return 1
-            fi
+            case "$conde_op" in
+                ==)        [ "$conde_val" = "$conde_r" ] && return 0 || return 1 ;;
+                !=)        [ "$conde_val" != "$conde_r" ] && return 0 || return 1 ;;
+                contains)  case "$conde_val" in *"$conde_r"*) return 0 ;; *) return 1 ;; esac ;;
+            esac
             ;;
         file.exists\(*\))
             # P4-11：`${var#file.exists(}`/`${var%)}` 为 mksh `(`-in-pattern 参数展开

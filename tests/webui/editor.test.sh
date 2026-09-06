@@ -217,8 +217,8 @@ r=$(send_req "dp4" "dp4|EDIT_TASK|id=$(ipc_b64enc task_dc)&payload=$(ipc_b64enc 
 CYC=$(printf '%s\n' "$DEPPAYLOAD" | sed 's/^advanced.logging=.*/dependency=task_dc/')
 r=$(send_req "dp5" "dp5|EDIT_TASK|id=$(ipc_b64enc task_dep1)&payload=$(ipc_b64enc "$CYC")")
 [ "$(resp_rc "$r")" = "4" ] && ok "P4-08 depcond: dependency cycle -> configuration_invalid (rc 4)" || bad "P4-08 depcond: cycle rc=$(resp_rc "$r")"
-# 3) 非法 condition 文法（>= 运算符不在白名单）
-CONDBAD=$(printf '%s\n' "$DC" | sed 's/^condition=.*/condition={{ time.hour >= 8 }}/')
+# 3) 非法 condition 文法（P5-03 反转：`>=` 已合法 → 改用越界数值 hour>=24，仍非法）
+CONDBAD=$(printf '%s\n' "$DC" | sed 's/^condition=.*/condition={{ time.hour >= 24 }}/')
 r=$(send_req "dp6" "dp6|EDIT_TASK|id=$(ipc_b64enc task_dc)&payload=$(ipc_b64enc "$CONDBAD")")
 [ "$(resp_rc "$r")" = "4" ] && ok "P4-08 depcond: illegal condition grammar -> configuration_invalid (rc 4)" || bad "P4-08 depcond: cond rc=$(resp_rc "$r")"
 # 原子性：全部失败编辑后 task-config 快照逐字节一致

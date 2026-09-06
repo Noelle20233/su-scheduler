@@ -173,6 +173,8 @@ rc=$(req_rc "scr1")
 # ── P4-06 Condition 表达式注入：校验期拒绝，零副作用、零执行 ────────────
 # condition 是受限表达式（{{ 谓词 }}）；注入串 / 未授权谓词 / 越界 / 穿越 → VALIDATE_TASK
 # 拒绝（rc 4），且绝不进入 shell 求值路径（EXEC_LOG 零新增）。
+# P5-03 反转：`>=` 运算符已合法，不再作为注入样例；改为「合法运算符 + 命令拼接」注入
+# 形态（`{{ ... }}; rm -rf /`），任何语法下都必须被拒绝。
 cond_inj_cases=(
   "{{ task.state(x) = Y; rm -rf / }}"
   '$(id)'
@@ -180,7 +182,7 @@ cond_inj_cases=(
   '{{ env.HOME == /root }}'
   '{{ time.hour == 99 }}'
   '{{ file.exists(/etc/passwd) }}'
-  '{{ time.hour >= 8 }}'
+  '{{ time.hour >= 8 }}; rm -rf /'
   'sh -c id'
 )
 cid=0

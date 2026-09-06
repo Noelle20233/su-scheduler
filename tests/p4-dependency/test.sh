@@ -655,7 +655,7 @@ grep -q 'echo T4' "$Q_EXEC" && bad "P4-06 Q: task.state(==PENDING) on FAILED wro
 # 写路径非法 condition → rc 非 0 且原文件逐字节不变（原子性 B9）
 cond_task q_r1 09:00 "{{ time.hour == 8 }}" "echo R"
 Q_R1_MD5=$(md5sum "$Q_TCFG/q_r1.task" | cut -d' ' -f1)
-for bad in '{{ time.hour >= 8 }}' '{{ time.hour == 99 }}' '{{ time.minute == 60 }}' \
+for bad in '{{ time.hour >= 24 }}' '{{ time.hour == 99 }}' '{{ time.minute == 60 }}' \
            '{{ time.wday == 7 }}' '{{ env.HOME == /root }}' '{{ env.CONFIG_FILE == a;b }}' \
            '{{ task.state(q_dep) == RUNNING }}; rm -rf /' 'x }; pwd' '$(id)' '`id`' \
            '{{ file.exists(../etc/passwd) }}' '{{ file.exists(/etc/passwd) }}' \
@@ -718,14 +718,24 @@ else
     ok "P4-06 T: file.exists path traversal rejected (validated lexical, no side effect)"
 fi
 
-# U) 运算符 ==/!= 合法；其它运算符（< > >= <= contains）→ 校验期拒绝（已含 §R）
+# U) 运算符 ==/!= 合法；数值域 < > <= >= 合法（P5-03）；contains 仅字符串域合法
+#    （time.* 无 contains，D39 适用矩阵 → 仍拒绝；env.*/task.state contains → 接受）
 cond_task q_u 09:00 "{{ time.hour != 23 }}" "echo U"
 SCHED_CYCLE_NOW=202609040900 qtick 0900
 grep -q 'echo U' "$Q_EXEC" && ok "P4-06 U: '!=' operator valid → executed (hour=09 != 23 true)" || bad "P4-06 U: != not executed"
-if tcfg_set_field q_r1 condition "{{ time.hour contains 8 }}" >/dev/null 2>&1; then
-    bad "P4-06 U: unsupported 'contains' operator accepted"
+# 字符串域 contains 合法（P5-02 §5 反转清单正式执行）：env.* / task.state 子串匹配
+cond_task q_uc 09:00 "{{ env.CONFIG_FILE contains su-scheduler }}" "echo UC"
+if tcfg_set_field q_uc condition "{{ env.CONFIG_FILE contains su-scheduler }}" >/dev/null 2>&1 \
+   && tcfg_set_field q_uc condition "{{ task.state(q_dep) contains RUN }}" >/dev/null 2>&1; then
+    ok "P4-06 U: string-domain 'contains' accepted (env.* and task.state)"
 else
-    ok "P4-06 U: unsupported operator 'contains' rejected (== / != only)"
+    bad "P4-06 U: string-domain 'contains' rejected (must accept)"
+fi
+# 数值域 contains 仍非法（适用矩阵：time.* 无 contains）→ 校验期拒绝
+if tcfg_set_field q_r1 condition "{{ time.hour contains 8 }}" >/dev/null 2>&1; then
+    bad "P4-06 U: time.* 'contains' accepted (must reject)"
+else
+    ok "P4-06 U: time.* 'contains' rejected (numeric domain has no contains)"
 fi
 
 # ── §retry-p4-07：Supervisor/Recovery/Retry 联动（FAILED>WAITING 退避接线）────
