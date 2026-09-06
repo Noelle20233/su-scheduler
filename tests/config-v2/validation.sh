@@ -5,7 +5,8 @@
 # 判定（AGENTS §4）：每项 [PASS]/[FAIL]；出现 [FAIL] → exit 非 0。
 # 覆盖：
 #   §id      ID 路径穿越/字符集拒绝；
-#   §enum    trigger 枚举（未实现族拒绝）+ action/health/recovery 枚举；
+#   §enum    trigger 枚举（P5-04 反转：合法格式全接受含新家族 + 非法格式全拒绝）
+#            + action/health/recovery 枚举；
 #   §app     App Action 注入全部拒绝（复用 P2-10 安全门）；
 #   §script  recovery/action script 绝对路径且可读；
 #   §num     全部数值范围钳制（retry/advanced）；
@@ -71,14 +72,16 @@ tcfg_editor_id_ok 'bad space' && bad "P3-06 id: space allowed" || ok "P3-06 id: 
 tcfg_editor_id_ok '' && bad "P3-06 id: empty allowed" || ok "P3-06 id: empty rejected"
 
 # ── §enum：trigger 枚举 ───────────────────────────────────────────────────
-for t in boot '08:30' '0830' 'weekly:1:0800' 'nweekly:2:5:1400' 'monthly:01:0000' 'nmonthly:3:15:1200' 'yearly:12:25:0800'; do
+# P5-04 反转（docs/P5-04.md §4）：boot_completed/oneshot/delay/interval/cron
+# 已实现为合法 Trigger 家族（校验层冻结，接线在 P5-05）；仅非法格式拒绝。
+for t in boot '08:30' '0830' 'weekly:1:0800' 'nweekly:2:5:1400' 'monthly:01:0000' 'nmonthly:3:15:1200' 'yearly:12:25:0800' 'boot_completed' 'oneshot:0830' 'delay:30' 'interval:60' 'cron:0 8 * * *'; do
     tcfg_editor_trigger_ok "$t" || { bad "P3-06 enum: implemented trigger rejected: $t"; }
 done
-ok "P3-06 enum: all implemented trigger families accepted"
-for t in 'boot_completed' 'delay' 'interval' 'cron:0 8 * * *' 'oneshot'; do
-    if tcfg_editor_trigger_ok "$t"; then bad "P3-06 enum: unimplemented trigger allowed: $t"; fi
+ok "P3-06 enum: all implemented trigger families accepted (incl. P5-04 new families)"
+for t in 'bootx' 'oneshot:2460' 'oneshot:ab' 'delay:0' 'delay:1441' 'delay:abc' 'interval:0' 'interval:x' 'cron:60 * * * *' 'cron:* * * *' 'cron:*/0 * * * *' 'cron:a * * * *'; do
+    if tcfg_editor_trigger_ok "$t"; then bad "P3-06 enum: invalid trigger allowed: $t"; fi
 done
-ok "P3-06 enum: unimplemented triggers rejected"
+ok "P3-06 enum: invalid triggers rejected (P5-04 schema)"
 
 # ── §app：App Action 注入全部拒绝（复用 P2-10）──────────────────────────
 for bad in \
@@ -128,7 +131,7 @@ rc=$?
 
 # 非法 payload → rc=1，不写盘，旧配置不变
 MD5_BEFORE=$(md5sum "$TCFG_DIR/task_v.task" | cut -d' ' -f1)
-BAD_PAYLOAD=$(printf 'schema_version=2\nid=task_v\ntrigger=boot_completed\naction.type=command\naction.command=echo x\n')
+BAD_PAYLOAD=$(printf 'schema_version=2\nid=task_v\ntrigger=bootx\naction.type=command\naction.command=echo x\n')
 tcfg_apply_task task_v "$BAD_PAYLOAD" >/dev/null 2>&1
 rcb=$?
 [ "$rcb" -eq 1 ] && ok "P3-06 atomic: invalid apply rc=1" || bad "P3-06 atomic: invalid rc=$rcb"
@@ -142,8 +145,10 @@ tcfg_apply_task task_v "$MISMATCH" >/dev/null 2>&1 && bad "P3-06 atomic: payload
 # 绕过前端直接提交非法 payload（路径穿越 id / 未实现 trigger / 越界数值）→ 后端仍拒
 BAD1=$(printf 'schema_version=2\nid=../../etc/passwd\ntrigger=boot\naction.type=command\naction.command=echo x\n')
 if tcfg_editor_validate_payload "$BAD1"; then bad "P3-06 back: path traversal id passed backend"; else ok "P3-06 back: path traversal id rejected by backend"; fi
-BAD2=$(printf 'schema_version=2\nid=t2\ntrigger=cron:0 8 * * *\naction.type=command\naction.command=echo x\n')
-if tcfg_editor_validate_payload "$BAD2"; then bad "P3-06 back: unimplemented trigger passed backend"; else ok "P3-06 back: unimplemented trigger rejected by backend"; fi
+BAD2=$(printf 'schema_version=2\nid=t2\ntrigger=cron:60 * * * *\naction.type=command\naction.command=echo x\n')
+if tcfg_editor_validate_payload "$BAD2"; then bad "P3-06 back: invalid trigger passed backend"; else ok "P3-06 back: invalid trigger rejected by backend"; fi
+GOOD2=$(printf 'schema_version=2\nid=t2\ntrigger=cron:0 8 * * *\naction.type=command\naction.command=echo x\n')
+if tcfg_editor_validate_payload "$GOOD2"; then ok "P3-06 back: valid new-family trigger accepted by backend"; else bad "P3-06 back: valid cron trigger rejected"; fi
 BAD3=$(printf 'schema_version=2\nid=t3\ntrigger=boot\naction.type=command\naction.command=echo x\nretry.max=999\n')
 if tcfg_editor_validate_payload "$BAD3"; then bad "P3-06 back: out-of-range retry passed backend"; else ok "P3-06 back: out-of-range retry rejected by backend"; fi
 # 杂散行（非 key=value）被 lenient 跳过，不影响整体校验（schema 宽容原则）

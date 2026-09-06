@@ -130,10 +130,10 @@ dec=$(ipc_b64dec "$back")
     && ok "P3-06 save: GET_TASK_EDIT round-trips full task" || bad "P3-06 save: round-trip mismatch rc=$rc"
 
 # ── §reject：非法 Task 无法保存 ─────────────────────────────────────────
-BAD1=$(printf 'schema_version=2\nid=task_bad\ntrigger=cron:0 8 * * *\naction.type=command\naction.command=echo x\n')
+BAD1=$(printf 'schema_version=2\nid=task_bad\ntrigger=cron:60 * * * *\naction.type=command\naction.command=echo x\n')
 r=$(send_req "re1" "re1|EDIT_TASK|id=$(ipc_b64enc task_bad)&payload=$(ipc_b64enc "$BAD1")")
 rc=$(resp_rc "$r")
-[ "$rc" = "4" ] && [ ! -f "$TCFG_DIR/task_bad.task" ] && ok "P3-06 reject: unimplemented trigger -> rc4, not persisted" || bad "P3-06 reject: rc=$rc"
+[ "$rc" = "4" ] && [ ! -f "$TCFG_DIR/task_bad.task" ] && ok "P3-06 reject: invalid trigger -> rc4, not persisted" || bad "P3-06 reject: rc=$rc"
 BAD2=$(printf 'schema_version=2\nid=../../etc\ntrigger=boot\naction.type=command\naction.command=echo x\n')
 r=$(send_req "re2" "re2|EDIT_TASK|id=$(ipc_b64enc '../../etc')&payload=$(ipc_b64enc "$BAD2")")
 rc=$(resp_rc "$r")

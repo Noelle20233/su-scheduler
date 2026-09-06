@@ -4541,19 +4541,90 @@ tcfg_editor_id_ok() {   # <id> → 0=合法（charset + 无路径穿越）
     esac
     return 0
 }
-tcfg_editor_trigger_ok() {   # <trigger> → 0=已实现合法触发器（拒绝未实现族）
+tcfg_editor_trigger_ok() {   # <trigger> → 0=已实现合法触发器（拒绝未实现族/非法格式）
     case "$1" in
         boot) return 0 ;;
+        boot_completed) return 0 ;;                              # P5-04 D41
         [0-9][0-9]:[0-9][0-9]) return 0 ;;
         [0-9][0-9][0-9][0-9]) return 0 ;;
+        oneshot:[0-9][0-9][0-9][0-9]) ;;                        # P5-04 D41（range 在 helper 校验）
+        delay:*) ;;                                              # P5-04 D41（落 helper 数值校验）
+        interval:*) ;;                                           # P5-04 D41（落 helper 数值校验）
+        cron:*) ;;                                               # P5-04 D41（落 helper cron 校验）
         weekly:[1-7]:[0-9][0-9][0-9][0-9]) return 0 ;;
         nweekly:[0-9]*:[1-7]:[0-9][0-9][0-9][0-9]) return 0 ;;
         monthly:[0-9]*:[0-9][0-9][0-9][0-9]) return 0 ;;
         nmonthly:[0-9]*:[0-9]*:[0-9][0-9][0-9][0-9]) return 0 ;;
         yearly:[0-9][0-9][0-9][0-9]:[0-9][0-9][0-9][0-9]) return 0 ;;
         yearly:[0-9][0-9]:[0-9][0-9]:[0-9][0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
     esac
-    return 1
+    # P5-04：oneshot HHMM 范围 / delay・interval 1-1440 / cron 五段校验（新增辅助函数）
+    tcfg_trigger_extra_ok "$1" || return 1
+    return 0
+}
+# P5-04 D41/D42：新 Trigger 深度校验辅助（数值范围 + cron 五段语法；命名 tcfg_trigger_* 防覆盖）
+tcfg_trigger_num_ok() {   # <min> <max> <val> → 0=纯数字且范围内（含非空检查）
+    [ -n "$3" ] || return 1
+    case "$3" in *[!0-9]*) return 1 ;; esac
+    ttgr_v=$(conde_unzero "$3")
+    [ "$ttgr_v" -ge "$1" ] 2>/dev/null && [ "$ttgr_v" -le "$2" ] 2>/dev/null
+}
+tcfg_trigger_cron_field_ok() {   # <min> <max> <field> → 0=* | */N(N≥1) | a,b,c 逐项范围内 | num
+    [ -n "$3" ] || return 1
+    case "$3" in
+        '*') return 0 ;;
+        '*/'*)
+            ttgr_s=${3#\*/}
+            case "$ttgr_s" in ''|*[!0-9]*) return 1 ;; esac
+            ttgr_sn=$(conde_unzero "$ttgr_s")
+            [ "$ttgr_sn" -ge 1 ] 2>/dev/null || return 1
+            return 0 ;;
+        *,*)
+            ttgr_rest=$3
+            while :; do
+                case "$ttgr_rest" in
+                    *,*) ttgr_item=${ttgr_rest%%,*}; ttgr_rest=${ttgr_rest#*,} ;;
+                    *)   ttgr_item=$ttgr_rest; ttgr_rest="" ;;
+                esac
+                tcfg_trigger_num_ok "$1" "$2" "$ttgr_item" || return 1
+                [ -n "$ttgr_rest" ] || break
+            done
+            return 0 ;;
+        *) tcfg_trigger_num_ok "$1" "$2" "$3" ;;
+    esac
+}
+tcfg_trigger_extra_ok() {   # <trigger> → oneshot HHMM 范围 / delay・interval 1-1440 / cron 五段
+    case "$1" in
+        oneshot:*)
+            ttgr_t=$(printf '%s' "$1" | cut -d: -f2)
+            case "$ttgr_t" in
+                [0-9][0-9][0-9][0-9])
+                    tcfg_trigger_num_ok 0 23 "$(printf '%s' "$ttgr_t" | cut -c1-2)" || return 1
+                    tcfg_trigger_num_ok 0 59 "$(printf '%s' "$ttgr_t" | cut -c3-4)" || return 1
+                    return 0 ;;
+                *) return 1 ;;
+            esac ;;
+        delay:*)
+            tcfg_trigger_num_ok 1 1440 "$(printf '%s' "$1" | cut -d: -f2)" ;;
+        interval:*)
+            tcfg_trigger_num_ok 1 1440 "$(printf '%s' "$1" | cut -d: -f2)" ;;
+        cron:*)
+            ttgr_param=${1#cron:}
+            ttgr_oldifs=$IFS; IFS=' '
+            ttgr_oldf=$-; case "$ttgr_oldf" in *f*) ;; *) set -f ;; esac
+            set -- $ttgr_param
+            IFS=$ttgr_oldifs
+            case "$ttgr_oldf" in *f*) ;; *) set +f ;; esac
+            [ $# -eq 5 ] || return 1
+            tcfg_trigger_cron_field_ok 0 59 "$1" || return 1
+            tcfg_trigger_cron_field_ok 0 23 "$2" || return 1
+            tcfg_trigger_cron_field_ok 1 31 "$3" || return 1
+            tcfg_trigger_cron_field_ok 1 12 "$4" || return 1
+            tcfg_trigger_cron_field_ok 0 6 "$5" || return 1
+            return 0 ;;
+        *) return 1 ;;
+    esac
 }
 # action 校验：<type> <command> → 0=合法（app 复用 P2-10 结构化校验；
 # script 绝对路径存在可读；command 非空且不含未转义真实换行）
@@ -4658,7 +4729,7 @@ tcfg_editor_validate_payload() {   # <content>
     tcfg_editor_bool "$tedv_enabled" || { echo "[editor] ERROR: enabled must be 0|1" >&2; tedv_err=1; }
     [ ${#tedv_name} -le 64 ] || { echo "[editor] ERROR: name > 64 chars" >&2; tedv_err=1; }
     [ ${#tedv_desc} -le 256 ] || { echo "[editor] ERROR: description > 256 chars" >&2; tedv_err=1; }
-    tcfg_editor_trigger_ok "$tedv_trig" || { echo "[editor] ERROR: trigger '$tedv_trig' not implemented (P3 supports boot/time/advanced families only)" >&2; tedv_err=1; }
+    tcfg_editor_trigger_ok "$tedv_trig" || { echo "[editor] ERROR: trigger '$tedv_trig' invalid/unsupported (P5 supports boot/time/advanced/oneshot/delay/interval/cron/boot_completed)" >&2; tedv_err=1; }
     [ -z "$tedv_atype" ] && tedv_atype=command
     tcfg_editor_action_ok "$tedv_atype" "$tedv_acmd" || { echo "[editor] ERROR: invalid action type='$tedv_atype' command='$tedv_acmd'" >&2; tedv_err=1; }
     [ -z "$tedv_htype" ] && tedv_htype=none

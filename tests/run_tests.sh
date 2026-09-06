@@ -74,6 +74,10 @@
 #       < > <= >=（仅 time.*）/ contains（仅 task.state/env.*）适用矩阵、类型与
 #       空值/非法值语义、注入面新规则；positive/negative/positive-p5 fixtures；
 #       生产代码零改动，新运算符实现与既有断言反转归 P5-03）
+#   L2  tests/p5-trigger/test.sh   P5-04 新 Trigger Schema 与持久化（schema-enum/
+#       schema-reject/persist/editor/legacy-zero：boot_completed、oneshot:HHMM、
+#       delay:MIN、interval:MIN、cron 五段冻结校验；Managed 写路径持久化 + B9
+#       原子性；B16 legacy 零触碰；既有家族不回归）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -197,6 +201,7 @@ else
         "tests/p3-integration/test.sh" \
         "tests/p4-dependency/test.sh" \
         "tests/p5-condition/test.sh" \
+        "tests/p5-trigger/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
