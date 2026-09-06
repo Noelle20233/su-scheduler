@@ -45,16 +45,17 @@ P5（V0.5）聚焦调度能力与操作体验增强：扩展受限 Condition 表
 
 | 管理器 | Android 12 | 13 | 14 | 15 | 16 |
 | :-- | :-- | :-- | :-- | :-- | :-- |
-| KernelSU | ⏳ | ⏳ | ⏳ | ⏳ | ✅ `8934ffc4` |
+| KernelSU | ⏳ | ⏳ | ⏳ | ⏳ | ✅ `adb-8934ffc4-` |
 | Magisk | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ |
 | APatch | ⏳ | ⏳ | ⏳ | ⏳ | ⏳ |
 
 - **已覆盖**：KernelSU × Android 16（Xiaomi 17 / `pudding` / `25113PN0EC`，ksud 3.3.0）——
-  boot/registry/WebUI/editor/app/health/control/fallback 等功能面全 PASS；daemon 快速重启
-  恢复路径受已知竞态残留 D-P5-01 影响（见 §5）。
+  **P5-10 发布验证全绿**（host 48 套件 2236/0 + p3-device 28/0 + p1-device 11/0，Runtime 1.30.0）：
+  P5 全部新功能（oneshot/interval/cron/delay/boot_completed、Condition 运算符、WAITING/Retry、
+  WebUI 刷新与批量控制、daemon 重启恢复、升级/回滚）真机实测通过；D-P5-01..05 均已修复。
 - **未覆盖 14 格**（P5-10 优先级排序）：KernelSU×A12/A13/A14/A15（4）、Magisk×A16（1）、
   APatch×A16（1）、Magisk×A12/A13/A14/A15（4）、APatch×A12/A13/A14/A15（4）——均为
-  ⏳ 发布限制（无真机/模拟器），**不伪造通过**。
+  ⏳ 发布限制（无真机/模拟器），**不伪造通过**（见 docs/P5-10.md §4）。
 
 ## 5. 已知竞态残留（D-P5-01，非回归）
 
