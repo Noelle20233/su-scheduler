@@ -96,10 +96,45 @@ LOG="$RESULT_DIR/run_tests-$TS.log"
 : > "$LOG"
 
 ok=1
-run_suite() {   # <path>：捕获输出，判 [FAIL] 计数与退出码；全量入 trace 日志
+# D-P5-02：单套件超时上限（秒，可经 SUITE_TIMEOUT 覆盖）。此前 providers/action-run
+# 的后台孤儿子进程（start 子 shell 未脱离管道）可令 out=$(bash ...) 永久阻塞 → 整个
+# 全量回归挂起。现在改为输出落临时文件 + 超时强杀，任何套件挂起最多阻塞一个超时上限。
+SUITE_TIMEOUT=${SUITE_TIMEOUT:-300}
+
+run_suite() {   # <path>：捕获输出，判 [FAIL] 计数与退出码；超时则强杀并记 FAIL
     echo "== $1 ==" | tee -a "$LOG"
-    out=$(bash "$1" 2>&1)
+    tmp=$(mktemp "$RESULT_DIR/.suite.XXXXXX") || { ok=0; echo "[FAIL] mktemp failed" | tee -a "$LOG"; echo "" >> "$LOG"; return; }
+    bash "$1" > "$tmp" 2>&1 &
+    spid=$!
+    i=0
+    while [ "$i" -lt "$SUITE_TIMEOUT" ] && kill -0 "$spid" 2>/dev/null; do
+        sleep 1; i=$((i + 1))
+    done
+    if [ "$i" -ge "$SUITE_TIMEOUT" ] && kill -0 "$spid" 2>/dev/null; then
+        kill "$spid" 2>/dev/null
+        j=0
+        while [ "$j" -lt 5 ] && kill -0 "$spid" 2>/dev/null; do
+            sleep 1; j=$((j + 1))
+        done
+        if kill -0 "$spid" 2>/dev/null; then
+            kill -9 "$spid" 2>/dev/null
+            # 不 wait：进程若陷于不可中断阻塞（如 FIFO open D-state），wait 可能永久
+            # 挂起；僵尸由本脚本退出时回收，先放行后续套件。
+        else
+            wait "$spid" 2>/dev/null
+        fi
+        ok=0
+        echo "[FAIL] suite TIMEOUT after ${SUITE_TIMEOUT}s: $1" | tee -a "$LOG"
+        echo "--- last lines of output ---" | tee -a "$LOG"
+        tail -20 "$tmp" | tee -a "$LOG"
+        rm -f "$tmp"
+        echo "" >> "$LOG"
+        return
+    fi
+    wait "$spid"
     rc=$?
+    out=$(cat "$tmp")
+    rm -f "$tmp"
     fails=$(printf '%s\n' "$out" | grep -c '\[FAIL\]' || true)
     printf '%s\n' "$out" | tail -1 | tee -a "$LOG"
     printf '%s\n' "$out" >> "$LOG"

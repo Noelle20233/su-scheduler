@@ -58,6 +58,13 @@ execute_task() {            # 7 参：id cmd notify_start notify_end custom_msg 
 }
 . ./$RTLIB
 
+# D-P5-02：固定周期 token（SCHED_CYCLE_NOW，Runtime §20 既有的测试确定性注入；
+# 生产缺省 = 真实分钟）。否则相邻两次 scheduler_tick 恰跨真实分钟边界时，cycle 去重
+# token（sched_cycle_token）不同 → 0830 在 dedup/reload 段被二次执行 → 时间敏感
+# flake（"dedup: 0830 count=2"，全量回归慢速环境复现）。断言意图（同周期不重复执行）
+# 不变，仅固定确定性输入（与 P4-04 设计意图一致）。
+export SCHED_CYCLE_NOW=202609040900
+
 BASE="$T/base"; CFG="$T/config.txt"
 mkdir -p "$BASE"
 

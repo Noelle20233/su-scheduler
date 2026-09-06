@@ -91,11 +91,16 @@ TPR_LOG=0 provider_dispatch trigger time validate '' >/dev/null 2>&1 && bad "tim
 
 now=$(date +%H%M)
 next=$(date -d '+1 min' +%H%M)
-TPR_LOG=0 provider_dispatch trigger time matches "$now" >/dev/null 2>&1 && ok "time matches current ($now)" || bad "time matches current"
-TPR_LOG=0 provider_dispatch trigger time matches "$next" >/dev/null 2>&1 && bad "time should not match +1min" || ok "time no match +1min"
-due_now=$(TPR_LOG=0 provider_dispatch trigger time next_due "$now")
+# D-P5-02：固定 TRIGGER_DECISION_NOW 使判定与采样时刻解耦——否则取 now 与断言执行
+# 之间跨分钟边界（如 23:59:59 前后）时 matches/next_due 回退真实时钟 → 时间敏感
+# flake（providers 套件曾于 WSL 高负载时段挂起/失败；P4-07 已同类修复 nweekly）。
+TRIGGER_DECISION_NOW=$now TPR_LOG=0 provider_dispatch trigger time matches "$now" >/dev/null 2>&1 \
+    && ok "time matches current ($now)" || bad "time matches current"
+TRIGGER_DECISION_NOW=$now TPR_LOG=0 provider_dispatch trigger time matches "$next" >/dev/null 2>&1 \
+    && bad "time should not match +1min" || ok "time no match +1min"
+due_now=$(TRIGGER_DECISION_NOW=$now TPR_LOG=0 provider_dispatch trigger time next_due "$now")
 [ "$due_now" = 0 ] && ok "time next_due(current)=0" || bad "time next_due(current)=$due_now"
-due_next=$(TPR_LOG=0 provider_dispatch trigger time next_due "$next")
+due_next=$(TRIGGER_DECISION_NOW=$now TPR_LOG=0 provider_dispatch trigger time next_due "$next")
 if [ "$due_next" -gt 0 ] 2>/dev/null && [ "$due_next" -le 3600 ]; then
     ok "time next_due(+1min)=$due_next in (0,3600]"
 else

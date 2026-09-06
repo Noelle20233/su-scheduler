@@ -72,7 +72,12 @@ tpr_trigger_time_next_due() {   # 距下次命中的秒数（分钟粒度，镜�
     th=$(echo "$norm" | cut -c1-2); tm=$(echo "$norm" | cut -c3-4)
     th=$(echo "$th" | sed 's/^0*//'); tm=$(echo "$tm" | sed 's/^0*//')
     [ -z "$th" ] && th=0; [ -z "$tm" ] && tm=0
-    nh=$(date +%H | sed 's/^0*//'); nm=$(date +%M | sed 's/^0*//')
+    # D-P5-02：经 tpr_ctx_now 读取“当前分钟”（TRIGGER_DECISION_NOW 可注入，缺省真实
+    # 时钟，与 matches 同源）。原实现直读 date，测试取 now 与断言执行跨分钟边界时
+    # 产生时间敏感 flake。
+    nnorm=$(tpr_ctx_now)
+    nh=$(echo "$nnorm" | cut -c1-2); nm=$(echo "$nnorm" | cut -c3-4)
+    nh=$(echo "$nh" | sed 's/^0*//'); nm=$(echo "$nm" | sed 's/^0*//')
     [ -z "$nh" ] && nh=0; [ -z "$nm" ] && nm=0
     target=$((th * 60 + tm)); now=$((nh * 60 + nm))
     if [ "$target" -gt "$now" ]; then
@@ -194,6 +199,10 @@ tpr_action_command_prepare() {
 tpr_action_command_start() {  # <id> <cmd> [termux=0|1] [interactive=0|1]
     id=$1; cmd=$2; termux=${3:-0}; interactive=${4:-0}
     dir=$(tpr_action_command_dir "$id")
+    # D-P5-02：后台执行子 shell 显式脱离 stdin/stdout/stderr。否则当 start 被放入
+    # 命令替换（如 action-run 的 out=$(action_run_task ...) 或 run_tests 的
+    # out=$(bash suite)）时，子 shell 会继承捕获管道 fd，即使套件本身已结束，
+    # 孤儿子进程仍握着管道 → 命令替换永久阻塞 → 全量回归挂起（WSL 高负载时复现）。
     (
         if [ "$interactive" = "1" ]; then
             tpr_action_exec_interactive "$id" "$dir" "$cmd"
@@ -202,7 +211,7 @@ tpr_action_command_start() {  # <id> <cmd> [termux=0|1] [interactive=0|1]
         else
             tpr_action_exec_smart "$dir" "$cmd"
         fi
-    ) &
+    ) </dev/null >/dev/null 2>&1 &
     echo $!
 }
 tpr_action_command_status() {
@@ -281,6 +290,9 @@ tpr_action_exec_interactive() { # $1=id $2=dir $3=cmd（镜像 daemon L345-380�
     sh -i < "$in" > "$out" 2>&1 &
     pid=$!
     echo "$cmd" > "$in"
+    # D-P5-02 护栏：交互 sh -i 若因环境（FIFO/EOF 时序）挂起，最多等 30s 即终止，
+    # 避免孤儿子进程长期滞留测试主机；正常路径（sh -i 读到 exit 即退出）语义不变。
+    ( sleep 30; kill "$pid" 2>/dev/null ) &
     wait $pid
     rc=$?
     # legacy 保真（P1-01 §5 + daemon L369-380）：交互分支结束后**只写 exit_code.txt**；
