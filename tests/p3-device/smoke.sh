@@ -374,7 +374,13 @@ tick
 # `task start edit1`（item 8 已保存 edit1，命令 sleep 20）经 IPC START_TASK →
 # tctl_start → action_run；成功 = rc=0 且运行目录 state.txt 达 RUNNING。
 ipc_ready
+# 防御 restart 风暴窗口 IPC 短暂不可用（D-P5-05）：operation_timeout（rc=5）时重试一次；
+# 首启 rc=5 但任务已实际拉起时重试得 rc=2（already running），同样视为 start 已生效。
 TS=$(adb shell "su -c 'su-scheduler task start edit1 2>&1; echo rc=\$?'" 2>/dev/null | tr -d '\r' | tail -1)
+if echo "$TS" | grep -q 'rc=5'; then
+    sleep 5
+    TS=$(adb shell "su -c 'su-scheduler task start edit1 2>&1; echo rc=\$?'" 2>/dev/null | tr -d '\r' | tail -1)
+fi
 TS_RUN=""
 W=0
 while [ "$W" -lt 20 ]; do
@@ -382,7 +388,8 @@ while [ "$W" -lt 20 ]; do
     [ "$TS_RUN" = "RUNNING" ] && break
     sleep 1; W=$((W + 1))
 done
-if echo "$TS" | grep -q 'rc=0' && [ "$TS_RUN" = "RUNNING" ]; then
+# rc=0=started / rc=2=already running（首启已生效）均证明控制面成功；且 state 必须达 RUNNING
+if [ "$TS_RUN" = "RUNNING" ] && { echo "$TS" | grep -q 'rc=0' || echo "$TS" | grep -q 'rc=2'; }; then
     ok "14-control: task start -> RUNNING (tctl+action_run via IPC)"
 else
     bad "14-control: task start=[$TS] state=[$TS_RUN]"
@@ -431,11 +438,16 @@ tick
 # ═══════════════════════════════════════════════════════════════════════════
 # 造一个 RUNNING 残留目录（进程已死）→ daemon 重启 → state_rehydrate → FAILED
 adb shell "su -c 'mkdir -p $DATA/tasks/ghost_x; echo RUNNING > $DATA/tasks/ghost_x/state.txt; echo RUNNING > $DATA/tasks/ghost_x/status.txt; echo 99999999 > $DATA/tasks/ghost_x/pid.txt'" 2>/dev/null
+# D-P5-05：restart 前清除 crash guard（与 step 0/19 预置复位一致）。此前 step 0/6/10 等
+# 多次 `su-scheduler restart` 可累积 crash_seq；若本次 restart 落入 crash-guard 降级窗口
+# （300s cooldown 内 fast-exit 风暴 ~70s，daemon 从不执行 state_rehydrate），ghost 会保持
+# RUNNING 直至 40s 轮询超时 → 偶发 FAIL。清 guard 后 crash_seq=0 干净进入，rehydrate 必执行。
+adb shell "su -c 'rm -f $DATA/runtime/daemon.guard 2>/dev/null'" 2>/dev/null
 adb shell "su -c 'su-scheduler restart 2>/dev/null'" >/dev/null 2>&1
 # 有界轮询等待 daemon 重启（state_rehydrate 在 daemon 启动时执行，避免固定 sleep
-# 在慢设备/重负载下过早判定）
+# 在慢设备/重负载下过早判定；上限 60s 放宽，覆盖降级窗口残留抖动，D-P5-05）
 W=0
-while [ "$W" -lt 40 ]; do
+while [ "$W" -lt 60 ]; do
     GHOST=$(adb shell "su -c 'cat $DATA/tasks/ghost_x/state.txt 2>/dev/null'" 2>/dev/null | tr -d '\r')
     [ "$GHOST" = "FAILED" ] && break
     sleep 2; W=$((W + 2))
