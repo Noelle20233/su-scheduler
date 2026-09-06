@@ -235,6 +235,23 @@ done
 [ "$(tc_snap)" = "$SNAP_DEP" ] && ok "P4-08 fuzz: task-config byte-identical after dependency injection" \
     || bad "P4-08 fuzz: task-config mutated by dependency injection"
 
+# ── P5-09 cron 逗号列表项数上限注入：VALIDATE_TASK 拒绝（rc 4）+ config 不变 + 零 exec ──
+# 61 项全 `0`（值合法仅超 CRON_FIELD_MAX_ITEMS=60）→ 校验期拒绝，绝不写盘/执行。
+cron_bad=""
+ci=0; while [ "$ci" -lt 61 ]; do cron_bad="${cron_bad}0,"; ci=$((ci + 1)); done
+cron_bad=${cron_bad%,}
+SNAP_CRON=$(tc_snap)
+cron_payload=$(printf 'schema_version=2\nid=cron_bad\ntrigger=cron:%s * * * *\naction.command=echo ok\n' "$cron_bad")
+drop_req "cron1" "cron1|VALIDATE_TASK|payload=$(b64 "$cron_payload")"
+poll
+rc=$(req_rc "cron1")
+[ "$rc" = "4" ] && ok "P5-09 fuzz: cron 61-item minute list -> configuration_invalid (rc 4)" \
+    || bad "P5-09 fuzz: cron 61-item list rc=$rc (want 4)"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P5-09 fuzz: ZERO exec after cron list injection" \
+    || bad "P5-09 fuzz: cron list injection executed ($(wc -l < "$EXEC_LOG"))"
+[ "$(tc_snap)" = "$SNAP_CRON" ] && ok "P5-09 fuzz: task-config byte-identical after cron list injection" \
+    || bad "P5-09 fuzz: config mutated by cron list injection"
+
 # ── 副作用：task-config 逐字节不变；EXEC_LOG 仅安全启动那一次（如有）───
 # 前面所有恶意请求不应改 task-config（除 UPDATE 合法更新 command 外）
 grep -q '^action.command=echo ok; rm -rf /$' "$TCFG_DIR/$mkid.task" 2>/dev/null \

@@ -113,6 +113,23 @@ boot_completedx
 EOF
 ok "P5-04 schema-reject: invalid formats all rejected"
 
+# ── P5-09 cron 逗号列表项数上限（CRON_FIELD_MAX_ITEMS=60）─────────────────
+# 61 项全 `0`（值合法仅超项数）→ 拒绝；10 项合法列表 → 通过（仅新增边界，语义不变）。
+LIST61=""
+i=0
+while [ "$i" -lt 61 ]; do LIST61="${LIST61}0,"; i=$((i + 1)); done
+LIST61=${LIST61%,}
+if tcfg_editor_trigger_ok "cron:$LIST61 * * * *"; then
+    bad "P5-09 cron-limit: 61-item minute list ACCEPTED (must reject >60)"
+else
+    ok "P5-09 cron-limit: 61-item minute list rejected (CRON_FIELD_MAX_ITEMS=60)"
+fi
+if tcfg_editor_trigger_ok 'cron:0,5,10,15,20,25,30,35,40,45 * * * *'; then
+    ok "P5-09 cron-limit: 10-item minute list accepted (<=60, existing semantics intact)"
+else
+    bad "P5-09 cron-limit: 10-item minute list REJECTED (must accept <=60)"
+fi
+
 # ── §persist：持久化 + 原子性 ─────────────────────────────────────────────
 echo managed > "$TCFG_DIR/MANAGED"
 tcfg_new_task task_os oneshot:0830 "echo hi" >/dev/null 2>&1

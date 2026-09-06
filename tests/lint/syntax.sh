@@ -53,6 +53,22 @@ for f in build.sh bump_version.sh; do
     check_n bash "$f"
 done
 
+# ── mksh 兼容性结构断言（P5-09 §4.1，D36/D37 延续）────────────────────────
+# Android 16 mksh 对 `${var#*|}` / `${var#*(...)}` 等含裸 `|`/`(`/`)` 的 glob
+# pattern 展开存在二层展开 bug；P5-04/05/08 新代码仅用逗号/字面量/转义 `*`
+# pattern。断言 RTLIB **代码行**（去注释）零命中——注释中的文档示例不计数。
+RTLIB_CODE="$TMP/rtlib-code.txt"
+tr -d '\r' < system/bin/su-scheduler-runtime | grep -vE '^[[:space:]]*#' > "$RTLIB_CODE"
+[ "$(grep -cE '\$\{[^}]*\|' "$RTLIB_CODE")" -eq 0 ] \
+    && ok "mksh: RTLIB no bare | inside \${} expansion (D36)" \
+    || bad "mksh: RTLIB bare | inside \${} expansion"
+[ "$(grep -cE '\$\{[A-Za-z0-9_]*##?[^}]*[()]' "$RTLIB_CODE")" -eq 0 ] \
+    && ok "mksh: RTLIB no bare ( in prefix \${} pattern (D37)" \
+    || bad "mksh: RTLIB bare ( in prefix \${} pattern"
+[ "$(grep -cE '\$\{[A-Za-z0-9_]*%[^}]*[()]' "$RTLIB_CODE")" -eq 0 ] \
+    && ok "mksh: RTLIB no bare ) in suffix \${} pattern (D37)" \
+    || bad "mksh: RTLIB bare ) in suffix \${} pattern"
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "lint tests: PASS=$PASS FAIL=$FAIL"

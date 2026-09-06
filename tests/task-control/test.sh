@@ -395,6 +395,50 @@ cli_run cmd_task stop t_b1
     && ok "P5-07 batch: single-id stop keeps legacy format (no prefix)" \
     || bad "P5-07 batch: single-id rc=$CLI_RC out=$CLI_OUT"
 
+# ── 13b) P5-09 §batch-limit：批量 id 数量上限（task_ctl_multi 入口先拒，零 IPC）──
+# 用 mock task_ctl_send（计数写文件）验证：>50 id 在**任何 IPC 调用前**拒绝
+# （零 send、零 exec、配置逐字节不变）；恰好 50 id 通过守卫并 50 次 send。
+# （SIGSTOP 停 poller 会让 ≤50 边界每个 send 等满 IPC 超时——改用 mock 保持确定性且快。）
+cli_run_mock() {   # <args...> → CLI_OUT/CLI_RC + $T/mock.cnt（task_ctl_send 调用次数）
+    local tmp="$T/cli"
+    mkdir -p "$tmp/tasks" "$tmp/shells"
+    : > "$T/mock.cnt"
+    CLI_OUT=$( {
+        set +u
+        eval "$(cli_body)"
+        CONFIG_FILE="$tmp/config.txt"
+        LOG_FILE="$tmp/su-scheduler.log"
+        TASKS_DIR="$tmp/tasks"
+        SHELLS_DIR="$tmp/shells"
+        DATA_DIR="$BASE"
+        TCFG_DIR="$BASE/task-config"
+        task_ctl_send() { n=$(cat "$T/mock.cnt" 2>/dev/null || echo 0); echo $((n + 1)) > "$T/mock.cnt"; echo "started $2"; return 0; }
+        "$@"
+    } 2>&1 )
+    CLI_RC=$?
+}
+: > "$EXEC_LOG"
+SNAP_BL=$(tc_snap)
+IDS51=""
+i=1; while [ "$i" -le 51 ]; do IDS51="$IDS51 id_$i"; i=$((i + 1)); done
+cli_run_mock cmd_task start $IDS51
+[ "$CLI_RC" -eq 1 ] && echo "$CLI_OUT" | grep -q 'batch limit 50' \
+    && ok "P5-09 batch-limit: 51 ids -> rc 1 + 'batch limit 50' (rejected before IPC)" \
+    || bad "P5-09 batch-limit: rc=$CLI_RC out=$CLI_OUT"
+[ "$(cat "$T/mock.cnt" 2>/dev/null)" = "" ] && ok "P5-09 batch-limit: ZERO IPC send (guard fired first)" \
+    || bad "P5-09 batch-limit: IPC send leaked ($(cat "$T/mock.cnt" 2>/dev/null))"
+[ "$(wc -l < "$EXEC_LOG")" -eq 0 ] && ok "P5-09 batch-limit: ZERO exec" \
+    || bad "P5-09 batch-limit: exec leaked ($(wc -l < "$EXEC_LOG"))"
+[ "$(tc_snap)" = "$SNAP_BL" ] && ok "P5-09 batch-limit: task-config byte-identical" \
+    || bad "P5-09 batch-limit: config mutated"
+# 恰好 50 id 通过守卫（边界 = `<=50`），50 次 send 全成功 rc 0
+IDS50=${IDS51% *}
+cli_run_mock cmd_task start $IDS50
+[ "$CLI_RC" -eq 0 ] && [ "$(cat "$T/mock.cnt" 2>/dev/null)" = "50" ] \
+    && [ "$(printf '%s\n' "$CLI_OUT" | grep -c '^id_[0-9]*: started id_')" -eq 50 ] \
+    && ok "P5-09 batch-limit: 50 ids pass the guard -> 50 sends + rc 0 (boundary = <=50)" \
+    || bad "P5-09 batch-limit: 50-id boundary rc=$CLI_RC cnt=$(cat "$T/mock.cnt" 2>/dev/null)"
+
 kill "$DLOOP" 2>/dev/null
 wait "$DLOOP" 2>/dev/null
 

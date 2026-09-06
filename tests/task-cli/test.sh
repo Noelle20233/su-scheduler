@@ -245,6 +245,18 @@ done
 [ -z "${zero_reg:-}" ] && ok "P5-08 status: existing fields zero regression (10 field lines intact)" \
     || bad "P5-08 status: existing fields regressed"
 
+# ── P5-09 §batch-limit：生产 CLI 批量上限结构断言（task_ctl_multi 入口先拒）──
+# task_ctl_multi 位于生产 system/bin/su-scheduler（P5-07）。断言批量上限守卫
+# 出现在任何 IPC 调用（task_ctl_send）之前——超限拒绝零副作用。行为测试见
+# tests/task-control/test.sh（§batch-limit，P5-07 batch 同域）。
+PROD_CLI="../../system/bin/su-scheduler"
+TCM_BODY=$(sed -n '/^task_ctl_multi()/,/^}/p' "$PROD_CLI")
+gln=$(printf '%s\n' "$TCM_BODY" | grep -n 'batch limit 50' | head -1 | cut -d: -f1)
+sln=$(printf '%s\n' "$TCM_BODY" | grep -n 'task_ctl_send' | head -1 | cut -d: -f1)
+[ -n "$gln" ] && [ -n "$sln" ] && [ "$gln" -lt "$sln" ] \
+    && ok "P5-09 batch-limit: task_ctl_multi guards \$#<=50 before any IPC send (guard=$gln < send=$sln)" \
+    || bad "P5-09 batch-limit: guard/order missing (guard='$gln' send='$sln')"
+
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 rm -f "$LKF"

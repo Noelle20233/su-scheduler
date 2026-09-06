@@ -1264,6 +1264,7 @@ task_ctl_send() {   # <op> <id> → rc；stdout=响应载荷（去首行）；�
 task_ctl_multi() {
     local op="$1"; shift
     [ $# -ge 1 ] || { echo "ERROR: usage: su-scheduler task <op> <id> [<id>...]" >&2; return 1; }
+    [ $# -le 50 ] || { echo "error: batch limit 50" >&2; return 1; }
     if [ $# -eq 1 ]; then
         task_ctl_send "$op" "$1"
         return $?

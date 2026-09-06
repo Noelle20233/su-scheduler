@@ -5130,11 +5130,14 @@ tcfg_trigger_cron_field_ok() {   # <min> <max> <field> → 0=* | */N(N≥1) | a,
             return 0 ;;
         *,*)
             ttgr_rest=$3
+            ttgr_cnt=0
             while :; do
                 case "$ttgr_rest" in
                     *,*) ttgr_item=${ttgr_rest%%,*}; ttgr_rest=${ttgr_rest#*,} ;;
                     *)   ttgr_item=$ttgr_rest; ttgr_rest="" ;;
                 esac
+                ttgr_cnt=$((ttgr_cnt + 1))
+                [ "$ttgr_cnt" -le "$CRON_FIELD_MAX_ITEMS" ] || return 1
                 tcfg_trigger_num_ok "$1" "$2" "$ttgr_item" || return 1
                 [ -n "$ttgr_rest" ] || break
             done
@@ -5795,6 +5798,7 @@ runtime_limit_task_log() {
 # ═══════════════════════════════════════════════════════════════════════════
 DEP_MAX=${DEP_MAX:-32}
 COND_MAX_LEN=${COND_MAX_LEN:-256}
+CRON_FIELD_MAX_ITEMS=${CRON_FIELD_MAX_ITEMS:-60}
 
 # 规范化 dependency 值：<raw> → 逗号分隔规范串（空格/制表符→逗号、去空段、去首尾逗号）。
 # 仅应在 dep_validate 通过后用于写回/回显。

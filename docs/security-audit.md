@@ -60,3 +60,36 @@
 - 宿主环境例外（Windows Git-Bash）：chmod 权限断言与 CRLF `dash -n` 为 P3-07
   记录的 pre-existing 宿主项（CI ubuntu-latest LF 全绿）；符号链接在无法产出真实
   链接的宿主显式 SKIP（逻辑由 `secv_nosymlink`/`secv_guard_task_dir` 覆盖）。
+
+---
+
+## P5-09 复核段（资源、安全与 Android 兼容性加固）
+
+> 依据 `docs/P5-09.md`。复核日期：2026-09-06。宿主全量回归 48 套件全绿
+> （2236 PASS / 0 FAIL，L1+L2+L4）。
+
+### 一、三项实质缺口处置
+
+| # | 缺口 | 处置 | 证据 |
+| :-- | :--- | :--- | :--- |
+| 1 | cron 逗号列表项数无上限 | **已修**：`tcfg_trigger_cron_field_ok` 逗号列表分支逐项计数，项数 > `CRON_FIELD_MAX_ITEMS=60` → 拒绝（§26 常量区新增，`DEP_MAX`/`COND_MAX_LEN` 旁） | tests/p5-trigger §schema-reject（61 项拒 / 10 项过）；tests/security/fuzz P5-09（VALIDATE_TASK rc 4 + 零 exec + config 不变） |
+| 2 | 批量操作数量无上限（ARG_MAX 隐式） | **已修**：CLI `task_ctl_multi` 入口 `[ $# -le 50 ]`，超限在**任何 IPC 调用前**拒绝（零副作用） | tests/task-control §13b（51 id → rc 1 + 'batch limit 50' + 零 send + 零 exec；50 id → 通过守卫 + 50 send）；tests/task-cli §P5-09 结构断言（守卫行号 < 首个 task_ctl_send） |
+| 3 | per-task 刷新频率（节流） | **裁决：不实施**。现状仅 IPC 全局 `IPC_RATE_MAX`（256/窗）；interval:1 任务每 tick 至多执行一次，受 `sched_cycle_seen` 同分钟去重天然约束——执行密度 = tick 密度，无 DoS 风险。新增 per-task 节流属过度设计（B20 相关） | 设计裁决记录于 docs/P5-09.md §3.3 |
+
+### 二、mksh / date / 主循环结构断言（纯测试，零生产）
+
+| # | 断言 | 结果 | 位置 |
+| :-- | :--- | :--- | :--- |
+| 4 | RTLIB 无裸 `\|` in `${}` 展开（D36） | ✅（代码行零命中） | tests/lint/syntax.sh |
+| 5 | RTLIB 无裸 `(` in 前缀 `${#}` pattern（D37） | ✅ | tests/lint/syntax.sh |
+| 6 | RTLIB 无裸 `)` in 后缀 `${%}` pattern（D37） | ✅ | tests/lint/syntax.sh |
+| 7 | next_due 纯整数算术，无 BSD `date -d` 生产依赖 | ✅（P5-08 既有） | — |
+| 8 | `while true` 恰 1（daemon 主循环）+ RTLIB 零常驻循环 | ✅（daemon=1 / RTLIB=0） | tests/resource/stress.sh |
+
+### 三、既有安全面复核结论
+
+- 路径穿越（`secv_id_ok`/`secv_inside`/`conde_path_in`）、控制字符
+  （`web_json_escape`/`cond_validate`/`dep_validate`）、零任意 Shell 执行
+  （生产零 eval）三项经复核**无需新增**——P3-08 基线已全覆盖，本次不重复造轮子。
+- 兼容性：`dash -n` 对改动后的 runtime/CLI 通过；无新增运行期外部依赖
+  （新增计数逻辑仅用 POSIX 算术与既有 `grep`/`awk`）；Legacy 解析语义零变更（C4）。

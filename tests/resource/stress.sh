@@ -27,6 +27,7 @@ ok()  { PASS=$((PASS + 1)); echo "[PASS] $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "[FAIL] $1"; }
 
 RTLIB="system/bin/su-scheduler-runtime"
+DAEMON="system/bin/su-schedulerd"
 T=$(mktemp -d)
 trap 'rm -rf "$T"' EXIT
 
@@ -63,6 +64,15 @@ done
 printf '%s\n' "$sched_body" | grep -q 'for id in $(registry_task_ids)' || loop_ok=0
 printf '%s\n' "$sup_body" | grep -q 'for rd in "$tasks"/*' || loop_ok=0
 [ "$loop_ok" -eq 1 ] && ok "P3-08 stress-a: scheduler/supervisor single for-loop, no per-task while/background (no 100 permanent loops)" || bad "P3-08 stress-a: loop structure violated (possible per-task loop)"
+
+# 主循环恰 1 断言（P5-09 §4.2 / B20）：daemon 全文件 `while true` 恰 1（主循环），
+# runtime 库为零常驻循环（库无主循环，供 daemon/CLI 加载）。
+[ "$(grep -c 'while true' "$DAEMON")" -eq 1 ] \
+    && ok "P5-09 struct: daemon has exactly 1 main loop (while true count=1)" \
+    || bad "P5-09 struct: daemon while true count=$(grep -c 'while true' "$DAEMON") (want 1)"
+[ "$(grep -c 'while true' "$RTLIB")" -eq 0 ] \
+    && ok "P5-09 struct: runtime library has NO resident loop (while true count=0)" \
+    || bad "P5-09 struct: runtime library while true count=$(grep -c 'while true' "$RTLIB") (want 0)"
 
 # supervisor_tick 遍历运行目录（结构已证单循环无每任务循环；此处用小目录集做
 # 真实有界时界证明——循环结构不随目录数变化，避免慢宿主上 100 目录扫描拖慢）。
