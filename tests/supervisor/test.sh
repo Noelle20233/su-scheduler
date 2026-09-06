@@ -71,6 +71,25 @@ grep -q 'supervisor_tick "\$TASKS_DIR"' "$DAEMON" && ok "P2-12 entry: daemon mai
 n=$(grep -c 'RUNTIME_LOADED' "$DAEMON")
 [ "$n" -ge 10 ] && ok "P2-12 entry: RUNTIME_LOADED gates intact (loader+shadow+rehydrate+sync+supervisor+4 action sites)" || bad "P2-12 entry: RUNTIME_LOADED count=$n"
 
+# ── D-P5-03：supervisor_task_file 只读 idmap（不得按调用全量重建 → O(N×M) IPC 饥饿）──
+# 根因（真机取证）：supervisor_task_file 曾对每个运行目录调用 idmap 全量重建 →
+# supervisor_tick 为 O(N×M)，残留运行目录多时主循环每轮阻塞数十秒 → nap 段 IPC 轮询
+# 被拖延 → GET_SUMMARY/EDIT_TASK 频繁 operation_timeout。修复：依赖 daemon 主循环
+# 每 tick 先于 supervisor_tick 的刷新（新鲜度保证）。静态断言防回归。
+tf_body=$(sed -n '/^supervisor_task_file()/,/^}/p' "$RTLIB")
+if printf '%s\n' "$tf_body" | grep -q 'runtime_map_refresh \$'; then
+    bad "D-P5-03 map: supervisor_task_file must NOT rebuild idmap per-call (O(N×M) IPC starvation)"
+else
+    ok "D-P5-03 map: supervisor_task_file reads idmap only (no per-call rebuild)"
+fi
+map_ln=$(grep -n 'runtime_map_refresh "\$DATA_DIR" "\$TASKS_DIR"' "$DAEMON" | head -1 | cut -d: -f1)
+sup_ln=$(grep -n 'supervisor_tick "\$TASKS_DIR"' "$DAEMON" | head -1 | cut -d: -f1)
+if [ -n "$map_ln" ] && [ -n "$sup_ln" ] && [ "$map_ln" -lt "$sup_ln" ]; then
+    ok "D-P5-03 map: main loop refreshes idmap (L$map_ln) before supervisor_tick (L$sup_ln) — freshness guaranteed"
+else
+    bad "D-P5-03 map: idmap refresh missing or after supervisor_tick (map=$map_ln sup=$sup_ln)"
+fi
+
 # ── 4) 统一事件循环结构断言（先于行为——无每任务循环/后台派生）────────────────
 step_body=$(sed -n '/^supervisor_step()/,/^}/p' "$RTLIB")
 if printf '%s\n' "$step_body" | grep -qE '(^|[[:space:]])(while|for)([[:space:]]|$)|&$'; then

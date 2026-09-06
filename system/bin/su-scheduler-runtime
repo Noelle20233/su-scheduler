@@ -2163,7 +2163,11 @@ supervisor_policy() {   # <task_file>
 supervisor_task_file() {   # <base> <tasks_dir> <id> → 注册表任务文件（旧运行 ID 经 idmap 解析）
     base=$1; tasks=$2; qid=$3
     f=$(registry_task_file "$qid" 2>/dev/null) && { echo "$f"; return 0; }
-    runtime_map_refresh "$base" "$tasks" >/dev/null 2>&1
+    # D-P5-03：不再在此按调用刷新 idmap——daemon 主循环每 tick 已在 supervisor_tick
+    # 之前调用 runtime_map_refresh（su-schedulerd 主循环），idmap 恒为最新；此处若再
+    # 全量重建，会把 O(M) 的映射扫描放大为 O(N×M)（N=运行目录数），supervisor_tick
+    # 每循环阻塞数十秒 → 主循环被卡 → IPC（仅 nap 段轮询）饥饿 → GET_SUMMARY/
+    # EDIT_TASK 频繁 operation_timeout（真机 35 个残留目录实测 ~50s/循环）。
     canon=$(runtime_map_run_task "$base" "$qid")
     [ -n "$canon" ] || {
         # P3-03 要求 9：任务已从新快照移除但仍在运行 → 用运行目录 stash 的
