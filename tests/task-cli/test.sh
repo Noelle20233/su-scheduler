@@ -186,6 +186,65 @@ grep -q '^Gate: WAITING (dep unsat: dep_a)$' <<< "$wout" \
 grep -q '^state=WAITING$' <<< "$wout" \
     && ok "P4-09 status: state=WAITING from run-dir state.txt" || bad "P4-09 status: state"
 
+# ── 9) P5-08：task status 新字段（trigger_kind/next_due/last_trigger_cause/condition_state/dependency_state）──
+# 构造带 interval + 依赖 + 条件的 v2 任务；依赖任务须为 registry 任务（缺失=waiting）；
+# dep_a 运行目录 state 控制满足/未满足
+printf 'schema_version=2\nid=t_p5\nname=p5\ntrigger=interval:15\ndependency=dep_a,?dep_b:FAILED\ncondition={{ task.state(dep_a) == STOPPED }}\naction.command=echo hi\n' > "$SNAP/t_p5.task"
+printf 'schema_version=2\nid=dep_a\ntrigger=23:59\naction.command=echo dep\n' > "$SNAP/dep_a.task"
+printf 'schema_version=2\nid=dep_b\ntrigger=23:58\naction.command=echo depb\n' > "$SNAP/dep_b.task"
+mkdir -p "$RUNDIR/dep_a"
+printf 'STOPPED\n' > "$RUNDIR/dep_a/state.txt"
+pout=$(TASK_CLI_TASKS_DIR="$RUNDIR" TASK_CLI_LOCK="$LKF" task_cli_status t_p5 2>/dev/null)
+grep -q '^trigger_kind=kind=interval;minutes=15$' <<< "$pout" \
+    && ok "P5-08 status: trigger_kind=kind=interval;minutes=15" \
+    || bad "P5-08 status: trigger_kind=[$(echo "$pout" | grep '^trigger_kind=')]"
+grep -q '^dependency_state=satisfied$' <<< "$pout" \
+    && ok "P5-08 status: dependency_state=satisfied (dep_a STOPPED, dep_b optional unmet)" \
+    || bad "P5-08 status: dependency_state=[$(echo "$pout" | grep '^dependency_state=')]"
+grep -q '^condition_state=ok$' <<< "$pout" \
+    && ok "P5-08 status: condition_state=ok ({{ task.state(dep_a) == STOPPED }} true)" \
+    || bad "P5-08 status: condition_state=[$(echo "$pout" | grep '^condition_state=')]"
+# dep_a 置 FAILED → 依赖终态不匹配（unsat）+ 条件为假（unsat）
+printf 'FAILED\n' > "$RUNDIR/dep_a/state.txt"
+pout=$(TASK_CLI_TASKS_DIR="$RUNDIR" TASK_CLI_LOCK="$LKF" task_cli_status t_p5 2>/dev/null)
+grep -q '^dependency_state=unsat$' <<< "$pout" \
+    && ok "P5-08 status: dependency_state=unsat (dep_a FAILED terminal mismatch)" \
+    || bad "P5-08 status: dependency_state(FAILED)=[$(echo "$pout" | grep '^dependency_state=')]"
+grep -q '^condition_state=unsat$' <<< "$pout" \
+    && ok "P5-08 status: condition_state=unsat ({{ task.state(dep_a) == STOPPED }} false)" \
+    || bad "P5-08 status: condition_state(FAILED)=[$(echo "$pout" | grep '^condition_state=')]"
+# 空 condition / 空 dependency → ok
+gout=$(TASK_CLI_LOCK="" task_cli_status t45_2200 2>/dev/null)
+grep -q '^condition_state=ok$' <<< "$gout" && grep -q '^dependency_state=ok$' <<< "$gout" \
+    && ok "P5-08 status: empty condition/dependency -> condition_state=ok + dependency_state=ok" \
+    || bad "P5-08 status: empty cond/dep=[$(echo "$gout" | grep -E '^(condition_state|dependency_state)=' | tr '\n' ' ')]"
+# next_due：time/oneshot 注入 TRIGGER_DECISION_NOW（确定性秒数）
+printf 'schema_version=2\nid=t_nd\ntrigger=09:00\naction.command=echo x\n' > "$SNAP/t_nd.task"
+nout=$(TRIGGER_DECISION_NOW=0855 TASK_CLI_LOCK="" task_cli_status t_nd 2>/dev/null)
+grep -q '^next_due=300$' <<< "$nout" \
+    && ok "P5-08 status: next_due=300 for time 09:00 at 08:55" \
+    || bad "P5-08 status: next_due(time)=[$(echo "$nout" | grep '^next_due=')]"
+printf 'schema_version=2\nid=t_os\ntrigger=oneshot:0830\naction.command=echo x\n' > "$SNAP/t_os.task"
+nout=$(TRIGGER_DECISION_NOW=0900 TASK_CLI_LOCK="" task_cli_status t_os 2>/dev/null)
+grep -q '^next_due=84600$' <<< "$nout" \
+    && ok "P5-08 status: next_due=84600 for oneshot:0830 at 09:00 (tomorrow 08:30)" \
+    || bad "P5-08 status: next_due(oneshot)=[$(echo "$nout" | grep '^next_due=')]"
+# last_trigger_cause：构造 scheduler/audit.log 后反向 grep 末条 op=exec
+mkdir -p "$BASE/scheduler"
+printf '2026-09-06 08:30:00|op=exec|task=t_p5|trigger=interval:15|mode=managed|rc=0|ron=0|del=0|cause=interval\n' >> "$BASE/scheduler/audit.log"
+printf '2026-09-06 08:45:00|op=exec|task=t_p5|trigger=interval:15|mode=managed|rc=1|ron=0|del=0|cause=interval\n' >> "$BASE/scheduler/audit.log"
+aout=$(TASK_CLI_TASKS_DIR="$RUNDIR" TASK_CLI_LOCK="$LKF" task_cli_status t_p5 2>/dev/null)
+grep -q '^last_trigger_cause=interval$' <<< "$aout" \
+    && ok "P5-08 status: last_trigger_cause=interval (reverse grep last op=exec audit)" \
+    || bad "P5-08 status: last_trigger_cause=[$(echo "$aout" | grep '^last_trigger_cause=')]"
+# 既有字段零回退（精确 grep 断言）
+zout=$(TASK_CLI_LOCK="" task_cli_status t45_2200 2>/dev/null)
+for zpat in '^id=t45_2200$' '^name=echo$' '^enabled=1$' '^trigger=22:00$' '^action=echo "No modifiers at all"$' '^source.type=line$' '^source.line=45$' '^state=PENDING$' '^run_count=0$' '^legacy_status=$'; do
+    grep -q "$zpat" <<< "$zout" || { echo "   missing: $zpat"; zero_reg=1; }
+done
+[ -z "${zero_reg:-}" ] && ok "P5-08 status: existing fields zero regression (10 field lines intact)" \
+    || bad "P5-08 status: existing fields regressed"
+
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 rm -f "$LKF"

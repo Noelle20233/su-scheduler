@@ -171,6 +171,92 @@ done
 [ "$n" -eq 0 ] && ok "P2-08 old-cli: no function named tasks()/list()/status() (legacy command names not overridden)" || bad "P2-08 old-cli: name-override count=$n"
 grep -q 'task-info) shift; cmd_task_info' "$CLI" && ok "P2-08 old-cli: task-info command untouched" || bad "P2-08 old-cli: task-info changed"
 
+# ── 9) P5-08：task status 新字段 + task-info managed 域新标签 ───────────────
+# 复用 §5b managed 构造（TCFG_DIR=$MTC 已含 dep_a/dep_b/t_dep/t_empty）；追加
+# interval 任务 t_int 与 task.state 条件任务 t_cst（确定性求值，不依赖真实时钟）
+export TCFG_DIR="$MTC"
+printf 'schema_version=2\nid=t_int\ntrigger=interval:15\naction.command=echo x\n' > "$MTC/t_int.task"
+printf 'schema_version=2\nid=t_cst\ntrigger=09:00\ndependency=dep_a\ncondition={{ task.state(dep_a) == STOPPED }}\naction.command=echo x\n' > "$MTC/t_cst.task"
+rm -f "$BASE/scheduler/source.md5"
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+# trigger_kind（interval）与 next_due（time，注入 TRIGGER_DECISION_NOW）
+sout=$(TRIGGER_DECISION_NOW=0855 task_cli_status_id "$BASE" "$RUN" "" t_int 2>/dev/null)
+grep -q '^trigger_kind=kind=interval;minutes=15$' <<< "$sout" \
+    && ok "P5-08 status: trigger_kind=kind=interval;minutes=15 (managed)" \
+    || bad "P5-08 status: trigger_kind=[$(echo "$sout" | grep '^trigger_kind=')]"
+sout=$(TRIGGER_DECISION_NOW=0855 task_cli_status_id "$BASE" "$RUN" "" t_empty 2>/dev/null)
+grep -q '^next_due=300$' <<< "$sout" \
+    && ok "P5-08 status: next_due=300 for time 09:00 at 08:55 (managed)" \
+    || bad "P5-08 status: next_due=[$(echo "$sout" | grep '^next_due=')]"
+# last_trigger_cause：构造 scheduler/audit.log → 反向 grep 末条 op=exec
+mkdir -p "$BASE/scheduler"
+printf '2026-09-06 09:00:00|op=exec|task=t_empty|trigger=09:00|mode=managed|rc=0|ron=0|del=0|cause=time_trigger\n' >> "$BASE/scheduler/audit.log"
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_empty 2>/dev/null)
+grep -q '^last_trigger_cause=time_trigger$' <<< "$sout" \
+    && ok "P5-08 status: last_trigger_cause=time_trigger (audit reverse grep)" \
+    || bad "P5-08 status: last_trigger_cause=[$(echo "$sout" | grep '^last_trigger_cause=')]"
+# condition_state / dependency_state：dep_a STOPPED → ok/satisfied；FAILED → unsat/unsat
+mkdir -p "$RUN/dep_a"
+printf 'STOPPED\n' > "$RUN/dep_a/state.txt"
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_cst 2>/dev/null)
+grep -q '^condition_state=ok$' <<< "$sout" && grep -q '^dependency_state=satisfied$' <<< "$sout" \
+    && ok "P5-08 status: condition_state=ok + dependency_state=satisfied (dep_a STOPPED)" \
+    || bad "P5-08 status: STOPPED case cond=[$(echo "$sout" | grep '^condition_state=')] dep=[$(echo "$sout" | grep '^dependency_state=')]"
+printf 'FAILED\n' > "$RUN/dep_a/state.txt"
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_cst 2>/dev/null)
+grep -q '^condition_state=unsat$' <<< "$sout" && grep -q '^dependency_state=unsat$' <<< "$sout" \
+    && ok "P5-08 status: condition_state=unsat + dependency_state=unsat (dep_a FAILED)" \
+    || bad "P5-08 status: FAILED case cond=[$(echo "$sout" | grep '^condition_state=')] dep=[$(echo "$sout" | grep '^dependency_state=')]"
+rm -f "$RUN/dep_a/state.txt"
+# 空 condition / 空 dependency → ok
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_empty 2>/dev/null)
+grep -q '^condition_state=ok$' <<< "$sout" && grep -q '^dependency_state=ok$' <<< "$sout" \
+    && ok "P5-08 status: empty condition/dependency -> ok (managed)" \
+    || bad "P5-08 status: empty cond/dep=[$(echo "$sout" | grep -E '^(condition_state|dependency_state)=' | tr '\n' ' ')]"
+# 兼容红线：canonical 查询无 queried_id（P2-08 L81 语义保持）
+sout=$(task_cli_status_id "$BASE" "$RUN" "" t_dep 2>/dev/null)
+grep -q '^queried_id=' <<< "$sout" && bad "P5-08 redline: canonical query emits queried_id" \
+    || ok "P5-08 redline: canonical query no queried_id (kept)"
+# task-info managed 域新标签（CLI body source + 强制 RUNTIME_LOADED=1 + 覆盖路径）
+CLI_BODY=$(sed '/^# 🚦 Main Dispatcher/,$d' "$CLI" | tr -d '\r' | sed '/^unset /d; /^export PATH=/d')
+cli_info_managed() {   # <id> → CLI_OUT
+    CLI_OUT=$( {
+        set +u
+        . ./$RTLIB 2>/dev/null || true
+        eval "$CLI_BODY"
+        RUNTIME_LOADED=1
+        DATA_DIR="$BASE"
+        TASKS_DIR="$RUN"
+        SHELLS_DIR="$T/shells"
+        TCFG_DIR="$MTC"
+        cmd_task_info "$1"
+    } 2>&1 )
+}
+mkdir -p "$RUN/t_empty"
+printf 'echo x\n' > "$RUN/t_empty/command.txt"
+printf 'SUCCESS\n' > "$RUN/t_empty/status.txt"
+TRIGGER_DECISION_NOW=0855 cli_info_managed t_empty
+printf '%s\n' "$CLI_OUT" | grep -qE 'Trigger:.*kind=time;time=0900' \
+    && ok "P5-08 task-info: Trigger: kind=time;time=0900 (managed)" \
+    || bad "P5-08 task-info: Trigger line missing out=[$(printf '%s\n' "$CLI_OUT" | grep -E 'Trigger|Next|Cause|State' | tr '\n' ' ')]"
+printf '%s\n' "$CLI_OUT" | grep -qE 'Next Due:.*300s' \
+    && ok "P5-08 task-info: Next Due: 300s (managed)" \
+    || bad "P5-08 task-info: Next Due line missing"
+printf '%s\n' "$CLI_OUT" | grep -qE 'Dependency State:.*ok' \
+    && ok "P5-08 task-info: Dependency State: ok (managed)" \
+    || bad "P5-08 task-info: Dependency State line missing"
+printf '%s\n' "$CLI_OUT" | grep -qE 'Condition State:.*ok' \
+    && ok "P5-08 task-info: Condition State: ok (managed)" \
+    || bad "P5-08 task-info: Condition State line missing"
+# legacy 域 task-info 不显示新字段（RUNTIME_LOADED=0 经 cli harness；既有输出零改动）
+. ./tests/cli/harness.sh
+CLI_TMP="$T/cli"; mkdir -p "$CLI_TMP/tasks/t_empty" "$CLI_TMP/shells"
+printf 'echo x\n' > "$CLI_TMP/tasks/t_empty/command.txt"
+printf 'SUCCESS\n' > "$CLI_TMP/tasks/t_empty/status.txt"
+cli_run cmd_task_info t_empty
+printf '%s\n' "$CLI_OUT" | grep -q 'kind=time' && bad "P5-08 task-info: legacy domain shows Trigger line" \
+    || ok "P5-08 task-info: legacy domain no new labels (RUNTIME_LOADED=0, C2 intact)"
+
 # ── 8) 接线 + POSIX ────────────────────────────────────────────────────────
 grep -q 'cmd_task_list()' "$CLI" && grep -q 'task_cli_attach "$DATA_DIR"' "$CLI" && ok "P2-08 wiring: task list reads registry via attach (no config rescan)" || bad "P2-08 wiring: task list attach missing"
 grep -q 'task_cli_status_id "$DATA_DIR"' "$CLI" && ok "P2-08 wiring: task status routes via §13 status_id" || bad "P2-08 wiring: status_id missing in CLI"

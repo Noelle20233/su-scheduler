@@ -111,7 +111,7 @@ print_help() {
     echo -e "  ${GREEN}edit${RESET} ${CYAN}[editor]${RESET}             Crack open the config 🎨"
     echo -e "  ${GREEN}log${RESET} ${YELLOW}[-f|-n NUM]${RESET}          View logs (-f=follow, -n=lines) 🕵️"
     echo -e "  ${GREEN}tasks${RESET}                    List only running tasks 📋"
-    echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id> | enable <id> | disable <id> | start <id> | stop <id> | restart <id> | check <id> | logs <id>}${RESET}   Registry Task CLI + 控制 (P2-08/P3-07) 🗂️"
+    echo -e "  ${GREEN}task${RESET} ${CYAN}{list | status <id> [<id>...] | enable <id> | disable <id> | start <id> | stop <id> | restart <id> | check <id> | logs <id>}${RESET}   Registry Task CLI + 控制 (P2-08/P3-07) 🗂️"
     echo -e "  ${GREEN}task-config${RESET} ${CYAN}{status|import|export|rollback|list|show|set|new|apply|rm}${RESET}   Task v2 配置存储与迁移 (P3-02) 🗄️"
     echo -e "  ${GREEN}ipc${RESET} ${CYAN}<OP> [k=v ...]${RESET}         本地 IPC 控制面客户端 (P3-04) 🔌"
     echo -e "      ${YELLOW}OP:${RESET} GET_TASKS|GET_TASK_STATUS|GET_TASK_LOG|VALIDATE_TASK|CREATE_TASK|UPDATE_TASK|DELETE_TASK|ENABLE_TASK|DISABLE_TASK|START_TASK|STOP_TASK|RESTART_TASK|CHECK_TASK|GET_SUMMARY|GET_TASK_DETAIL|GET_TASK_EVENTS|GET_DAEMON_LOG|GET_TASK_EDIT|EDIT_TASK"
@@ -509,10 +509,24 @@ cmd_task_info() {
     [ -f "$task_dir/exit_code.txt" ] && echo -e "${BOLD}Exit Code:${RESET} $(cat "$task_dir/exit_code.txt")"
     # P4-09：managed 域任务附加 dependency/condition 观测（legacy 显示空/不显示）
     if [ "$RUNTIME_LOADED" -eq 1 ] && tcfg_is_managed 2>/dev/null; then
+        task_cli_attach "$DATA_DIR" >/dev/null 2>&1
         tf=$(tcfg_task_file "$task_id" 2>/dev/null)
         if [ -n "$tf" ] && [ -f "$tf" ]; then
             echo -e "${BOLD}Dependency:${RESET} $(grep '^dependency=' "$tf" | head -1 | cut -d= -f2-)"
             echo -e "${BOLD}Condition:${RESET} $(grep '^condition=' "$tf" | head -1 | cut -d= -f2-)"
+            # P5-08：managed 域附加只读查询（Trigger/Next Due/Last Trigger Cause/
+            # Condition State/Dependency State；既有行零改动，仅附加行）
+            tinfo_trig=$(grep '^trigger=' "$tf" | head -1 | cut -d= -f2)
+            echo -e "${BOLD}Trigger:${RESET} $(task_cli_trigger_kind "$tinfo_trig" 2>/dev/null)"
+            tinfo_nd=$(TASK_CLI_BASE="$DATA_DIR" task_cli_next_due "$DATA_DIR" "$tinfo_trig" "$task_id" 2>/dev/null) || tinfo_nd=""
+            if [ -n "$tinfo_nd" ]; then
+                echo -e "${BOLD}Next Due:${RESET} ${tinfo_nd}s"
+            else
+                echo -e "${BOLD}Next Due:${RESET} -"
+            fi
+            echo -e "${BOLD}Last Trigger Cause:${RESET} $(TASK_CLI_BASE="$DATA_DIR" task_cli_last_cause "$task_id" 2>/dev/null)"
+            echo -e "${BOLD}Condition State:${RESET} $(obs_cond_state "$TASKS_DIR" "$task_id")"
+            echo -e "${BOLD}Dependency State:${RESET} $(obs_dep_state "$TASKS_DIR" "$task_id")"
         fi
     fi
     echo -e "${BLUE}============================================================${RESET}"
@@ -1201,8 +1215,25 @@ cmd_task_list() {
 }
 cmd_task_status() {
     local id="${1:-}"
-    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task status <id>" >&2; return 1; }
-    task_cli_status_id "$DATA_DIR" "$TASKS_DIR" "/dev/.su_scheduler.lock" "$id"
+    [ -n "$id" ] || { echo "ERROR: usage: su-scheduler task status <id> [<id>...]" >&2; return 1; }
+    if [ $# -eq 1 ]; then
+        task_cli_status_id "$DATA_DIR" "$TASKS_DIR" "/dev/.su_scheduler.lock" "$id"
+        return $?
+    fi
+    # P5-08：批量查询（B7：CLI 层循环 registry 直读，不新增 IPC op；仿 task_ctl_multi）
+    local rc failed=""
+    for id in "$@"; do
+        task_cli_status_id "$DATA_DIR" "$TASKS_DIR" "/dev/.su_scheduler.lock" "$id"
+        rc=$?
+        if [ "$rc" -ne 0 ]; then
+            failed="$failed $id"
+        fi
+    done
+    if [ -n "$failed" ]; then
+        echo "FAILED:$failed" >&2
+        return 1
+    fi
+    return 0
 }
 
 # 🎛️ Task 控制子命令（P3-07）：与 WebUI 共用同一控制 API

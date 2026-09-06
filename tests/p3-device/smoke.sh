@@ -152,10 +152,10 @@ echo "$DS" | grep -qi "Alive" && ok "2-boot: daemon alive via service.sh (boot-s
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════
-# 3) Runtime Library 加载（daemon log 记录 Runtime v1.29.0 loaded）
+# 3) Runtime Library 加载（daemon log 记录 Runtime v1.30.0 loaded）
 # ═══════════════════════════════════════════════════════════════════════════
 RL=$(adb shell "su -c 'tail -200 $DATA/su-scheduler.log'" 2>/dev/null | grep -m1 "Runtime library loaded" | tr -d '\r')
-echo "$RL" | grep -q "v1.29.0" && ok "3-runtime: daemon loaded Runtime v1.29.0" || bad "3-runtime: load line=[$RL]"
+echo "$RL" | grep -q "v1.30.0" && ok "3-runtime: daemon loaded Runtime v1.30.0" || bad "3-runtime: load line=[$RL]"
 tick
 
 # ═══════════════════════════════════════════════════════════════════════════

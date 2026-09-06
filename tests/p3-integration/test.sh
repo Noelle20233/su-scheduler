@@ -135,6 +135,10 @@ BOOTID=$(registry_task_ids | while read -r id; do grep -q '^trigger=boot$' "$TCF
     || bad "P3-09 sched: no boot task executed"
 grep -q 'trigger=boot' "$BASE/scheduler/audit.log" 2>/dev/null \
     && ok "P3-09 sched: scheduler audit.log records boot source" || bad "P3-09 sched: audit missing"
+# P5-08：op=exec 审计行含 cause=（触发原因透传，尾部只增字段）
+grep -q 'op=exec.*cause=boot' "$BASE/scheduler/audit.log" 2>/dev/null \
+    && ok "P5-08 audit: op=exec carries cause=boot (trigger reason passthrough)" \
+    || bad "P5-08 audit: op=exec missing cause= (log=$(tail -3 "$BASE/scheduler/audit.log" 2>/dev/null | tr '\n' ' '))"
 
 # ── 7) WebUI Dashboard：GET_SUMMARY 经真实 IPC 通道（multi-task 计数）──────
 ipc_server_init "$BASE" >/dev/null 2>&1

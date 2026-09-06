@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.29.0"
+RUNTIME_LIB_VERSION="1.30.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -417,7 +417,9 @@ tpr_trigger_time_next_due() {
     th=$(echo "$norm" | cut -c1-2); tm=$(echo "$norm" | cut -c3-4)
     th=$(echo "$th" | sed 's/^0*//'); tm=$(echo "$tm" | sed 's/^0*//')
     [ -z "$th" ] && th=0; [ -z "$tm" ] && tm=0
-    nh=$(date +%H | sed 's/^0*//'); nm=$(date +%M | sed 's/^0*//')
+    tn=$(tpr_ctx_now)   # P5-08：注入 TRIGGER_DECISION_NOW 覆盖当前时刻（语义不变）
+    nh=$(echo "$tn" | cut -c1-2); nm=$(echo "$tn" | cut -c3-4)
+    nh=$(echo "$nh" | sed 's/^0*//'); nm=$(echo "$nm" | sed 's/^0*//')
     [ -z "$nh" ] && nh=0; [ -z "$nm" ] && nm=0
     target=$((th * 60 + tm)); now=$((nh * 60 + nm))
     if [ "$target" -gt "$now" ]; then
@@ -508,8 +510,91 @@ tpr_trigger_advanced_matches() {
     esac
     return 1
 }
+# ── P5-08 next_due 日历推进助手（纯算术，无子进程；dow 统一 0-6 推进，1-7 比对时归一）─
+_tpr_cal_days_in_month() {   # <yy> <mm> → echo 当月天数
+    cd_y=$1; cd_m=$2
+    case "$cd_m" in
+        1|3|5|7|8|10|12) echo 31 ;;
+        4|6|9|11) echo 30 ;;
+        2)
+            if [ $((cd_y % 4)) -eq 0 ] && { [ $((cd_y % 100)) -ne 0 ] || [ $((cd_y % 400)) -eq 0 ]; }; then
+                echo 29
+            else
+                echo 28
+            fi ;;
+        *) echo 30 ;;
+    esac
+}
+_tpr_cal_advance_day() {   # 状态：_cry/_crmo/_crd/_crdow（dow 0-6，Sun=0）前进一天
+    _crd=$((_crd + 1))
+    _crdow=$(((_crdow + 1) % 7))
+    _cdim=$(_tpr_cal_days_in_month "$_cry" "$_crmo")
+    if [ "$_crd" -gt "$_cdim" ]; then
+        _crd=1
+        _crmo=$((_crmo + 1))
+        if [ "$_crmo" -gt 12 ]; then
+            _crmo=1
+            _cry=$((_cry + 1))
+        fi
+    fi
+}
+_tpr_adv_trigger_time() {   # <trigger> → echo HHMM（按家族取时间字段位）
+    _att=$1
+    case "$_att" in
+        weekly:*|monthly:*)   echo "$(echo "$_att" | cut -d: -f3)" ;;
+        nweekly:*|nmonthly:*) echo "$(echo "$_att" | cut -d: -f4)" ;;
+        yearly:*)             echo "$(echo "$_att" | cut -d: -f3)" ;;
+    esac
+}
+_tpr_adv_day_match() {   # <trigger> <yy> <mm> <dd> <dow0-6> → 0=候选日命中
+    _adm_trig=$1; _adm_mm=$2; _adm_dd=$3; _adm_dow=$4
+    [ "$_adm_dow" -eq 0 ] && _adm_dow=7
+    case "$_adm_trig" in
+        weekly:*)
+            _adm_tdow=$(echo "$_adm_trig" | cut -d: -f2)
+            [ "$_adm_dow" = "$_adm_tdow" ] && return 0 || return 1 ;;
+        nweekly:*)
+            _adm_tdow=$(echo "$_adm_trig" | cut -d: -f3)
+            [ "$_adm_dow" = "$_adm_tdow" ] && return 0 || return 1 ;;
+        monthly:*|nmonthly:*)
+            _adm_tdd=$(echo "$_adm_trig" | cut -d: -f2)
+            [ "$_adm_dd" = "$_adm_tdd" ] && return 0 || return 1 ;;
+        yearly:*)
+            _adm_tdate=$(echo "$_adm_trig" | cut -d: -f2)
+            [ "${_adm_mm}${_adm_dd}" = "$_adm_tdate" ] && return 0 || return 1 ;;
+        *) return 1 ;;
+    esac
+}
 tpr_trigger_advanced_next_due() {
-    if tpr_trigger_advanced_matches "$1"; then echo 0; return 0; fi
+    _adtrig=$1
+    tpr_trigger_advanced_validate "$_adtrig" || return 1
+    _cry=$(tpr_ctx_date %Y); _crmo=$(tpr_ctx_date %m); _crd=$(tpr_ctx_date %d)
+    _crdow=$(( $(tpr_ctx_date %u) % 7 ))
+    _adnow=$(tpr_ctx_now)
+    _crh=$(echo "$_adnow" | cut -c1-2); _crmin=$(echo "$_adnow" | cut -c3-4)
+    _crh=$(echo "$_crh" | sed 's/^0*//'); _crmin=$(echo "$_crmin" | sed 's/^0*//')
+    [ -z "$_crh" ] && _crh=0; [ -z "$_crmin" ] && _crmin=0
+    _adnowmin=$((_crh * 60 + _crmin))
+    _adtt=$(_tpr_adv_trigger_time "$_adtrig")
+    _adth=$(echo "$_adtt" | cut -c1-2); _adtm=$(echo "$_adtt" | cut -c3-4)
+    _adth=$(echo "$_adth" | sed 's/^0*//'); _adtm=$(echo "$_adtm" | sed 's/^0*//')
+    [ -z "$_adth" ] && _adth=0; [ -z "$_adtm" ] && _adtm=0
+    _adttmin=$((_adth * 60 + _adtm))
+    _adday=0
+    while [ "$_adday" -le 366 ]; do
+        if _tpr_adv_day_match "$_adtrig" "$_crmo" "$_crd" "$_crdow"; then
+            if [ "$_adday" -gt 0 ]; then
+                echo $(((_adday * 1440 + (_adttmin - _adnowmin)) * 60))
+                return 0
+            fi
+            if [ "$_adttmin" -ge "$_adnowmin" ]; then
+                echo $(((_adttmin - _adnowmin) * 60))
+                return 0
+            fi
+        fi
+        _tpr_cal_advance_day
+        _adday=$((_adday + 1))
+    done
     return 1
 }
 
@@ -572,8 +657,28 @@ tpr_trigger_oneshot_matches() {
     [ "$(echo "$1" | cut -d: -f2)" = "$(tpr_ctx_now)" ] && return 0 || return 1
 }
 tpr_trigger_oneshot_next_due() {
-    if tpr_trigger_oneshot_matches "$1"; then echo 0; return 0; fi
-    return 1
+    [ -n "$1" ] || return 1
+    os_norm=$(echo "$1" | cut -d: -f2)
+    case "$os_norm" in
+        [0-9][0-9][0-9][0-9]) ;;
+        *) return 1 ;;
+    esac
+    os_th=$(echo "$os_norm" | cut -c1-2); os_tm=$(echo "$os_norm" | cut -c3-4)
+    os_th=$(echo "$os_th" | sed 's/^0*//'); os_tm=$(echo "$os_tm" | sed 's/^0*//')
+    [ -z "$os_th" ] && os_th=0; [ -z "$os_tm" ] && os_tm=0
+    os_now=$(tpr_ctx_now)
+    os_nh=$(echo "$os_now" | cut -c1-2); os_nm=$(echo "$os_now" | cut -c3-4)
+    os_nh=$(echo "$os_nh" | sed 's/^0*//'); os_nm=$(echo "$os_nm" | sed 's/^0*//')
+    [ -z "$os_nh" ] && os_nh=0; [ -z "$os_nm" ] && os_nm=0
+    os_target=$((os_th * 60 + os_tm)); os_nowmin=$((os_nh * 60 + os_nm))
+    if [ "$os_target" -gt "$os_nowmin" ]; then
+        echo $(((os_target - os_nowmin) * 60))
+    elif [ "$os_target" -eq "$os_nowmin" ]; then
+        echo 0
+    else
+        echo $(((1440 - os_nowmin + os_target) * 60))
+    fi
+    return 0
 }
 
 # ── TriggerProvider: delay（P5-05，创建后延迟 N 分钟执行一次）────────────────
@@ -601,8 +706,18 @@ tpr_trigger_delay_matches() {
     [ $((now - base)) -ge "$n" ] && return 0 || return 1
 }
 tpr_trigger_delay_next_due() {
-    if tpr_trigger_delay_matches "$1"; then echo 0; return 0; fi
-    return 1
+    [ -n "$1" ] || return 1
+    dly_n=$(echo "$1" | cut -d: -f2)
+    case "$dly_n" in ''|*[!0-9]*) return 1 ;; esac
+    dly_tid=${TRIGGER_TASK_ID:-x}
+    dly_base=$(tpr_trigger_state_read "dl_$dly_tid")
+    [ -n "$dly_base" ] || return 1
+    [ "$(tpr_trigger_state_read "dlx_$dly_tid")" = "1" ] && return 1
+    dly_now=$(tpr_ctx_epoch_min)
+    dly_diff=$((dly_base + dly_n - dly_now))
+    [ "$dly_diff" -lt 0 ] && dly_diff=0
+    echo $((dly_diff * 60))
+    return 0
 }
 
 # ── TriggerProvider: interval（P5-05，每 N 分钟重复）────────────────────────
@@ -627,8 +742,17 @@ tpr_trigger_interval_matches() {
     [ $((now - last)) -ge "$n" ] && return 0 || return 1
 }
 tpr_trigger_interval_next_due() {
-    if tpr_trigger_interval_matches "$1"; then echo 0; return 0; fi
-    return 1
+    [ -n "$1" ] || return 1
+    iv_n=$(echo "$1" | cut -d: -f2)
+    case "$iv_n" in ''|*[!0-9]*) return 1 ;; esac
+    iv_tid=${TRIGGER_TASK_ID:-x}
+    iv_last=$(tpr_trigger_state_read "iv_$iv_tid")
+    [ -n "$iv_last" ] || return 1
+    iv_now=$(tpr_ctx_epoch_min)
+    iv_diff=$((iv_last + iv_n - iv_now))
+    [ "$iv_diff" -lt 0 ] && iv_diff=0
+    echo $((iv_diff * 60))
+    return 0
 }
 
 # ── TriggerProvider: cron（P5-05，五段全匹配 + 日级去重；严格 AND）───────────
@@ -694,8 +818,66 @@ tpr_trigger_cron_matches() {
     tpr_trigger_cron_field_match "$5" "$now_dow" || return 1
     return 0
 }
+_tpr_cron_split() {   # <5 段参> → $_c1..$_c5；段数≠5 → return 1
+    _cif=$IFS; IFS=' '
+    _cf=$-; case "$_cf" in *f*) ;; *) set -f ;; esac
+    set -- $1
+    IFS=$_cif
+    case "$_cf" in *f*) ;; *) set +f ;; esac
+    [ $# -eq 5 ] || return 1
+    _c1=$1; _c2=$2; _c3=$3; _c4=$4; _c5=$5
+    return 0
+}
+_tpr_cron_field_match_fast() {   # <field> <value> → 0=段匹配（next_due 热循环用，无子进程）
+    tff_f=$1; tff_v=$2
+    case "$tff_f" in
+        '*') return 0 ;;
+        '*/'*)
+            tff_n=${tff_f#\*/}
+            case "$tff_n" in ''|*[!0-9]*) return 1 ;; esac
+            [ $((tff_v % tff_n)) -eq 0 ] && return 0 || return 1 ;;
+        *,*) tpr_trigger_cron_list_match "$tff_f" "$tff_v" ;;
+        *)
+            tff_z=$tff_f
+            while :; do
+                case "$tff_z" in 0*) tff_z=${tff_z#0} ;; *) break ;; esac
+            done
+            [ -z "$tff_z" ] && tff_z=0
+            [ "$tff_z" = "$tff_v" ] && return 0 || return 1 ;;
+    esac
+}
 tpr_trigger_cron_next_due() {
-    if tpr_trigger_cron_matches "$1"; then echo 0; return 0; fi
+    [ -n "$1" ] || return 1
+    _tpr_cron_split "${1#cron:}" || return 1
+    _cry=$(tpr_ctx_date %Y); _crmo=$(tpr_ctx_date %m); _crd=$(tpr_ctx_date %d)
+    _crdow=$(( $(tpr_ctx_date %u) % 7 ))
+    _crnow=$(tpr_ctx_now)
+    _crh=$(echo "$_crnow" | cut -c1-2); _crmin=$(echo "$_crnow" | cut -c3-4)
+    _crh=$(echo "$_crh" | sed 's/^0*//'); _crmin=$(echo "$_crmin" | sed 's/^0*//')
+    [ -z "$_crh" ] && _crh=0; [ -z "$_crmin" ] && _crmin=0
+    _cstart=$((_crh * 60 + _crmin))
+    # 日级推进 + 日内分钟扫描（分钟/日级近似，≤366 天防死循环；秒数 = 距当前时刻）
+    _cri=0
+    while [ "$_cri" -le 366 ]; do
+        if _tpr_cron_field_match_fast "$_c4" "$_crmo" \
+           && _tpr_cron_field_match_fast "$_c3" "$_crd" \
+           && _tpr_cron_field_match_fast "$_c5" "$_crdow"; then
+            _cscan=0
+            [ "$_cri" -eq 0 ] && _cscan=$_cstart
+            _cti=$_cscan
+            while [ "$_cti" -le 1439 ]; do
+                _cth=$((_cti / 60)); _ctm=$((_cti % 60))
+                if _tpr_cron_field_match_fast "$_c2" "$_cth" \
+                   && _tpr_cron_field_match_fast "$_c1" "$_ctm"; then
+                    echo $(((_cri * 1440 + _cti - _cstart) * 60))
+                    return 0
+                fi
+                _cti=$((_cti + 1))
+            done
+        fi
+        _tpr_cal_advance_day
+        _cri=$((_cri + 1))
+    done
     return 1
 }
 
@@ -1312,6 +1494,51 @@ task_cli_list() {
     return 0
 }
 
+# ── P5-08 只读查询助手（trigger_kind / next_due / last_trigger_cause）─────────
+# 数据源：registry 快照 + scheduler/audit.log（只读；供 task status 与 task-info）。
+# base 解析：TASK_CLI_BASE 优先（CLI 注入），回退 TR_BASE（registry_attach 设置）。
+task_cli_base() { echo "${TASK_CLI_BASE:-${TR_BASE:-}}"; }
+task_cli_audit_file() { echo "$(task_cli_base)/scheduler/audit.log"; }
+task_cli_trigger_kind() {   # <trigger> → kind=...;...（未知家族 → 空 + rc1）
+    tk_trig=$1
+    case "$tk_trig" in
+        boot) echo "kind=boot" ;;
+        boot_completed) echo "kind=bootcompleted" ;;
+        oneshot:*)     provider_dispatch trigger oneshot parse "$tk_trig" 2>/dev/null ;;
+        delay:*)       provider_dispatch trigger delay parse "$tk_trig" 2>/dev/null ;;
+        interval:*)    provider_dispatch trigger interval parse "$tk_trig" 2>/dev/null ;;
+        cron:*)        provider_dispatch trigger cron parse "$tk_trig" 2>/dev/null ;;
+        [0-9][0-9]:[0-9][0-9]|[0-9][0-9][0-9][0-9]) provider_dispatch trigger time parse "$tk_trig" 2>/dev/null ;;
+        weekly:*|nweekly:*|monthly:*|nmonthly:*|yearly:*) provider_dispatch trigger advanced parse "$tk_trig" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+task_cli_next_due() {   # <base> <trigger> <id> → echo 距下次命中秒数（rc0）；不可预测 rc1
+    nd_base=$1; nd_trig=$2; nd_id=$3
+    case "$nd_trig" in
+        boot) TRIGGER_BOOT_CONTEXT=${TRIGGER_BOOT_CONTEXT:-0} \
+            provider_dispatch trigger boot next_due "$nd_trig" 2>/dev/null ;;
+        boot_completed) TRIGGER_BOOT_COMPLETED_CONTEXT=${TRIGGER_BOOT_COMPLETED_CONTEXT:-0} \
+            provider_dispatch trigger bootcompleted next_due "$nd_trig" 2>/dev/null ;;
+        oneshot:*) provider_dispatch trigger oneshot next_due "$nd_trig" 2>/dev/null ;;
+        delay:*) TRIGGER_STATE_FILE="$nd_base/schedule_state.txt" TRIGGER_TASK_ID="$nd_id" \
+            provider_dispatch trigger delay next_due "$nd_trig" 2>/dev/null ;;
+        interval:*) TRIGGER_STATE_FILE="$nd_base/schedule_state.txt" TRIGGER_TASK_ID="$nd_id" \
+            provider_dispatch trigger interval next_due "$nd_trig" 2>/dev/null ;;
+        cron:*) provider_dispatch trigger cron next_due "$nd_trig" 2>/dev/null ;;
+        [0-9][0-9]:[0-9][0-9]|[0-9][0-9][0-9][0-9]) provider_dispatch trigger time next_due "$nd_trig" 2>/dev/null ;;
+        weekly:*|nweekly:*|monthly:*|nmonthly:*|yearly:*) provider_dispatch trigger advanced next_due "$nd_trig" 2>/dev/null ;;
+        *) return 1 ;;
+    esac
+}
+task_cli_last_cause() {   # <id> → scheduler/audit.log 末条 op=exec 的 cause=（无 → 空+rc1）
+    lc_id=$1
+    lc_f=$(task_cli_audit_file)
+    [ -f "$lc_f" ] || return 1
+    grep -F "task=$lc_id|" "$lc_f" 2>/dev/null | grep -F 'op=exec' | tail -1 \
+        | sed -n 's/.*|cause=\([^|]*\).*/\1/p'
+}
+
 task_cli_status() {
     id=$1
     [ -n "$id" ] || { echo "ERROR: usage: task status <id>" >&2; return 1; }
@@ -1358,6 +1585,15 @@ task_cli_status() {
     else
         echo "last_event="
     fi
+    # P5-08：触发/下次执行/最近原因/条件/依赖 只读摘要（既有行零改动，仅新增行）
+    st_trig=$(grep '^trigger=' "$f" | head -1 | cut -d= -f2)
+    tk=$(task_cli_trigger_kind "$st_trig" 2>/dev/null) || tk=""
+    echo "trigger_kind=$tk"
+    nd=$(task_cli_next_due "$(task_cli_base)" "$st_trig" "$id" 2>/dev/null) || nd=""
+    echo "next_due=$nd"
+    echo "last_trigger_cause=$(task_cli_last_cause "$id" 2>/dev/null)"
+    echo "condition_state=$(obs_cond_state "${TASK_CLI_TASKS_DIR:-}" "$id")"
+    echo "dependency_state=$(obs_dep_state "${TASK_CLI_TASKS_DIR:-}" "$id")"
     # P4-09：门控状态行（WAITING + 原因；缺省空）
     obs_g=$(obs_gate_state "${TASK_CLI_TASKS_DIR:-}" "$id")
     if [ -n "$obs_g" ]; then
@@ -3676,6 +3912,7 @@ sched_advance_waiting() {
     gres=$(sched_gate_check "$tasks" "$id")
     grc=$?
     out=$(trigger_decide "$base" "$id" "$now" "$boot" "$base/schedule_state.txt")
+    cause=$(printf '%s' "$out" | sed -n 's/.*|cause=\([^|]*\).*/\1/p')   # P5-08：透传触发原因
     case "$out" in
         *due=Y*) due=1 ;;
         *) due=0 ;;
@@ -3734,7 +3971,7 @@ sched_advance_waiting() {
             elif case "$trig" in oneshot:*) true ;; *) false ;; esac; then
                 sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
             fi
-            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=start|rc=$arc|mode=$(sched_source_mode "$base")"
+            sched_audit "$base" "op=advance|task=$id|trigger=$trig|action=start|rc=$arc|mode=$(sched_source_mode "$base")|cause=$cause"
             return 0
         fi
         state_log_event "$run_dir" "$id" rearm PENDING "" "" "deps ok but window closed" >/dev/null 2>&1
@@ -3789,6 +4026,7 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     tf=$(registry_task_file "$id" 2>/dev/null) || { sched_log "WARN execute: no task file $id"; return 2; }
     trig=$(sched_task_field "$tf" trigger)
     out=$(trigger_decide "$base" "$id" "$now" "$boot" "$base/schedule_state.txt")
+    cause=$(printf '%s' "$out" | sed -n 's/.*|cause=\([^|]*\).*/\1/p')   # P5-08：透传触发原因
     case "$out" in
         *due=Y*) ;;
         *) return 1 ;;
@@ -3868,7 +4106,7 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     elif case "$trig" in oneshot:*) true ;; *) false ;; esac; then
         sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
     fi
-    sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del"
+    sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del|cause=$cause"
     return "$arc"
 }
 # Registry 正式调度 tick（daemon 主循环 RUNTIME_LOADED=1 调用）：源重载 + 已
@@ -6061,6 +6299,7 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
               web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
               web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
               obs_gate_state obs_dep_state obs_cond_state \
+              task_cli_base task_cli_audit_file task_cli_trigger_kind task_cli_next_due task_cli_last_cause \
               tcfg_editor_num tcfg_editor_bool tcfg_editor_id_ok tcfg_editor_trigger_ok tcfg_editor_action_ok \
               tcfg_editor_health_ok tcfg_editor_recovery_ok tcfg_editor_validate_payload tcfg_apply_task ipc_op_get_task_edit ipc_op_edit_task \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \

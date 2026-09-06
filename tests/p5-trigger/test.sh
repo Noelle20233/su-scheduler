@@ -358,6 +358,63 @@ SCHED_CYCLE_NOW=202609060702 TRIGGER_BOOT_COMPLETED_CONTEXT=1 TRIGGER_TODAY=2026
     scheduler_tick "$SCHED_BASE" "$SCHED_CFG" "$SCHED_TASKS" "0702" >/dev/null 2>&1
 [ "$(grep -c '^s_bc|' "$SCHED_EXEC_LOG")" -eq 1 ] && ok "P5-05 sched: boot_completed not re-executed across ticks (bc_ key)" || bad "P5-05 sched: boot_completed re-exec (count=$(grep -c '^s_bc|' "$SCHED_EXEC_LOG"))"
 
+# ── §nextdue：P5-08 next_due 真计算（统一返回距下次命中秒数；注入确定性）──────
+# oneshot：距 HHMM 秒数（精确分钟=0；未来=当天差值；已过=明天同刻）
+out=$(TRIGGER_DECISION_NOW=0830 provider_dispatch trigger oneshot next_due oneshot:0830); rc=$?
+[ "$rc" -eq 0 ] && [ "$out" = "0" ] && ok "P5-08 next_due: oneshot exact minute -> 0" || bad "P5-08 next_due: oneshot now out=$out rc=$rc"
+out=$(TRIGGER_DECISION_NOW=1000 provider_dispatch trigger oneshot next_due oneshot:0830)
+[ "$out" = "81000" ] && ok "P5-08 next_due: oneshot passed (08:30 after 10:00) -> 81000s next day" || bad "P5-08 next_due: oneshot passed=$out"
+out=$(TRIGGER_DECISION_NOW=0900 provider_dispatch trigger oneshot next_due oneshot:1000)
+[ "$out" = "3600" ] && ok "P5-08 next_due: oneshot future same day -> 3600s" || bad "P5-08 next_due: oneshot future=$out"
+# delay：读 dl_<tid> 基准 + N 分钟；缺失基准 / dlx 已消费 → 不可预测（rc1）
+rm -f "$DSF"   # 清 §sched 残留状态（dlx 等），保证基准重建
+TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_dl" tpr_trigger_state_write dl_s_dl 5000 >/dev/null 2>&1
+out=$(TRIGGER_EPOCH_MIN=5010 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_dl" provider_dispatch trigger delay next_due delay:30)
+[ "$out" = "1200" ] && ok "P5-08 next_due: delay base+N diff -> 1200s (20min*60)" || bad "P5-08 next_due: delay=$out"
+out=$(TRIGGER_EPOCH_MIN=5035 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_dl" provider_dispatch trigger delay next_due delay:30)
+[ "$out" = "0" ] && ok "P5-08 next_due: delay elapsed -> 0" || bad "P5-08 next_due: delay elapsed=$out"
+TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_dl" tpr_trigger_state_write dlx_s_dl 1 >/dev/null 2>&1
+TRIGGER_EPOCH_MIN=5040 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_dl" \
+    provider_dispatch trigger delay next_due delay:30 >/dev/null 2>&1 \
+    && bad "P5-08 next_due: delay after once (dlx) should be unpredictable" \
+    || ok "P5-08 next_due: delay consumed (dlx) -> rc1"
+# interval：读 iv_<tid> last-run + N 分钟；last 缺失 → 不可预测（rc1）
+TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_iv" tpr_trigger_state_write iv_s_iv 7000 >/dev/null 2>&1
+out=$(TRIGGER_EPOCH_MIN=7010 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_iv" provider_dispatch trigger interval next_due interval:15)
+[ "$out" = "300" ] && ok "P5-08 next_due: interval last+N diff -> 300s" || bad "P5-08 next_due: interval=$out"
+out=$(TRIGGER_EPOCH_MIN=7020 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_iv" provider_dispatch trigger interval next_due interval:15)
+[ "$out" = "0" ] && ok "P5-08 next_due: interval elapsed -> 0" || bad "P5-08 next_due: interval elapsed=$out"
+rm -f "$DSF"
+TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_iv" \
+    provider_dispatch trigger interval next_due interval:15 >/dev/null 2>&1 \
+    && bad "P5-08 next_due: interval without last-run should be unpredictable" \
+    || ok "P5-08 next_due: interval no last-run -> rc1"
+# cron：5 段全字段推进找首次匹配（分钟级，TRIGGER_TODAY+TRIGGER_DECISION_NOW 确定性）
+out=$(TRIGGER_TODAY=20260906 TRIGGER_DECISION_NOW=0830 provider_dispatch trigger cron next_due 'cron:0 * * * *')
+[ "$out" = "1800" ] && ok "P5-08 next_due: cron :00 hourly at 08:30 -> 1800s" || bad "P5-08 next_due: cron hourly=$out"
+out=$(TRIGGER_TODAY=20260906 TRIGGER_DECISION_NOW=0833 provider_dispatch trigger cron next_due 'cron:*/15 * * * *')
+[ "$out" = "720" ] && ok "P5-08 next_due: cron */15 at 08:33 -> 720s (08:45)" || bad "P5-08 next_due: cron step=$out"
+out=$(TRIGGER_TODAY=20260906 TRIGGER_DECISION_NOW=0830 provider_dispatch trigger cron next_due 'cron:30 8 * * *')
+[ "$out" = "0" ] && ok "P5-08 next_due: cron current minute match -> 0" || bad "P5-08 next_due: cron now=$out"
+out=$(TRIGGER_TODAY=20260906 TRIGGER_DECISION_NOW=0830 provider_dispatch trigger cron next_due 'cron:0 0 * * *')
+[ "$out" = "55800" ] && ok "P5-08 next_due: cron midnight from 08:30 -> 55800s (15.5h)" || bad "P5-08 next_due: cron midnight=$out"
+# advanced weekly：当天未到 → 当天；已过 → 下一匹配日
+MON=$(date -d 'monday' +%Y%m%d 2>/dev/null || date +%Y%m%d)
+out=$(TRIGGER_TODAY=$MON TRIGGER_DECISION_NOW=0900 provider_dispatch trigger advanced next_due 'weekly:1:1000')
+[ "$out" = "3600" ] && ok "P5-08 next_due: advanced weekly today 10:00 (later) -> 3600s" || bad "P5-08 next_due: weekly today=$out"
+out=$(TRIGGER_TODAY=$MON TRIGGER_DECISION_NOW=0900 provider_dispatch trigger advanced next_due 'weekly:1:0800')
+[ "$out" = "601200" ] && ok "P5-08 next_due: advanced weekly passed today -> next Mon 08:00 601200s" || bad "P5-08 next_due: weekly next=$out"
+out=$(TRIGGER_TODAY=20260906 TRIGGER_DECISION_NOW=0900 provider_dispatch trigger advanced next_due 'monthly:15:1200')
+[ "$out" = "788400" ] && ok "P5-08 next_due: advanced monthly 09-15 12:00 from 09-06 09:00 -> 788400s" || bad "P5-08 next_due: monthly=$out"
+# bootcompleted：上下文=1（未消费）→ 0；已消费（bc_ 键）/上下文=0 → 不可预测
+out=$(TRIGGER_BOOT_COMPLETED_CONTEXT=1 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_bc" provider_dispatch trigger bootcompleted next_due boot_completed)
+[ "$out" = "0" ] && ok "P5-08 next_due: bootcompleted context=1 (not fired) -> 0" || bad "P5-08 next_due: bootcompleted out=$out rc=$?"
+TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_bc" tpr_trigger_state_write bc_s_bc 20260906 >/dev/null 2>&1
+TRIGGER_BOOT_COMPLETED_CONTEXT=1 TRIGGER_STATE_FILE="$DSF" TRIGGER_TASK_ID="s_bc" \
+    provider_dispatch trigger bootcompleted next_due boot_completed >/dev/null 2>&1 \
+    && bad "P5-08 next_due: bootcompleted fired (bc_ key) should be unpredictable" \
+    || ok "P5-08 next_due: bootcompleted after fire -> rc1"
+
 # ── §posix ────────────────────────────────────────────────────────────────
 if command -v dash >/dev/null 2>&1; then
     dash -n "$PWD/$RTLIB" 2>/dev/null && ok "P5-04 POSIX: dash -n ok (lib incl. P5-04 helpers)" || bad "P5-04 POSIX: dash -n failed"
