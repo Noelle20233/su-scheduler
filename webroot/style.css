@@ -55,7 +55,9 @@ main { padding: 1rem; max-width: 1100px; margin: 0 auto; }
 .st { font-weight: 600; }
 .st-RUNNING, .st-HEALTHY { color: var(--ok); }
 .st-FAILED { color: var(--bad); }
-.st-RECOVERING, .st-UNHEALTHY { color: var(--warn); }
+.st-RECOVERING, .st-UNHEALTHY, .st-WAITING { color: var(--warn); }
+.st-WAITING .card-value, .st-RECOVERING .card-value, .c-waiting .card-value,
+.c-unhealthy .card-value, .c-recovering .card-value { color: var(--warn); }
 .kv { display: grid; grid-template-columns: 160px 1fr; gap: 0.15rem 0.75rem; margin-bottom: 1rem; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; }
@@ -71,6 +73,12 @@ main { padding: 1rem; max-width: 1100px; margin: 0 auto; }
 }
 .logform { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
 .note { color: var(--muted); font-size: 0.8rem; }
+.err-banner {
+  background: rgba(239,68,68,0.15); color: var(--bad);
+  border: 1px solid var(--bad); padding: 0.75rem 1rem;
+  border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem;
+}
+.refresh-indicator { color: var(--muted); font-size: 0.8rem; margin-bottom: 0.5rem; }
 .banner {
   padding: 0.75rem 1rem; border-radius: 8px; margin-bottom: 1rem; font-size: 0.9rem;
 }

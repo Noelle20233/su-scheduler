@@ -61,7 +61,9 @@ su-scheduler webui GET_SUMMARY
     "failed": 1,
     "disabled": 1,
     "unhealthy": 1,
-    "unknown": 0
+    "unknown": 0,
+    "waiting": 0,
+    "recovering": 0
   },
   "tasks": [
     {
@@ -91,6 +93,8 @@ su-scheduler webui GET_SUMMARY
 | `counts.disabled` | int | enabled == 0 |
 | `counts.unhealthy` | int | 状态 == UNHEALTHY |
 | `counts.unknown` | int | 其余状态 |
+| `counts.waiting` | int | 状态 == WAITING（P4-09） |
+| `counts.recovering` | int | 状态 == RECOVERING（P5-06，从 unknown 拆出） |
 | `tasks[].health` | str | 健康族状态（HEALTHY/UNHEALTHY/UNKNOWN/RECOVERING）或 health.type（none/process/port） |
 | `tasks[].last_run` | str | start_time.txt 或 runtime.last_start |
 | `tasks[].restart_count` | int | 运行目录 recovery.count（缺省 0） |
@@ -120,6 +124,12 @@ su-scheduler webui GET_TASK_DETAIL id=<base64(task_id)>
     "restart_count": 0,
     "run_count": 0,
     "source": { "type": "", "line": "", "raw": "" },
+    "dependency": "",
+    "condition": "",
+    "dependency_state": "ok",
+    "gate_state": "",
+    "condition_state": "ok",
+    "last_event": "",
     "has_run_dir": 1
   }
 }
@@ -128,6 +138,16 @@ su-scheduler webui GET_TASK_DETAIL id=<base64(task_id)>
 字段来源：task-config / Registry 快照字段（name/trigger/action/enabled/health.*/
 recovery.*/retry.*/source.*/runtime.run_count）+ 运行目录工件（pid.txt/
 exit_code.txt/start_time.txt/end_time.txt/recovery.count/state.txt→status）。
+追加字段（P4-09 / P5-06，只增键不删字段 B8）：
+
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `dependency` | str | 依赖原字符串（task-config `dependency`） |
+| `condition` | str | 条件原字符串（task-config `condition`） |
+| `dependency_state` | str | 依赖门控判定：`ok`/`satisfied`/`waiting`/`unsat`（P4-09 `obs_dep_state`） |
+| `gate_state` | str | WAITING 原因摘要（含 dep failed / wait timeout / retry backoff），非 WAITING 为空串 |
+| `condition_state` | str | 条件求值判定：`ok`/`unsat`/`illegal`/`n/a`（P5-06 `obs_cond_state`；空 condition=恒真 ok） |
+| `last_event` | str | events.log 末行摘要 `ts|event|state|msg`（JSON 转义），无事件为空串 |
 
 ### 3.3 GET_TASK_EVENTS（运行历史 / 最近事件）
 
@@ -214,6 +234,6 @@ CLI Reader 经 `web_task_log_to_json` 归一为与 §3.4 相同 JSON Schema
 
 ## 6. 版本与命名空间
 
-- Runtime 库版本 `RUNTIME_LIB_VERSION=1.16.0`（§22 新增）。
+- Runtime 库版本 `RUNTIME_LIB_VERSION=1.29.0`（P5-06 递增；只增键不删字段，B8 契约重申：本文档各 op Schema 均为**向下兼容追加**，既有字段名/类型/顺序永不删改）。
 - 新 IPC op 白名单计数：12（P3-04）+ 4（P3-05 只读）= **16**。
 - 函数前缀：`web_`（函数）/ `webv_`（内部全局）；注册进 `runtime_lib_selfcheck`。

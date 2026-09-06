@@ -60,11 +60,83 @@
     return b;
   }
 
+  /* ── 周期刷新 + 错误保留上次数据（P5-06）────────────────────────────── */
+  var refreshTimer = null;
+  var lastData = {};
+
+  function lastUpdatedTime() {
+    var d = new Date();
+    function p(n) { return (n < 10 ? "0" : "") + n; }
+    return p(d.getHours()) + ":" + p(d.getMinutes()) + ":" + p(d.getSeconds());
+  }
+  function updateIndicator(view, text) {
+    var ind = document.getElementById("refresh-indicator");
+    if (!ind) {
+      ind = el("p", { id: "refresh-indicator", class: "refresh-indicator", text: "" });
+      view.insertBefore(ind, view.firstChild);
+    }
+    ind.textContent = text;
+  }
+  function showErrBanner(view, info) {
+    var b = document.getElementById("err-banner");
+    if (!b) {
+      b = el("div", { id: "err-banner", class: "err-banner" });
+      view.insertBefore(b, view.firstChild);
+    }
+    b.textContent = info;
+  }
+  function clearErrBanner() {
+    var b = document.getElementById("err-banner");
+    if (b && b.parentNode) { b.parentNode.removeChild(b); }
+  }
+  function stopRefresh() {
+    if (refreshTimer !== null) {
+      clearInterval(refreshTimer);
+      refreshTimer = null;
+    }
+  }
+  function startRefresh(fn, intervalMs) {
+    stopRefresh();
+    refreshTimer = setInterval(fn, intervalMs);
+  }
+  function errInfo(data) {
+    var e = data && data.error;
+    return "刷新失败（上次数据已过期）：" + escText(e || "") +
+      " (rc=" + ((data && data.rc === undefined) ? "?" : (data && data.rc)) + ")";
+  }
+  function markRefreshErr(view, viewName, data) {
+    if (!lastData[viewName]) {
+      view.textContent = "";
+      view.appendChild(offlineBanner());
+    }
+    showErrBanner(view, errInfo(data));
+    updateIndicator(view, "上次更新 " + lastUpdatedTime() + " — 刷新失败（上次数据已过期）");
+  }
+  function loadAndRender(op, params, renderFn) {
+    read(op, params).then(renderFn).catch(function (e) {
+      renderFn({ ok: false, error: String((e && e.message) || e || "read_failed"), rc: -1 });
+    });
+  }
+  function parseTs(s) {
+    var m = /^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})$/.exec(String(s || ""));
+    if (!m) { return NaN; }
+    return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]);
+  }
+  function lastDuration(t) {
+    if (!t || !t.last_start || !t.last_end) { return null; }
+    var ms = parseTs(t.last_end) - parseTs(t.last_start);
+    if (isNaN(ms) || ms < 0) { return null; }
+    return Math.floor(ms / 1000);
+  }
+
   /* ── 视图：Dashboard ────────────────────────────────────────────────── */
   function renderDashboard(data) {
     var view = document.getElementById("view");
+    if (!data.ok) { markRefreshErr(view, "dashboard", data); return; }
+    lastData.dashboard = data;
+    clearErrBanner();
     view.textContent = "";
-    if (!data.ok) { view.appendChild(offlineBanner()); return; }
+    updateIndicator(view, "上次更新 " + lastUpdatedTime());
     var counts = data.counts || {};
     var grid = el("div", { class: "cards" });
     grid.appendChild(card("Total Tasks", counts.total || 0, "c-total"));
@@ -72,6 +144,9 @@
     grid.appendChild(card("Healthy", counts.healthy || 0, "c-healthy"));
     grid.appendChild(card("Failed", counts.failed || 0, "c-failed"));
     grid.appendChild(card("Disabled", counts.disabled || 0, "c-disabled"));
+    grid.appendChild(card("Waiting", counts.waiting || 0, "c-waiting"));
+    grid.appendChild(card("Unhealthy", counts.unhealthy || 0, "c-unhealthy"));
+    grid.appendChild(card("Recovering", counts.recovering || 0, "c-recovering"));
     view.appendChild(grid);
 
     var mode = el("p", { class: "mode", text: "配置模式：" + escText(data.mode || "legacy") });
@@ -107,8 +182,11 @@
   /* ── 视图：Task List ────────────────────────────────────────────────── */
   function renderTasks(data) {
     var view = document.getElementById("view");
+    if (!data.ok) { markRefreshErr(view, "tasks", data); return; }
+    lastData.tasks = data;
+    clearErrBanner();
     view.textContent = "";
-    if (!data.ok) { view.appendChild(offlineBanner()); return; }
+    updateIndicator(view, "上次更新 " + lastUpdatedTime());
     var h = el("h2", { text: "Task List" });
     view.appendChild(h);
     var list = el("table", { class: "tbl" });
@@ -140,20 +218,26 @@
   /* ── 视图：Task Detail ──────────────────────────────────────────────── */
   function renderTaskDetail(data, id) {
     var view = document.getElementById("view");
-    view.textContent = "";
     if (!data.ok) {
-      if (data.error === "task_not_found") {
+      if (data.error === "task_not_found" && !lastData.task) {
+        view.textContent = "";
         view.appendChild(el("p", { class: "empty", text: "任务不存在或配置无效：" + escText(id) }));
-      } else {
-        view.appendChild(offlineBanner());
+        showErrBanner(view, "刷新失败（上次数据已过期）：" + escText(id) + " (rc=3)");
+        updateIndicator(view, "上次更新 " + lastUpdatedTime() + " — 刷新失败（上次数据已过期）");
+        return;
       }
+      markRefreshErr(view, "task", data);
       return;
     }
+    lastData.task = data;
+    clearErrBanner();
+    view.textContent = "";
+    updateIndicator(view, "上次更新 " + lastUpdatedTime());
     var t = data.task || {};
     var h = el("h2", { text: "Task Detail — " + escText(t.id) });
     view.appendChild(h);
     var grid = el("div", { class: "cards" });
-    grid.appendChild(card("状态", t.status, "c-running"));
+    grid.appendChild(card("状态", t.status, "st-" + escText(t.status)));
     grid.appendChild(card("Trigger", t.trigger));
     grid.appendChild(card("Enabled", t.enabled));
     grid.appendChild(card("PID", t.pid));
@@ -162,6 +246,8 @@
     grid.appendChild(card("上次结束", t.last_end));
     grid.appendChild(card("重启次数", t.restart_count));
     grid.appendChild(card("运行次数", t.run_count));
+    var dur = lastDuration(t);
+    if (dur !== null) { grid.appendChild(card("last_duration", dur + "s")); }
     view.appendChild(grid);
 
     var info = el("dl", { class: "kv" });
@@ -178,6 +264,12 @@
     kv("source.type", (t.source && t.source.type) || "");
     kv("source.line", (t.source && t.source.line) || "");
     kv("source.raw", (t.source && t.source.raw) || "");
+    kv("dependency", t.dependency);
+    kv("condition", t.condition);
+    kv("dependency_state", t.dependency_state);
+    kv("gate_state", t.gate_state);
+    kv("condition_state", t.condition_state);
+    kv("last_event", t.last_event);
     view.appendChild(info);
 
     /* 运行历史（events） */
@@ -738,22 +830,32 @@
 
   function route() {
     var r = parseHash();
+    stopRefresh();
     document.querySelectorAll("#nav a").forEach(function (a) {
       a.classList.toggle("active", a.getAttribute("data-view") === r.view);
     });
     if (r.view === "tasks") {
-      read("GET_SUMMARY", {}).then(function (d) { setBadge(!!d.ok); renderTasks(d); });
+      loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderTasks(d); });
+      startRefresh(function () {
+        loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderTasks(d); });
+      }, 10000);
     } else if (r.view === "logs") {
       read("GET_DAEMON_LOG", { lines: "5" }).then(function (d) { setBadge(!!d.ok); });
       renderLogs();
     } else if (r.view === "task") {
-      read("GET_TASK_DETAIL", { id: r.id }).then(function (d) { setBadge(!!d.ok); renderTaskDetail(d, r.id); });
+      loadAndRender("GET_TASK_DETAIL", { id: r.id }, function (d) { setBadge(!!d.ok); renderTaskDetail(d, r.id); });
+      startRefresh(function () {
+        loadAndRender("GET_TASK_DETAIL", { id: r.id }, function (d) { setBadge(!!d.ok); renderTaskDetail(d, r.id); });
+      }, 5000);
     } else if (r.view === "editor") {
       renderEditor({ id: r.id || "new" });
       read("GET_TASK_DETAIL", { id: r.id }).then(function (d) { setBadge(!!d.ok); renderTaskDetail(d, r.id); });
       read("GET_TASK_DETAIL", { id: r.id }).then(function (d) { setBadge(!!d.ok); renderTaskDetail(d, r.id); });
     } else {
-      read("GET_SUMMARY", {}).then(function (d) { setBadge(!!d.ok); renderDashboard(d); });
+      loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderDashboard(d); });
+      startRefresh(function () {
+        loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderDashboard(d); });
+      }, 5000);
     }
   }
 

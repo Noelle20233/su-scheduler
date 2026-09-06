@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.28.0"
+RUNTIME_LIB_VERSION="1.29.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -4593,6 +4593,24 @@ obs_dep_state() {
     esac
     return 0
 }
+# 条件求值判定摘要（复用 §20 sched_cond_check，只读无副作用）：
+# <tasks_dir> <id> → stdout=ok|unsat|illegal|n/a
+obs_cond_state() {
+    obs_tasks=$1; obs_id=$2
+    obs_tf=$(registry_task_file "$obs_id" 2>/dev/null)
+    [ -n "$obs_tf" ] || { echo "n/a"; return 0; }
+    obs_cond=$(sched_task_field "$obs_tf" condition)
+    [ -n "$obs_cond" ] || { echo "ok"; return 0; }
+    sched_cond_check "$obs_tasks" "$obs_id" >/dev/null 2>&1
+    obs_rc=$?
+    case "$obs_rc" in
+        0) echo "ok" ;;
+        1) echo "unsat" ;;
+        2) echo "illegal" ;;
+        *) echo "ok" ;;
+    esac
+    return 0
+}
 # 任务紧凑行（GET_SUMMARY.tasks 元素）
 web_task_row() {   # <tasks_dir> <task_file> <id>
     webv_tasks=$1; webv_f=$2; webv_id=$3
@@ -4620,7 +4638,7 @@ web_task_row() {   # <tasks_dir> <task_file> <id>
 # ── GET_SUMMARY：计数 + 任务紧凑列表（Dashboard + Task List 单调用）────────
 web_agg_summary() {   # <base> <tasks> → 单行 JSON
     webv_base=$1; webv_tasks=$2
-    webv_total=0 webv_running=0 webv_healthy=0 webv_failed=0 webv_disabled=0 webv_unhealthy=0 webv_unknown=0 webv_waiting=0
+    webv_total=0 webv_running=0 webv_healthy=0 webv_failed=0 webv_disabled=0 webv_unhealthy=0 webv_unknown=0 webv_waiting=0 webv_recovering=0
     webv_rows="" webv_sep=""
     for webv_id in $(registry_task_ids); do
         webv_f=$(registry_task_file "$webv_id" 2>/dev/null) || continue
@@ -4634,6 +4652,7 @@ web_agg_summary() {   # <base> <tasks> → 单行 JSON
             FAILED) webv_failed=$((webv_failed + 1)) ;;
             UNHEALTHY) webv_unhealthy=$((webv_unhealthy + 1)) ;;
             WAITING) webv_waiting=$((webv_waiting + 1)) ;;
+            RECOVERING) webv_recovering=$((webv_recovering + 1)) ;;
             *) webv_unknown=$((webv_unknown + 1)) ;;
         esac
         webv_row=$(web_task_row "$webv_tasks" "$webv_f" "$webv_id")
@@ -4641,9 +4660,9 @@ web_agg_summary() {   # <base> <tasks> → 单行 JSON
         webv_sep=","
     done
     webv_mode=$(sched_source_mode "$webv_base")
-    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s},"tasks":[%s]}' \
+    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s,"recovering":%s},"tasks":[%s]}' \
         "$(web_json_str "$webv_mode")" \
-        "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" "$webv_waiting" \
+        "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" "$webv_waiting" "$webv_recovering" \
         "$webv_rows"
 }
 # ── GET_TASK_DETAIL：完整任务详情（Task Detail 页）─────────────────────────
@@ -4663,6 +4682,7 @@ web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
     webv_rmax=$(sched_task_field "$webv_f" retry.max); [ -n "$webv_rmax" ] || webv_rmax=0
     webv_rint=$(sched_task_field "$webv_f" retry.interval); [ -n "$webv_rint" ] || webv_rint=60
     webv_hasrun=0; [ -d "$webv_rd" ] && webv_hasrun=1
+    webv_ev=$(tail -1 "$webv_rd/events.log" 2>/dev/null | cut -d'|' -f1,3,4,7-)
     printf '{"ok":true,"task":{'
     printf '"id":%s,"name":%s,"status":%s,"trigger":%s,"action":%s,"enabled":%s,' \
         "$(web_json_str "$webv_id")" \
@@ -4687,6 +4707,10 @@ web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
     printf '"dependency_state":%s,"gate_state":%s,' \
         "$(web_json_str "$(obs_dep_state "$webv_tasks" "$webv_id")")" \
         "$(web_json_str "$(obs_gate_state "$webv_tasks" "$webv_id")")"
+    # P5-06：条件求值判定 + 最近事件摘要（只增键，B8）
+    printf '"condition_state":%s,"last_event":%s,' \
+        "$(web_json_str "$(obs_cond_state "$webv_tasks" "$webv_id")")" \
+        "$(web_json_str "$webv_ev")"
     printf '"has_run_dir":%s}}' "$webv_hasrun"
 }
 # ── 日志聚合（GET_TASK_EVENTS / GET_DAEMON_LOG / GET_TASK_LOG）──────────────
@@ -6005,7 +6029,7 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
               web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
               web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
-              obs_gate_state obs_dep_state \
+              obs_gate_state obs_dep_state obs_cond_state \
               tcfg_editor_num tcfg_editor_bool tcfg_editor_id_ok tcfg_editor_trigger_ok tcfg_editor_action_ok \
               tcfg_editor_health_ok tcfg_editor_recovery_ok tcfg_editor_validate_payload tcfg_apply_task ipc_op_get_task_edit ipc_op_edit_task \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \

@@ -130,6 +130,19 @@ r=$(send_req "s3" "s3|GET_SUMMARY|")
     && ok "P4-09 agg: GET_SUMMARY counts include waiting (total=6, waiting=1)" \
     || bad "P4-09 agg: waiting count rc=$(resp_rc "$r") payload=$(printf '%s' "$r" | tail -n +2)"
 
+# P5-06：GET_SUMMARY counts 含 recovering 键；RECOVERING 计入 recovering 而非 unknown
+# （fixture 中 t_off 无运行目录 → status UNKNOWN 计入 unknown=1；t_rec 不使 unknown 增加）
+tcfg_new_task t_rec "13:00" "echo rec" >/dev/null 2>&1
+mkdir -p "$TASKS_DIR/t_rec"
+echo "RECOVERING" > "$TASKS_DIR/t_rec/state.txt"
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+r=$(send_req "s4" "s4|GET_SUMMARY|")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q '"recovering":1' \
+    && printf '%s\n' "$r" | grep -q '"total":7' \
+    && printf '%s\n' "$r" | grep -q '"unknown":1' \
+    && ok "P5-06 agg: GET_SUMMARY counts include recovering (total=7, recovering=1, unknown unchanged=1)" \
+    || bad "P5-06 agg: recovering count rc=$(resp_rc "$r") payload=$(printf '%s' "$r" | tail -n +2)"
+
 r=$(send_req "d1" "d1|GET_TASK_DETAIL|id=$(ipc_b64enc t_run)")
 rc=$(resp_rc "$r")
 [ "$rc" = "0" ] && printf '%s\n' "$r" | grep -q '"id":"t_run"' \
@@ -152,6 +165,8 @@ rc=$(resp_rc "$r")
     && printf '%s\n' "$r" | grep -q '"condition":""' \
     && printf '%s\n' "$r" | grep -q '"dependency_state":"ok"' \
     && printf '%s\n' "$r" | grep -q '"gate_state":""' \
+    && printf '%s\n' "$r" | grep -q '"condition_state":"ok"' \
+    && printf '%s\n' "$r" | grep -q '"last_event":"2026-09-02 08:30:01|spawn|STARTING|launched"' \
     && ok "P4-09 agg: GET_TASK_DETAIL new fields present + existing keys intact" \
     || bad "P4-09 agg: detail fields payload=$(printf '%s' "$r" | tail -n +2)"
 
@@ -175,6 +190,16 @@ rc=$(resp_rc "$r")
 rm -f "$TASKS_DIR/t_run/state.txt"
 printf '2026-09-02 08:30:01|t_run|spawn|STARTING|1001||launched\n' > "$TASKS_DIR/t_run/events.log"
 tcfg_set_field t_run dependency "" >/dev/null 2>&1
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+
+# P5-06：condition_state 求值（恒假 → unsat；空 condition → ok 已在 d9 覆盖）
+tcfg_set_field t_ok condition "{{ time.hour < 0 }}" >/dev/null 2>&1
+sched_reload "$BASE" "$CFG" >/dev/null 2>&1
+r=$(send_req "cs1" "cs1|GET_TASK_DETAIL|id=$(ipc_b64enc t_ok)")
+[ "$(resp_rc "$r")" = "0" ] && printf '%s\n' "$r" | grep -q '"condition_state":"unsat"' \
+    && ok "P5-06 agg: condition_state=unsat for unmet condition" \
+    || bad "P5-06 agg: condition_state payload=$(printf '%s' "$r" | tail -n +2)"
+tcfg_set_field t_ok condition "" >/dev/null 2>&1
 sched_reload "$BASE" "$CFG" >/dev/null 2>&1
 
 r=$(send_req "d2" "d2|GET_TASK_DETAIL|id=$(ipc_b64enc nope)")

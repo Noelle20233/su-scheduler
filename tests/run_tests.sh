@@ -78,6 +78,10 @@
 #       schema-reject/persist/editor/legacy-zero：boot_completed、oneshot:HHMM、
 #       delay:MIN、interval:MIN、cron 五段冻结校验；Managed 写路径持久化 + B9
 #       原子性；B16 legacy 零触碰；既有家族不回归）
+#   L2  tests/p5-webui/test.sh P5-06 WebUI 实时状态增强（counts.recovering +
+#       detail condition_state/last_event 后端只增键 B8、前端周期刷新/错误保留/
+#       WAITING/RECOVERING 渲染静态断言、只读零 exec、前端无 innerHTML/eval、
+#       read-only/security 关键断言不回归）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
@@ -206,6 +210,7 @@ else
         "tests/p4-dependency/test.sh" \
         "tests/p5-condition/test.sh" \
         "tests/p5-trigger/test.sh" \
+        "tests/p5-webui/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
