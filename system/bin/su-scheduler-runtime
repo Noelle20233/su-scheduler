@@ -4109,6 +4109,28 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del|cause=$cause"
     return "$arc"
 }
+# P6-02 跳拍补偿助手：HHMM → 当日分钟数（0-1439）；分钟 → 4 位 HHMM
+sched_hhmm_min() {   # <HHMM> → 当日分钟数
+    h=$1
+    hh=${h%??}; mm=${h#??}
+    hh=${hh#0}; mm=${mm#0}
+    [ -z "$hh" ] && hh=0; [ -z "$mm" ] && mm=0
+    echo $(( hh * 60 + mm ))
+}
+sched_min_hhmm() {   # <分钟数> → 4 位 HHMM
+    t=$1
+    printf '%02d%02d' $((t / 60)) $((t % 60))
+}
+# P6-02：该 trigger 是否可被跳拍补偿——仅分钟级精确（HH:MM/HHMM）与进阶
+# （weekly/nweekly/monthly/nmonthly/yearly）触发器。一次性（oneshot/delay/
+# run-once-now）与自校正（interval/cron/boot_completed）不补偿。
+sched_compensable() {   # <trigger> → 0=可补偿
+    case "$1" in
+        [0-9][0-9]:[0-9][0-9]|[0-9][0-9][0-9][0-9]|weekly:*|nweekly:*|monthly:*|nmonthly:*|yearly:*)
+            return 0 ;;
+        *) return 1 ;;
+    esac
+}
 # Registry 正式调度 tick（daemon 主循环 RUNTIME_LOADED=1 调用）：源重载 + 已
 # WAITING 任务复查（P4-04）+ 逐任务决策执行
 scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
@@ -4147,6 +4169,58 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
             fi
         fi
     done
+    # P6-02 主循环跳拍补偿：记录上次 cycle token（分钟级墙钟），跨分钟跳拍时对
+    # 分钟级精确/进阶触发器做受控补偿（catch-up）。以 cycle token（而非 now 参数）
+    # 判跳，使测试/人工 now 与真实墙钟解耦，避免对既有测试的伪时间步进误补偿。
+    # 一次性任务（oneshot/delay/run-once-now）与自校正触发器（interval/cron/
+    # boot_completed）不补偿；无 last 记录（首次/重启）不补偿，避免误补历史窗口。
+    # 补偿上限 CATCHUP_MAX 分钟（防极端卡顿后疯狂补跑），超过仅补偿最近
+    # CATCHUP_MAX 个窗口。补偿仍走 sched_execute_one（同依赖/条件/retry/cooldown
+    # 门控），并以当前 cycle token 标记保证同一时间窗口至多执行一次。
+    CATCHUP_MAX=3
+    last_file="$base/scheduler/last_tick"
+    cc_n=0
+    now_ck=$now
+    if [ -f "$last_file" ]; then
+        last_token=$(cat "$last_file" 2>/dev/null)
+        cur_token=$(sched_cycle_token)
+        ld=${last_token%????}; lt=${last_token#????????}
+        cd=${cur_token%????}; ct=${cur_token#????????}
+        if case "$ld" in [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) true ;; *) false ;; esac \
+           && [ "$ld" = "$cd" ] && [ "$lt" != "$ct" ]; then
+            lmin=$(sched_hhmm_min "$lt"); cmin=$(sched_hhmm_min "$ct")
+            if [ "$cmin" -gt "$lmin" ]; then
+                start=$((lmin + 1))
+                if [ $((cmin - lmin)) -gt "$CATCHUP_MAX" ]; then
+                    start=$((cmin - CATCHUP_MAX))
+                fi
+                m=$start
+                while [ "$m" -lt "$cmin" ]; do
+                    mhhmm=$(sched_min_hhmm "$m")
+                    for id in $(registry_task_ids); do
+                        if sched_cycle_seen "$base" "$id" "$token"; then
+                            continue
+                        fi
+                        tf=$(registry_task_file "$id" 2>/dev/null) || continue
+                        trig=$(sched_task_field "$tf" trigger)
+                        ron=$(sched_task_field "$tf" action.run_once_now)
+                        if [ "$ron" = "1" ] || ! sched_compensable "$trig"; then
+                            continue
+                        fi
+                        sched_execute_one "$base" "$config" "$tasks" "$id" "$mhhmm" 0
+                        rc=$?
+                        if [ "$rc" -eq 0 ]; then
+                            cc_n=$((cc_n + 1))
+                            sched_cycle_mark "$base" "$id" "$token"
+                        fi
+                    done
+                    m=$((m + 1))
+                done
+            fi
+        fi
+    fi
+    printf '%s\n' "$(sched_cycle_token)" > "$last_file" 2>/dev/null
+    now=$now_ck
     due=0; execn=0; errn=0
     for id in $(registry_task_ids); do
         if sched_cycle_seen "$base" "$id" "$token"; then
@@ -4160,7 +4234,7 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
         sched_cycle_mark "$base" "$id" "$token"
         [ "$rc" -eq 0 ] && execn=$((execn + 1)) || errn=$((errn + 1))
     done
-    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn|wadv=$w_ok|wfail=$w_err|retry=$rty_n"
+    sched_audit "$base" "op=tick|now=$now|mode=$(sched_source_mode "$base")|exec=$execn|err=$errn|wadv=$w_ok|wfail=$w_err|retry=$rty_n|catchup=$cc_n"
     return 0
 }
 # 启动 boot：registry 中 trigger=boot 的任务（RUNTIME_LOADED=1 启动段调用）

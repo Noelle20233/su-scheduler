@@ -255,6 +255,131 @@ else
     bad "P6-01 perf: scheduler_tick $PERFLINE (empty/full over loose bound)"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════
+# §P6-02 主循环跳拍补偿（catch-up）新增覆盖
+# 修复（P6-02）引入 last 分钟持久化 + 受控补偿：跨分钟跳拍时对分钟级精确/
+# 进阶触发器补执行，但：正常相邻分钟不重复、一次性任务（oneshot/ron）不补偿、
+# 跳拍超过 CATCHUP_MAX 只补最近 N 窗口、重启（无 last）不误补历史窗口。
+# 每项独立子 shell，写 out 后父层断言。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# 公共：独立 base（无 last_tick → 首 tick 场景）与执行日志 helper
+P62_D="$T/p62"; mkdir -p "$P62_D"
+
+# ── P6-02-1 正常相邻分钟：0829→0830 不重复，只在 0830 执行一次 ──────────
+P62_1="$P62_D/n1"; mkdir -p "$P62_1/tasks" "$P62_1/base"
+(
+    export TCFG_DIR="$P62_1/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    TASKS_DIR="$P62_1/tasks"
+    LOG="$P62_1/exec.log"; : > "$LOG"
+    execute_task() { id=$1; cmd=$2; mkdir -p "$TASKS_DIR/$id"; echo "$id|$cmd" >> "$LOG"; return 0; }
+    . "$PWD/$RTLIB"
+    tcfg_new_task n1 0830 "echo n1" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=202609060829 scheduler_tick "$P62_1/base" "$P62_1/config.txt" "$P62_1/tasks" "0829" >/dev/null 2>&1
+    c1=$(grep -c '^n1|' "$LOG" 2>/dev/null || true)
+    SCHED_CYCLE_NOW=202609060830 scheduler_tick "$P62_1/base" "$P62_1/config.txt" "$P62_1/tasks" "0830" >/dev/null 2>&1
+    c2=$(grep -c '^n1|' "$LOG" 2>/dev/null || true)
+    if [ "$c1" -eq 0 ] && [ "$c2" -eq 1 ]; then echo "P62_1=OK c1=$c1 c2=$c2"; else echo "P62_1=BAD c1=$c1 c2=$c2"; fi
+) > "$P62_1/out.txt" 2>&1
+P62_1R=$(grep -o 'P62_1=[A-Z]*' "$P62_1/out.txt" | head -1)
+if [ "$P62_1R" = "P62_1=OK" ]; then
+    ok "P6-02-1: 正常相邻分钟 0829→0830 仅在 0830 执行一次（无重复）"
+else
+    bad "P6-02-1: 相邻分钟行为异常 $(grep 'P62_1=' "$P62_1/out.txt" | head -1)"
+fi
+
+# ── P6-02-2 一次性任务（oneshot）不被跳拍补偿补跑 ────────────────────────
+P62_2="$P62_D/o2"; mkdir -p "$P62_2/tasks" "$P62_2/base"
+(
+    export TCFG_DIR="$P62_2/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    TASKS_DIR="$P62_2/tasks"
+    LOG="$P62_2/exec.log"; : > "$LOG"
+    execute_task() { id=$1; cmd=$2; mkdir -p "$TASKS_DIR/$id"; echo "$id|$cmd" >> "$LOG"; return 0; }
+    . "$PWD/$RTLIB"
+    tcfg_new_task os1 oneshot:0830 "echo oneshot" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=202609060829 scheduler_tick "$P62_2/base" "$P62_2/config.txt" "$P62_2/tasks" "0829" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=202609060831 scheduler_tick "$P62_2/base" "$P62_2/config.txt" "$P62_2/tasks" "0831" >/dev/null 2>&1
+    c=$(grep -c '^os1|' "$LOG" 2>/dev/null || true)
+    if [ "$c" -eq 0 ]; then echo "P62_2=OK c=$c"; else echo "P62_2=BAD c=$c"; fi
+) > "$P62_2/out.txt" 2>&1
+P62_2R=$(grep -o 'P62_2=[A-Z]*' "$P62_2/out.txt" | head -1)
+if [ "$P62_2R" = "P62_2=OK" ]; then
+    ok "P6-02-2: 一次性 oneshot 任务不被跳拍补偿补跑"
+else
+    bad "P6-02-2: oneshot 被跳拍补偿补跑 $(grep 'P62_2=' "$P62_2/out.txt" | head -1)"
+fi
+
+# ── P6-02-3 跳拍超上限：只补最近 CATCHUP_MAX(3) 窗口 ─────────────────────
+# last=0829 → now=0834（跳过 0830..0833，超上限），cap=3 只补 0831/0832/0833。
+# 任务A(0830) 落窗口外不得执行；任务B(0832) 落窗口内应被补执行。
+P62_3="$P62_D/cap"; mkdir -p "$P62_3/tasks" "$P62_3/base"
+(
+    export TCFG_DIR="$P62_3/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    TASKS_DIR="$P62_3/tasks"
+    LOG="$P62_3/exec.log"; : > "$LOG"
+    execute_task() { id=$1; cmd=$2; mkdir -p "$TASKS_DIR/$id"; echo "$id|$cmd" >> "$LOG"; return 0; }
+    . "$PWD/$RTLIB"
+    tcfg_new_task capA 0830 "echo a" >/dev/null 2>&1
+    tcfg_new_task capB 0832 "echo b" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=202609060829 scheduler_tick "$P62_3/base" "$P62_3/config.txt" "$P62_3/tasks" "0829" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=202609060834 scheduler_tick "$P62_3/base" "$P62_3/config.txt" "$P62_3/tasks" "0834" >/dev/null 2>&1
+    ca=$(grep -c '^capA|' "$LOG" 2>/dev/null || true)
+    cb=$(grep -c '^capB|' "$LOG" 2>/dev/null || true)
+    if [ "$ca" -eq 0 ] && [ "$cb" -eq 1 ]; then echo "P62_3=OK ca=$ca cb=$cb"; else echo "P62_3=BAD ca=$ca cb=$cb"; fi
+) > "$P62_3/out.txt" 2>&1
+P62_3R=$(grep -o 'P62_3=[A-Z]*' "$P62_3/out.txt" | head -1)
+if [ "$P62_3R" = "P62_3=OK" ]; then
+    ok "P6-02-3: 跳拍超上限仅补最近 3 窗口（0830 落窗外不执行，0832 落窗内补执行）"
+else
+    bad "P6-02-3: 跳拍上限补偿异常 $(grep 'P62_3=' "$P62_3/out.txt" | head -1)"
+fi
+
+# ── P6-02-4 run-once-now 一次性语义不被跳拍/单 tick 补成多次 ─────────────
+# run-once-now 任务应在执行后修剪（ron→0）且不因补偿补成多次：单次 tick 中
+# 主循环命中执行一次即可（c==1，而非被重复触发）。
+P62_4="$P62_D/ron"; mkdir -p "$P62_4/tasks" "$P62_4/base"
+(
+    export TCFG_DIR="$P62_4/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    TASKS_DIR="$P62_4/tasks"
+    LOG="$P62_4/exec.log"; : > "$LOG"
+    execute_task() { id=$1; cmd=$2; mkdir -p "$TASKS_DIR/$id"; echo "$id|$cmd" >> "$LOG"; return 0; }
+    . "$PWD/$RTLIB"
+    tcfg_new_task ron1 0830 "echo ron" >/dev/null 2>&1
+    tcfg_set_field ron1 action.run_once_now 1 >/dev/null 2>&1
+    # 全新 base 直接 tick(0830)：run-once-now 触发一次即修剪，不重复
+    SCHED_CYCLE_NOW=202609060830 scheduler_tick "$P62_4/base" "$P62_4/config.txt" "$P62_4/tasks" "0830" >/dev/null 2>&1
+    c=$(grep -c '^ron1|' "$LOG" 2>/dev/null || true)
+    if [ "$c" -eq 1 ]; then echo "P62_4=OK c=$c"; else echo "P62_4=BAD c=$c"; fi
+) > "$P62_4/out.txt" 2>&1
+P62_4R=$(grep -o 'P62_4=[A-Z]*' "$P62_4/out.txt" | head -1)
+if [ "$P62_4R" = "P62_4=OK" ]; then
+    ok "P6-02-4: run-once-now 一次性任务执行一次即修剪，不因补偿重复"
+else
+    bad "P6-02-4: run-once-now 被重复执行 $(grep 'P62_4=' "$P62_4/out.txt" | head -1)"
+fi
+
+# ── P6-02-5 重启（无 last 记录）不误补历史窗口 ────────────────────────────
+# 全新 base（无 last_tick）直接 tick(0831)：不得补偿已过的 0830 窗口。
+P62_5="$P62_D/rst"; mkdir -p "$P62_5/tasks" "$P62_5/base"
+(
+    export TCFG_DIR="$P62_5/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    TASKS_DIR="$P62_5/tasks"
+    LOG="$P62_5/exec.log"; : > "$LOG"
+    execute_task() { id=$1; cmd=$2; mkdir -p "$TASKS_DIR/$id"; echo "$id|$cmd" >> "$LOG"; return 0; }
+    . "$PWD/$RTLIB"
+    tcfg_new_task rst1 0830 "echo rst" >/dev/null 2>&1
+    # 首 tick（模拟 daemon 重启后第一次进入主循环）即 now=0831
+    SCHED_CYCLE_NOW=202609060831 scheduler_tick "$P62_5/base" "$P62_5/config.txt" "$P62_5/tasks" "0831" >/dev/null 2>&1
+    c=$(grep -c '^rst1|' "$LOG" 2>/dev/null || true)
+    if [ "$c" -eq 0 ]; then echo "P62_5=OK c=$c"; else echo "P62_5=BAD c=$c"; fi
+) > "$P62_5/out.txt" 2>&1
+P62_5R=$(grep -o 'P62_5=[A-Z]*' "$P62_5/out.txt" | head -1)
+if [ "$P62_5R" = "P62_5=OK" ]; then
+    ok "P6-02-5: daemon 重启后（无 last 记录）不误补已过历史窗口"
+else
+    bad "P6-02-5: 重启后误补历史窗口 $(grep 'P62_5=' "$P62_5/out.txt" | head -1)"
+fi
+
 # ── §posix dash -n ────────────────────────────────────────────────────────
 if command -v dash >/dev/null 2>&1; then
     dash -n "$PWD/$RTLIB" 2>/dev/null && ok "P6-01 POSIX: dash -n ok (runtime)" || bad "P6-01 POSIX: dash -n failed"
@@ -264,5 +389,5 @@ fi
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
-echo "p6-reliability tests: PASS=$PASS FAIL=$FAIL  (O-2/O-3/O-4 FAIL 属预期复现)"
+echo "p6-reliability tests: PASS=$PASS FAIL=$FAIL  (O-3/O-4 FAIL 属预期复现，P6-03/P6-04 范畴)"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1
