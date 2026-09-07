@@ -71,7 +71,8 @@ adb shell "su -c 'su-scheduler status'" 2>/dev/null | grep -qi "Alive" && ok "da
 # P3-09：固定 sleep 3 在慢启动设备（daemon 重启 + boot 执行可 >3s）上过早判定 → 改有界轮询
 TMPCFG=$(adb shell "mktemp /data/local/tmp/ss-smoke.XXXXXX" 2>/dev/null | tr -d '\r')
 adb shell "printf 'boot echo boot-smoke-ok > /data/local/tmp/ss-boot-marker\\n' > '$TMPCFG'" 2>/dev/null
-adb shell "su -c 'cp $CONFIG \$CONFIG.bak; cp $TMPCFG $CONFIG; su-scheduler restart'" >/dev/null 2>&1
+# O-1：restart 前清 crash guard（同 D-P5-05），防 guard×watchdog 竞态累积降级
+adb shell "su -c 'rm -f $DATA/runtime/daemon.guard 2>/dev/null; cp $CONFIG \$CONFIG.bak; cp $TMPCFG $CONFIG; su-scheduler restart'" >/dev/null 2>&1
 W=0; BM=""
 while [ "$W" -lt 30 ]; do
     BM=$(adb shell "cat /data/local/tmp/ss-boot-marker 2>/dev/null" 2>/dev/null | tr -d '\r')
@@ -88,7 +89,7 @@ HHMM=$(date +%H%M)
 # 计算（CI/Linux GNU date 与本地 Windows 宿主均可用，行为一致）。
 NEXT=$(printf '%s' "$HHMM" | awk '{h=substr($0,1,2)+0; m=substr($0,3,2)+2; if (m>=60){m-=60; h++}; if (h>=24) h=0; printf "%02d%02d", h, m}')
 adb shell "printf '$NEXT echo time-smoke-ok > /data/local/tmp/ss-time-marker\\n' > /data/local/tmp/ss-time.cfg" 2>/dev/null
-adb shell "su -c 'cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-time.cfg $CONFIG; su-scheduler restart'" >/dev/null 2>&1
+adb shell "su -c 'rm -f $DATA/runtime/daemon.guard 2>/dev/null; cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-time.cfg $CONFIG; su-scheduler restart'" >/dev/null 2>&1
 sleep 150
 adb shell "cat /data/local/tmp/ss-time-marker 2>/dev/null" | grep -q "time-smoke-ok" && ok "time task fired (HH:MM +2min)" || bad "time task marker"
 adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
@@ -96,7 +97,7 @@ adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
 # 4) --run-once-now：立即执行 + 配置修剪
 # P3-09：固定 sleep 3 在慢启动设备上过早判定（同 boot 用例）→ 改有界轮询 marker + 修剪
 adb shell "printf '$HHMM echo ron-ok > /data/local/tmp/ss-ron-marker; : --run-once-now\\n' > /data/local/tmp/ss-ron.cfg" 2>/dev/null
-adb shell "su -c 'cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-ron.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
+adb shell "su -c 'rm -f $DATA/runtime/daemon.guard 2>/dev/null; cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-ron.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
 W=0; RON=""
 while [ "$W" -lt 30 ]; do
     RON=$(adb shell "cat /data/local/tmp/ss-ron-marker 2>/dev/null" 2>/dev/null | tr -d '\r')
@@ -120,7 +121,7 @@ adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
 #    ——此处在用例内部**重新计算** +1min 的 DELNEXT 并等 150s 跨分钟。）
 DELNEXT=$(printf '%s' "$(date +%H%M)" | awk '{h=substr($0,1,2)+0; m=substr($0,3,2)+1; if (m>=60){m-=60; h++}; if (h>=24) h=0; printf "%02d%02d", h, m}')
 adb shell "printf '$DELNEXT echo del-ok > /data/local/tmp/ss-del-marker; : --delete\\n' > /data/local/tmp/ss-del.cfg" 2>/dev/null
-adb shell "su -c 'cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-del.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
+adb shell "su -c 'rm -f $DATA/runtime/daemon.guard 2>/dev/null; cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-del.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
 sleep 150
 adb shell "su -c 'grep -c -- del-ok $CONFIG'" 2>/dev/null | grep -q "0" && ok "--delete removed line" || bad "--delete"
 adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1
@@ -141,7 +142,7 @@ TS=$(adb shell "su -c 'su-scheduler-termux status'" 2>/dev/null | tr -d '\r')
 case "$TS" in
     "READY")      ok "termux READY" ;;
     "LOCKED")     ok "termux LOCKED (graceful state)" ;;
-    "NOT_INSTALLED"|"") adb shell "printf '$HHMM echo t; : --termux\\n' > /data/local/tmp/ss-t.cfg; su -c 'cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-t.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
+    "NOT_INSTALLED"|"") adb shell "printf '$HHMM echo t; : --termux\\n' > /data/local/tmp/ss-t.cfg; su -c 'rm -f $DATA/runtime/daemon.guard 2>/dev/null; cp $CONFIG \$CONFIG.bak; cp /data/local/tmp/ss-t.cfg $CONFIG; su-scheduler restart; sleep 2'" >/dev/null 2>&1
         sleep 3
         adb shell "su -c 'grep -q ERROR $DATA/tasks/*/output.log 2>/dev/null'" >/dev/null 2>&1 && ok "termux graceful ERROR (not installed)" || bad "termux graceful"
         adb shell "su -c 'cp \$CONFIG.bak $CONFIG; rm -f \$CONFIG.bak'" >/dev/null 2>&1 ;;
