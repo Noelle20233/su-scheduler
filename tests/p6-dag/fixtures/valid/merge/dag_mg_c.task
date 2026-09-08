@@ -1,0 +1,22 @@
+# P6-05 valid diamond right
+schema_version=2
+id=dag_mg_c
+name=dag_mg_c
+enabled=1
+trigger=chain
+condition=
+dependency=dag_mg_root
+action.type=command
+action.command=echo p6-dag-fixture
+action.notify_start=0
+action.notify_end=0
+action.delete=0
+action.termux=0
+action.interactive=0
+action.run_once_now=0
+action.boot=0
+action.msg=
+health.type=none
+recovery.type=none
+retry.max=0
+retry.interval=60

@@ -245,3 +245,14 @@ bash tests/state-machine/test.sh   # 期望：全 [PASS]，exit 0
   则不新增；确需新增则更新 TSV + lib + 测试三处（一致性由 §8.3 保证）。
 - P1-02 的 `runtime.state` 枚举以此为准（`docs/architecture/task-schema-v2.md` §9
   已指向本机；`task_state_from_legacy` 提供旧值映射）。
+
+## 11. 交叉引用：DAG / 链式调度（P6-05，追加不重写）
+
+- **183 条迁移与 11 态枚举冻结不变**。P6-05 DAG 裁决（`docs/architecture/dag-schema-v1.md`
+  D50，草案待批准）明确：链运行状态（`PENDING/RUNNING/SUCCESS/FAILED/CANCELLED`）是
+  `$base/dag/<chain>/runs/<run>/run.txt` 的**文件级聚合记录**，不是任务状态枚举扩充；链内
+  节点态仍由本机 11 态（`state.txt`）管辖，复用既有 `PENDING>WAITING`/`WAITING>STARTING`/
+  `WAITING>FAILED` 等 reserved→wired 通道语义，链传播失败沿用 `gate_fail` 事件令牌
+  （RT_EVENTS，非 TSM_CAUSES，D13 先例）。
+- `tests/state-machine/test.sh`（183 断言）为守卫：任何 DAG 实现若触碰本机三处一致性
+  （TSV/lib/测试）即回归失败。

@@ -1,0 +1,22 @@
+# P6-05 valid Optional edge
+schema_version=2
+id=dag_op_child
+name=dag_op_child
+enabled=1
+trigger=chain
+condition=
+dependency=dag_op_root,?dag_op_aux
+action.type=command
+action.command=echo p6-dag-fixture
+action.notify_start=0
+action.notify_end=0
+action.delete=0
+action.termux=0
+action.interactive=0
+action.run_once_now=0
+action.boot=0
+action.msg=
+health.type=none
+recovery.type=none
+retry.max=0
+retry.interval=60

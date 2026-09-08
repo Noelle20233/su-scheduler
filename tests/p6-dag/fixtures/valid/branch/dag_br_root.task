@@ -1,0 +1,22 @@
+# P6-05 valid branch root
+schema_version=2
+id=dag_br_root
+name=dag_br_root
+enabled=1
+trigger=07:30
+condition=
+dependency=
+action.type=command
+action.command=echo p6-dag-fixture
+action.notify_start=0
+action.notify_end=0
+action.delete=0
+action.termux=0
+action.interactive=0
+action.run_once_now=0
+action.boot=0
+action.msg=
+health.type=none
+recovery.type=none
+retry.max=0
+retry.interval=60

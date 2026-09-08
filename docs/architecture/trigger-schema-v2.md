@@ -51,3 +51,13 @@ dow 0-6。`*/0` 拒绝（除零）。任何非法字符/段数不足/越界 → 
 - 新家族仅 Managed（Task v2），经 `tcfg_new_task`/`tcfg_apply_task` 创建。
 - `legacy_adapter_parse`、`sched_remove_task`/`sched_prune_ron` legacy 分支零改动（B16）。
 - Legacy 配置逐字节兼容由 `tests/legacy/golden.sh` 持续锁定。
+
+## 8. 交叉引用：候选第 6 家族 `chain`（P6-05，追加不重写）
+
+- P6-05 DAG 裁决（`docs/architecture/dag-schema-v1.md` **D47**，**DRAFT 待人工批准**）提案
+  新增裸关键字家族 `trigger=chain`：链内节点**无自主时间触发**，仅由链引擎在依赖边 frontier
+  满足时释放执行；`trigger_decide` 对该族恒 `due=N`（P6-06 接线）。
+- **边界沿用本文 D41/D45**：仅 Managed（B16）、`legacy_adapter_parse` 零触碰、经
+  `tcfg_editor_trigger_ok` 白名单创建。批准前 `tcfg_editor_trigger_ok` **不含** `chain`
+  （创建路径自然拒绝，零占位实现）。
+- 根（链入口）= 本文 D41 全家族任一既有触发器，家族语义零变化（D44 顺序不变）。

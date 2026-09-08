@@ -632,6 +632,23 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ---
 
+## 17. 交叉引用：DAG / 链式调度立项（P6-05，追加不重写）
+
+> **状态**：引用**草案** `docs/architecture/dag-schema-v1.md`（ADR D46–D58，**待人工批准**，
+> P6-06 前零实现）。本节**不改动** D1–D45 任何裁决与运行行为，仅登记后续立项对本域的复用关系。
+
+- **D46（P6-05 D-01）**：DAG 的边 = 本文 D1/D2 的 `dependency=` entry，**同一语法、同一校验器**
+  （`dep_validate`/`dep_normalize`/`dep_entry_ok`/`dep_validate_graph`）。Required/Optional 与
+  `:STATE` 语义与 D15/D16 一一映射（dag-schema D51）；D15 传播矩阵在链语境逐行复用，判定材料
+  同源（dependency entry + 上游终态），仅新增「终态须落在本 run 登记簿（run.txt）」的 run 绑定层。
+- **D55（P6-05 D-08）**：`dep_validate_graph` 计划**尾部叠加**链段校验（深度 ≤16 / 节点 ≤32 /
+  边 ≤128 / 孤儿 `trigger=chain` 拒绝）；本文 D6–D10 的未知/自依赖/环检测行为、消息文案、
+  覆盖节点协议与 D9 四写路径接入点**逐字节不变**（`tests/p4-dependency` + 新增
+  `tests/p6-dag` 双侧 golden 锁定现行为作为升级基线）。
+- Legacy 边界不变（D4/NF-1/C4）：`trigger=chain` 仅 Managed（B16 先例，dag-schema D47）。
+
+---
+
 ## 附：决策记录
 
 - 2026-09-04：P4-02 建立本 ADR（D1–D5 冻结）。D2 中 Required/Optional 的
@@ -690,3 +707,5 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
   运算符白名单精确匹配；conde_l/conde_r 残余注入字符仍拒绝；禁 eval/sh -c/$()/
   反引号/管道/重定向；contains 用 case 子串 pattern；单谓词无复合无优先级）。
   实现与既有断言反转归 P5-03（docs/P5-02.md §5）。版本 1.28.0（不变）。
+- 2026-09-08：P6-05 追加 §17（DAG/链式调度立项交叉引用；引用 `dag-schema-v1.md` D46–D58
+  草案，本文 D1–D45 与运行行为零改动；批准与实现归 P6-06）。

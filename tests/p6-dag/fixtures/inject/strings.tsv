@@ -1,0 +1,23 @@
+# P6-05 injection fixtures — strings.tsv
+# 列: tag<TAB>secv_id_ok 期望<TAB>dep_validate 期望<TAB>payload
+# `\n` = 两字符转义（test.sh 用 printf %b 还原为真实换行）。
+# 期望列为**当前生产校验器的基线行为**（ADR §4 引用；P6-06 链路径必须一致或更严）。
+# overlong-200 在 dep_validate 层是 accept（entry 字符集合法、无长度门）——
+# 诚实锁定：长度门在 secv_id_ok（SECV_ID_MAXLEN=128）与文件名词法（创建路径），
+# 非 dependency 存储层。链路径（run 目录名）必须走 secv_id_ok，故链域该值被拒。
+# space-separator：**空格是 D1 规范容错分隔符，不是注入面**——dep_validate 按两条
+# entry 接受（p4 golden 同源）；但 secv_id_ok（链目录名/节点 id 门）更严拒绝之。
+# 该不对称即「链路径必须走更严的 id 门而非仅存储层门」（ADR §4-1）的可执行证据。
+legal-id	accept	accept	dag_a_1-x.Y
+semicolon	reject	reject	dag_a;touch /tmp/pwn
+pipe	reject	reject	dag_a|dag_b
+cmdsub	reject	reject	$(id)
+backtick	reject	reject	`id`
+dotdot	reject	reject	dag..a
+slash	reject	reject	dag/../a
+newline	reject	reject	dag_a\ndag_b
+glob	reject	reject	dag_*
+space-separator	reject	accept	dag_a dag_b
+ctrlchar	reject	reject	dag_a\001b
+empty	reject	accept	
+overlong-200	reject	accept	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
