@@ -634,8 +634,8 @@ expr              := 可打印 ASCII（0x20..0x7E），无换行/控制符，≤
 
 ## 17. 交叉引用：DAG / 链式调度立项（P6-05，追加不重写）
 
-> **状态**：引用**草案** `docs/architecture/dag-schema-v1.md`（ADR D46–D58，**待人工批准**，
-> P6-06 前零实现）。本节**不改动** D1–D45 任何裁决与运行行为，仅登记后续立项对本域的复用关系。
+> **状态**：引用 `docs/architecture/dag-schema-v1.md`（ADR D46–D58，**ACCEPTED 已批准 2026-09-08**，
+> 引擎实现属 P6-06，此前零实现）。本节**不改动** D1–D45 任何裁决与运行行为，仅登记后续立项对本域的复用关系。
 
 - **D46（P6-05 D-01）**：DAG 的边 = 本文 D1/D2 的 `dependency=` entry，**同一语法、同一校验器**
   （`dep_validate`/`dep_normalize`/`dep_entry_ok`/`dep_validate_graph`）。Required/Optional 与

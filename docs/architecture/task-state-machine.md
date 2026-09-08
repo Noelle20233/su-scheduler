@@ -249,7 +249,7 @@ bash tests/state-machine/test.sh   # 期望：全 [PASS]，exit 0
 ## 11. 交叉引用：DAG / 链式调度（P6-05，追加不重写）
 
 - **183 条迁移与 11 态枚举冻结不变**。P6-05 DAG 裁决（`docs/architecture/dag-schema-v1.md`
-  D50，草案待批准）明确：链运行状态（`PENDING/RUNNING/SUCCESS/FAILED/CANCELLED`）是
+  D50，ACCEPTED 已批准 2026-09-08）明确：链运行状态（`PENDING/RUNNING/SUCCESS/FAILED/CANCELLED`）是
   `$base/dag/<chain>/runs/<run>/run.txt` 的**文件级聚合记录**，不是任务状态枚举扩充；链内
   节点态仍由本机 11 态（`state.txt`）管辖，复用既有 `PENDING>WAITING`/`WAITING>STARTING`/
   `WAITING>FAILED` 等 reserved→wired 通道语义，链传播失败沿用 `gate_fail` 事件令牌

@@ -54,7 +54,7 @@ dow 0-6。`*/0` 拒绝（除零）。任何非法字符/段数不足/越界 → 
 
 ## 8. 交叉引用：候选第 6 家族 `chain`（P6-05，追加不重写）
 
-- P6-05 DAG 裁决（`docs/architecture/dag-schema-v1.md` **D47**，**DRAFT 待人工批准**）提案
+- P6-05 DAG 裁决（`docs/architecture/dag-schema-v1.md` **D47**，**ACCEPTED 已批准 2026-09-08**）提案
   新增裸关键字家族 `trigger=chain`：链内节点**无自主时间触发**，仅由链引擎在依赖边 frontier
   满足时释放执行；`trigger_decide` 对该族恒 `due=N`（P6-06 接线）。
 - **边界沿用本文 D41/D45**：仅 Managed（B16）、`legacy_adapter_parse` 零触碰、经

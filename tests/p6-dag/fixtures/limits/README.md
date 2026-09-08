@@ -1,6 +1,6 @@
 # P6-05 limits fixtures — 生成规格（golden 说明）
 
-上限权威定义 = `docs/architecture/dag-schema-v1.md` §2 常量表（**DRAFT 待批准**）。
+上限权威定义 = `docs/architecture/dag-schema-v1.md` §2 常量表（**ACCEPTED 已批准 2026-09-08**）。
 超限例由 `../tools/gen_limits.sh <dir>` 确定性生成（不入库产物，test.sh 现场展开到
 临时沙箱），每目录附 `manifest.txt`（nodes/edges/depth 计数，test.sh 交叉校验）：
 

@@ -5,11 +5,11 @@
 # 判定（AGENTS §4）：每项 [PASS]/[FAIL]；链引擎未实现类断言 [SKIP]（带原因）；
 # 出现 [FAIL] → exit 非 0。**SKIP→PASS 是 P6-06 的出口条件之一**：本文件所有
 # §engine 组 SKIP 行（DAG-EX-01..20）在 `docs/architecture/dag-schema-v1.md`
-# （DRAFT，待人工批准）获批、P6-06 链引擎落地后必须逐条转为真验证 [PASS]，
+# （ACCEPTED，已批准 2026-09-08）获批后、P6-06 链引擎落地时必须逐条转为真验证 [PASS]，
 # 禁止删除 SKIP 行以凑绿（AGENTS §10 测试不可作弊）。
 #
 # 本套件是 **P6-05 文档/裁决任务**的验证面，零生产代码改动：
-#   §schema-doc   ADR（dag-schema-v1.md）存在性/DRAFT 标注/上限常量/链态五态/
+#   §schema-doc   ADR（dag-schema-v1.md）存在性/ACCEPTED 批准标注/上限常量/链态五态/
 #                 183 迁移零改动声明/B16 声明/裁决表 D-01..D-13 完备性 +
 #                 fixtures 字段 ⊆ ADR 白名单（grep golden）。
 #   §valid        正例 fixtures（线性/分支/合流/Optional/:FAILED）：
@@ -107,15 +107,15 @@ if [ -f "$ADR" ]; then
 else
     bad "SD-01 ADR 缺失：$ADR"
 fi
-if grep -q 'DRAFT — 待人工批准（P6-06 实施前必须批准）' "$ADR" 2>/dev/null; then
-    ok "SD-02 ADR 状态标注 DRAFT（P6-06 前必须人工批准）"
+if grep -q 'ACCEPTED — 已获人工批准' "$ADR" 2>/dev/null; then
+    ok "SD-02 ADR 状态标注 ACCEPTED（已获人工批准 2026-09-08；P6-05 修订：原 DRAFT 断言随签核更新）"
 else
-    bad "SD-02 ADR 缺 DRAFT 批准标注"
+    bad "SD-02 ADR 缺 ACCEPTED 批准标注"
 fi
-if grep -q '待人工批准\|草案待批准' "$REQ" 2>/dev/null; then
-    ok "SD-03 需求文档标注待批准状态"
+if grep -q 'ACCEPTED\|已获人工批准\|已批准' "$REQ" 2>/dev/null; then
+    ok "SD-03 需求文档记录批准状态（P6-05 修订：原待批准断言随签核更新）"
 else
-    bad "SD-03 需求文档缺待批准标注"
+    bad "SD-03 需求文档缺批准状态记录"
 fi
 
 n_MISSING=0
@@ -404,7 +404,7 @@ if dep_validate 'dag_a dag_b'; then ok "PB-07 空格分隔两 entry 接受（D1 
 # ═══════════════════════════════════════════════════════════════════════════
 # §engine — 链引擎行为断言（P6-06 出口条件；ADR 批准前不得实现）
 # ═══════════════════════════════════════════════════════════════════════════
-skip "DAG-EX-01 根触发（interval/cron/boot/时间/catch-up）→ 创建 run 目录 run.txt（PENDING→RUNNING）— reason: P6-06 实施（ADR D48/D49，待批准）"
+skip "DAG-EX-01 根触发（interval/cron/boot/时间/catch-up）→ 创建 run 目录 run.txt（PENDING→RUNNING）— reason: P6-06 实施（ADR D48/D49 已批准 2026-09-08）"
 skip "DAG-EX-02 同一根同一 cycle token 至多一次 run（runs/<token> 目录名天然去重）— reason: P6-06 实施（D48）"
 skip "DAG-EX-03 手动 tctl start/restart 根不创建 run；节点 restart 终态更新入当前 run — reason: P6-06 实施（D48/D54）"
 skip "DAG-EX-04 frontier 释放：线性链 root→b→c 拓扑序执行；分支同层、合流双入边等待 — reason: P6-06 实施（D52）"

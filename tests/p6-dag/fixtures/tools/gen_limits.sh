@@ -1,7 +1,7 @@
 #!/bin/sh
 # gen_limits.sh — P6-05 超限 fixtures 生成器（确定性；测试沙箱内展开，不入库产物）
 # 用法: sh tools/gen_limits.sh <out_dir>
-# 生成三个「当前图校验接受、但超 DAG 提案上限（dag-schema-v1.md §2，DRAFT）」的链闭包：
+# 生成三个「当前图校验接受、但超 DAG 提案上限（dag-schema-v1.md §2，ACCEPTED 已批准）」的链闭包：
 #   deep17/    17 节点单线梯  = DAG_CHAIN_DEPTH_MAX(16) + 1（节点 17>32? 否；仅深度超限）
 #   nodes33/   1 根 + 32 叶   = DAG_CHAIN_NODES_MAX(32) + 1（深度 2、边 32，均不触其他上限）
 #   edges129/  1 根 + 17 中 + 14 叶 = 17+14*8 = 129 边 = DAG_CHAIN_EDGES_MAX(128) + 1

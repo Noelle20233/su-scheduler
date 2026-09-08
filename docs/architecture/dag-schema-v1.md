@@ -1,6 +1,6 @@
 # Su Scheduler — DAG / 链式调度 Schema v1 架构裁决（P6-05 ADR D46–D58）
 
-> **状态**：**`DRAFT — 待人工批准（P6-06 实施前必须批准）`**
+> **状态**：**`ACCEPTED — 已获人工批准（签核 2026-09-08，D-01..D-13 全部按草案批准，含五项风险决策：手动 stop 满足缺省边 / 回滚不回滚链态 / 超限不对称不强杀在途 / 链不自动重放且 v1 无链取消 API / 触发族命名 chain）`**
 > **任务**：P6-05 · DAG / 链式调度需求与架构裁决（文档任务，零生产改动）
 > **作者/日期**：P6-05 · 2026-09-08
 > **上游**：`docs/P6-05.md`（需求裁决表 D-01…D-13）、`docs/P4-DEPENDENCY-REQUIREMENTS.md`
@@ -331,16 +331,16 @@ golden 持续守卫。
 ## 附：决策记录
 
 | 编号 | 主题 | 状态 |
-| D46 | 边载体 = `dependency=` 扩展 | DRAFT（P6-05 D-01） |
-| D47 | `trigger=chain` 家族（managed-only） | DRAFT（P6-05 D-02/D-12） |
-| D48 | 链运行/重复触发/run id=cycle token | DRAFT（P6-05 D-03） |
-| D49 | 状态文件布局 `$base/dag/<chain>/runs/<token>/run.txt` | DRAFT（P6-05 D-09/D-13） |
-| D50 | 链级五态 = 文件记录；183 零改动 | DRAFT（P6-05 D-13） |
-| D51 | 失败传播 = D15/D16 一一映射 | DRAFT（P6-05 D-05） |
-| D52 | frontier 编排与并行闸 | DRAFT（P6-05 D-04） |
-| D53 | 优先级矩阵/重试仅节点级 | DRAFT（P6-05 D-06） |
-| D54 | 手动控制节点级 only | DRAFT（P6-05 D-07） |
-| D55 | 配置期校验升级口径 | DRAFT（P6-05 D-08） |
-| D56 | 运行期图变更一致性 | DRAFT（P6-05 D-09） |
-| D57 | 上限数值与超限行为 | DRAFT（P6-05 D-10） |
-| D58 | 可观测只增键 + 错误码映射 | DRAFT（交付物 B） |
+| D46 | 边载体 = `dependency=` 扩展 | ACCEPTED·2026-09-08（P6-05 D-01） |
+| D47 | `trigger=chain` 家族（managed-only） | ACCEPTED·2026-09-08（P6-05 D-02/D-12） |
+| D48 | 链运行/重复触发/run id=cycle token | ACCEPTED·2026-09-08（P6-05 D-03） |
+| D49 | 状态文件布局 `$base/dag/<chain>/runs/<token>/run.txt` | ACCEPTED·2026-09-08（P6-05 D-09/D-13） |
+| D50 | 链级五态 = 文件记录；183 零改动 | ACCEPTED·2026-09-08（P6-05 D-13） |
+| D51 | 失败传播 = D15/D16 一一映射 | ACCEPTED·2026-09-08（P6-05 D-05） |
+| D52 | frontier 编排与并行闸 | ACCEPTED·2026-09-08（P6-05 D-04） |
+| D53 | 优先级矩阵/重试仅节点级 | ACCEPTED·2026-09-08（P6-05 D-06） |
+| D54 | 手动控制节点级 only | ACCEPTED·2026-09-08（P6-05 D-07） |
+| D55 | 配置期校验升级口径 | ACCEPTED·2026-09-08（P6-05 D-08） |
+| D56 | 运行期图变更一致性 | ACCEPTED·2026-09-08（P6-05 D-09） |
+| D57 | 上限数值与超限行为 | ACCEPTED·2026-09-08（P6-05 D-10） |
+| D58 | 可观测只增键 + 错误码映射 | ACCEPTED·2026-09-08（交付物 B） |
