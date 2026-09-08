@@ -3,8 +3,9 @@
 # test.sh — P6-01 P5 基线复核与问题复现（tests/p6-reliability）
 # ═══════════════════════════════════════════════════════════════════════════
 # 判定（AGENTS §4）：每项 [PASS]/[FAIL]；出现 [FAIL] → exit 非 0。
-# 本套件为 **P6-01 复现套件**：O-2/O-3/O-4 三个断言在**当前生产代码**上
-# 应当 [FAIL]（证明缺陷存在、可复现），其余兼容性/性能/dash 断言 [PASS]。
+# 本套件为 **P6-01 复现套件**：O-2/O-3/O-4 三个断言在 P6-01 基线代码上
+# 应当 [FAIL]（证明缺陷存在、可复现）。P6-02 已修复 O-2、P6-03 已修复 O-3
+# （对应断言转 [PASS]）；O-4 仍应为 [FAIL]（P6-04 范畴）。
 # 套件不修改任何生产文件，只读 source Runtime 库（`. ./$RTLIB`，TCFG_DIR /
 # TR_BASE 均以临时目录隔离）。
 #
@@ -23,6 +24,9 @@
 #          extract_command 对 legacy 行仍按预期（标注来源 legacy/golden）。
 #   §perf   P6 性能记录性基线：scheduler_tick 空 registry + 50 任务 registry
 #          各跑 1 次，宽松上界（不设紧防误报）。
+#   §P6-02  主循环跳拍补偿（P6-02 修复）新增覆盖（P6-02-1..5）。
+#   §P6-03  Cron Task ID 稳定派生（P6-03 修复 tcfg_new_id sanitize）新增覆盖
+#          （P6-03-1..5：cron 字符集/确定性/旧 ID golden/穿越防御/端到端）。
 #   §posix  dash -n system/bin/su-scheduler-runtime。
 # ═══════════════════════════════════════════════════════════════════════════
 set -u
@@ -380,6 +384,140 @@ else
     bad "P6-02-5: 重启后误补历史窗口 $(grep 'P62_5=' "$P62_5/out.txt" | head -1)"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════
+# §P6-03 Cron Task ID 稳定派生（tcfg_new_id sanitize）新增覆盖
+# 修复（P6-03）：tcfg_new_id 在「去冒号」之后把非法路径字符（空格/`*`/`/`/
+# shell 元字符等）映射为 `_`，2+ 连点折叠、连续 `_` 折叠、空结果回退 `t`，
+# 全部在拼路径之前完成；派生确定性（无随机/时间戳）；去重计数器保留；
+# 非 cron trigger 旧 ID 逐字节不变；任务文件 trigger 字段仍逐字存储。
+# 每项独立子 shell，写 out 后父层断言。
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── P6-03-1 合法 cron 全场景：派生 ID 仅含 [A-Za-z0-9._-] ─────────────────
+# 修复前：cron trigger 含空格/`*`/`,`/`/` → 派生 ID 含非法字符 → BAD（复现 O-3）
+P63_D="$T/p63"; mkdir -p "$P63_D"
+P63_1="$P63_D/cron"; mkdir -p "$P63_1"
+(
+    export TCFG_DIR="$P63_1/tsks"; mkdir -p "$TCFG_DIR"
+    . "$PWD/$RTLIB"
+    bad_cnt=0
+    for ct in "cron:0 8 * * *" "cron:*/15 * * * *" "cron:5,10,15 9 * * 1" "cron:1 2 3 4 5"; do
+        cid=$(tcfg_new_id "$ct")
+        case "$cid" in
+            *[!A-Za-z0-9._-]*) bad_cnt=$((bad_cnt + 1)); echo "  P63_1_BADCHAR trig=$ct id=$cid" ;;
+        esac
+    done
+    if [ "$bad_cnt" -eq 0 ]; then echo "P63_1=OK"; else echo "P63_1=BAD bad_cnt=$bad_cnt"; fi
+) > "$P63_1/out.txt" 2>&1
+if grep -q '^P63_1=OK' "$P63_1/out.txt"; then
+    ok "P6-03-1: 空格/通配符/逗号/斜杠 cron trigger 派生 ID 仅含 [A-Za-z0-9._-]"
+else
+    bad "P6-03-1: cron trigger 派生 ID 含非法路径字符 $(grep 'bad_cnt' "$P63_1/out.txt" | head -1)"
+fi
+
+# ── P6-03-2 确定性：同输入同磁盘状态跨进程一致；已有同名 ID 时计数器去重 ──
+P63_2="$P63_D/det"; mkdir -p "$P63_2"
+(
+    export TCFG_DIR="$P63_2/tsks"; mkdir -p "$TCFG_DIR"
+    . "$PWD/$RTLIB"
+    # (a) 同空目录下两次独立派生（不同进程）→ 完全一致
+    r1=$(tcfg_new_id "cron:30 6 * * *")
+    r2=$(tcfg_new_id "cron:30 6 * * *")
+    # (b) 首个 ID 落盘后再派生 → 计数器给 _2（去冲突设计，不破坏确定性）
+    : > "$(tcfg_task_file "$r1")"
+    r3=$(tcfg_new_id "cron:30 6 * * *")
+    if [ "$r1" = "$r2" ] && [ "$r3" = "${r1%_1}_2" ]; then
+        echo "P63_2=OK r1=$r1 r3=$r3"
+    else
+        echo "P63_2=BAD r1=$r1 r2=$r2 r3=$r3"
+    fi
+) > "$P63_2/out.txt" 2>&1
+if grep -q '^P63_2=OK' "$P63_2/out.txt"; then
+    ok "P6-03-2: 派生跨进程确定性一致；同名已存在时计数器 _n 自增去重"
+else
+    bad "P6-03-2: 确定性/去重异常 $(grep 'P63_2=' "$P63_2/out.txt" | head -1)"
+fi
+
+# ── P6-03-3 旧 ID golden：非 cron trigger 派生逐字节不变 ──────────────────
+# 期望值取自修复前实测（.p63probe 2026-09-08），修复后必须逐字节相同。
+P63_3="$P63_D/golden"; mkdir -p "$P63_3"
+(
+    export TCFG_DIR="$P63_3/tsks"; mkdir -p "$TCFG_DIR"
+    . "$PWD/$RTLIB"
+    g_fail=0
+    for pair in \
+        "0830|task_0830_1" \
+        "weekly:1:0800|task_weekly10800_1" \
+        "monthly:01:0000|task_monthly010000_1" \
+        "boot_completed|task_boot_completed_1" \
+        "08:30|task_0830_1" \
+        "interval:5|task_interval5_1"; do
+        gt=${pair%%|*}; ge=${pair#*|}
+        gi=$(tcfg_new_id "$gt")
+        [ "$gi" = "$ge" ] || { g_fail=$((g_fail + 1)); echo "  P63_3_DIFF trig=$gt got=$gi want=$ge"; }
+    done
+    if [ "$g_fail" -eq 0 ]; then echo "P63_3=OK"; else echo "P63_3=BAD g_fail=$g_fail"; fi
+) > "$P63_3/out.txt" 2>&1
+if grep -q '^P63_3=OK' "$P63_3/out.txt"; then
+    ok "P6-03-3: 非 cron trigger 旧 ID 逐字节不变（6 条 golden）"
+else
+    bad "P6-03-3: 旧 ID 派生行为变化 $(grep 'P63_3_DIFF' "$P63_3/out.txt" | head -1)"
+fi
+
+# ── P6-03-4 路径穿越/shell 元字符防御 + 落盘限制在 TCFG_DIR 内 ────────────
+# 修复前：`cron:../../etc/passwd` 派生含 `/`+`..`（BAD）；`; rm -rf /` 派生含
+# 分号/空格/`/`；`$(id)`/反引号原样进入 ID → 断言 BAD（复现）。
+P63_4="$P63_D/evil"; mkdir -p "$P63_4"
+(
+    export TCFG_DIR="$P63_4/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    . "$PWD/$RTLIB"
+    e_fail=0
+    for et in "cron:../../etc/passwd" "08:30; rm -rf /" 'cron:$(id)`id`' ":::"; do
+        eid=$(tcfg_new_id "$et")
+        case "$eid" in
+            */*|*..*|.*|*[!A-Za-z0-9._-]*) e_fail=$((e_fail + 1)); echo "  P63_4_EVIL trig=$et id=$eid"; continue ;;
+        esac
+        # 用该 ID 走 tcfg_new_task：文件必须恰好落在 TCFG_DIR 内
+        tcfg_new_task "$eid" "$et" "echo evil-probe" >/dev/null 2>&1
+        [ -f "$(tcfg_task_file "$eid")" ] || { e_fail=$((e_fail + 1)); echo "  P63_4_NOFILE trig=$et id=$eid"; }
+    done
+    total=$(find "$TCFG_DIR" -type f ! -name MANAGED | wc -l | tr -d ' ')
+    outside=$(find "$P63_4" -type f ! -path "$TCFG_DIR/*" ! -name out.txt 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$e_fail" -eq 0 ] && [ "$total" -eq 4 ] && [ "$outside" -eq 0 ]; then
+        echo "P63_4=OK total=$total outside=$outside"
+    else
+        echo "P63_4=BAD e_fail=$e_fail total=$total outside=$outside"
+    fi
+) > "$P63_4/out.txt" 2>&1
+if grep -q '^P63_4=OK' "$P63_4/out.txt"; then
+    ok "P6-03-4: 穿越/分号/$()/反引号/全非法 trigger 派生安全 ID，落盘仅限 TCFG_DIR（4 任务文件、无逃逸）"
+else
+    bad "P6-03-4: 恶意 trigger 派生或落盘异常 $(grep 'P63_4' "$P63_4/out.txt" | head -2 | tr '\n' ' ')"
+fi
+
+# ── P6-03-5 端到端：派生 ID 创建 cron 任务 + validate + trigger 逐字保留 ──
+# 修复前：tcfg_new_task 拒绝含空格/`*` 的派生 ID（charset 校验）→ 文件不存在 → BAD
+P63_5="$P63_D/e2e"; mkdir -p "$P63_5"
+(
+    export TCFG_DIR="$P63_5/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    . "$PWD/$RTLIB"
+    e5id=$(tcfg_new_id "cron:30 6 * * *")
+    tcfg_new_task "$e5id" "cron:30 6 * * *" "echo x" >/dev/null 2>&1
+    e5rc=$?
+    e5f=$(tcfg_task_file "$e5id")
+    if [ "$e5rc" -eq 0 ] && [ -f "$e5f" ] && tcfg_validate_task "$e5f" \
+        && [ "$(tcfg_get "$e5f" trigger)" = "cron:30 6 * * *" ]; then
+        echo "P63_5=OK id=$e5id"
+    else
+        echo "P63_5=BAD rc=$e5rc id=$e5id trig=$(tcfg_get "$e5f" trigger 2>/dev/null)"
+    fi
+) > "$P63_5/out.txt" 2>&1
+if grep -q '^P63_5=OK' "$P63_5/out.txt"; then
+    ok "P6-03-5: 端到端 cron 任务创建通过校验，trigger 含空格逐字保留"
+else
+    bad "P6-03-5: 端到端 cron 任务创建失败 $(grep 'P63_5=' "$P63_5/out.txt" | head -1)"
+fi
+
 # ── §posix dash -n ────────────────────────────────────────────────────────
 if command -v dash >/dev/null 2>&1; then
     dash -n "$PWD/$RTLIB" 2>/dev/null && ok "P6-01 POSIX: dash -n ok (runtime)" || bad "P6-01 POSIX: dash -n failed"
@@ -389,5 +527,5 @@ fi
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
-echo "p6-reliability tests: PASS=$PASS FAIL=$FAIL  (O-3/O-4 FAIL 属预期复现，P6-03/P6-04 范畴)"
+echo "p6-reliability tests: PASS=$PASS FAIL=$FAIL  (O-3 已由 P6-03 修复转 PASS；O-4 FAIL 属预期复现，P6-04 范畴)"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

@@ -3216,9 +3216,14 @@ tcfg_write_task() {   # <id>
 }
 
 # 新建任务 ID：<trigger> → task_<trigger_norm>_<n>（避免与 legacy t<line>_ 冲突）
+# P6-03：norm 在拼路径前 sanitize 至 [A-Za-z0-9._-]——保留既有「去冒号」语义
+#（非 cron trigger 派生结果逐字节不变）；其余非法字符（空格/`*`/`/`/shell
+# 元字符等）映射 `_`，连续 `_` 折叠，2+ 连点折叠为 `_`（防路径穿越），
+# 空结果回退 `t`。仅影响 ID，任务文件 trigger 字段仍逐字存储原 trigger。
 tcfg_new_id() {   # <trigger>
     trig=$1
-    norm=$(echo "$trig" | sed 's/://g')
+    norm=$(printf '%s' "$trig" | sed 's/://g' | tr -c 'A-Za-z0-9._-' '_' | sed 's/\.\{2,\}/_/g' | tr -s '_')
+    [ -n "$norm" ] || norm=t
     n=1
     while [ -f "$(tcfg_task_file "task_${norm}_${n}")" ]; do
         n=$((n + 1))
