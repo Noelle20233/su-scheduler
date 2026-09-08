@@ -919,7 +919,8 @@ else
 fi
 
 # EX-17 拆分（P6-08 出口条件；测试自更新，非掩盖）：WebUI JSON 键面已由 P6-08 落地
-# → 17a/17b 转真验证 PASS；CLI `task status/info` 展示行归 P6-09，保持 SKIP。
+# → 17a/17b 转真验证 PASS；CLI `task status/info` 展示行归 P6-09（已落地，
+#   17c/17c-b/17c-c 由 SKIP 转真验证 PASS——本套件终态 0 SKIP）。
 ws17=$(web_agg_summary "$E_BASE" "$E_TASKS")
 if printf '%s' "$ws17" | grep -q '"dag":{"active":0,"limit":8,"recent_failed":0,"chains":\[' \
    && printf '%s' "$ws17" | grep -q '"root":"rt0","run":"202609080830","run_state":"SUCCESS"' \
@@ -935,7 +936,56 @@ if printf '%s' "$wd17" | grep -q '"dag":{"chain_root":"rt0","role":"node","run":
 else
     bad "DAG-EX-17b GET_TASK_DETAIL.dag 异常: $(printf '%s' "$wd17" | sed -n 's/.*\("dag":.*\)/\1/p' | cut -c1-160)"
 fi
-skip "DAG-EX-17c CLI task status/info 'Chain Root:'/'Run:'/'Run State:' 行 — reason: 归 P6-09 CLI 展示面（WebUI 键面已由 P6-08 以 17a/17b 转真验证；本行自原 EX-17 SKIP 拆分而来）"
+# EX-17c 转真验证（P6-09 CLI 展示面落地；自 SKIP 转 PASS，非删除断言）：
+#   `task status`（§13 task_cli_status_id）：dag 七键文本追加行（与 GET_TASK_DETAIL.dag
+#   同源 web_dag_detail_compute）+ 跳拍行 last_tick_catchup/catchup_executed；
+#   `task-info`（生产 CLI managed 域）：Chain Root:/Run:/Run State: 等追加标签行。
+s17c=$(task_cli_status_id "$E_BASE" "$E_TASKS" "" b 2>/dev/null)
+if printf '%s\n' "$s17c" | grep -q '^chain_root=rt0$' \
+   && printf '%s\n' "$s17c" | grep -q '^role=node$' \
+   && printf '%s\n' "$s17c" | grep -q '^run=202609080830$' \
+   && printf '%s\n' "$s17c" | grep -q '^run_state=SUCCESS$' \
+   && printf '%s\n' "$s17c" | grep -q '^node_state=STOPPED$' \
+   && printf '%s\n' "$s17c" | grep -q '^note=disp$' \
+   && printf '%s\n' "$s17c" | grep -q '^reason=$' \
+   && printf '%s\n' "$s17c" | grep -q '^last_tick_catchup=0$' \
+   && printf '%s\n' "$s17c" | grep -q '^catchup_executed=0$'; then
+    ok "DAG-EX-17c task status 链七键文本行（同源）+跳拍行真验证（P6-09；EX-17c SKIP→PASS）"
+else
+    bad "DAG-EX-17c task status 链行异常: [$(printf '%s\n' "$s17c" | grep -E '^(chain_root|role|run|run_state|node_state|note|reason|last_tick_catchup|catchup_executed)=' | tr '\n' ';')]"
+fi
+# 非链回归：rt0 为链根 → 有链行（role=root）；无关联任务（本场景不存在）零输出
+sr17=$(task_cli_status_id "$E_BASE" "$E_TASKS" "" rt0 2>/dev/null)
+if printf '%s\n' "$sr17" | grep -q '^chain_root=rt0$' && printf '%s\n' "$sr17" | grep -q '^role=root$' \
+   && printf '%s\n' "$sr17" | grep -q '^run_state=SUCCESS$'; then
+    ok "DAG-EX-17c-b 链根 task status role=root + run 态（账本事实源，与 WebUI 根口径一致）"
+else
+    bad "DAG-EX-17c-b 链根 status 异常: [$(printf '%s\n' "$sr17" | grep -E '^(chain_root|role|run_state)=' | tr '\n' ';')]"
+fi
+# task-info（生产 CLI，managed 域）：Chain Root:/Run:/Run State: + 上下游边追加标签
+CLI_BODY17=$(sed '/^# 🚦 Main Dispatcher/,$d' system/bin/su-scheduler | tr -d '\r' | sed '/^unset /d; /^export PATH=/d')
+ti17=$( {
+    set +u
+    . "./$RT" 2>/dev/null || true
+    eval "$CLI_BODY17"
+    RUNTIME_LOADED=1
+    DATA_DIR="$E_BASE"
+    TASKS_DIR="$E_TASKS"
+    SHELLS_DIR="$T/shells17"
+    TCFG_DIR="$E_TCFG"
+    cmd_task_info b
+} 2>&1 )
+if printf '%s\n' "$ti17" | grep -q 'Chain Root:.*rt0' \
+   && printf '%s\n' "$ti17" | grep -q 'Run:.*202609080830' \
+   && printf '%s\n' "$ti17" | grep -q 'Run State:.*SUCCESS' \
+   && printf '%s\n' "$ti17" | grep -q 'Node State:.*STOPPED' \
+   && printf '%s\n' "$ti17" | grep -q 'Upstream:.*rt0 (required want=STOPPED via=chain)' \
+   && printf '%s\n' "$ti17" | grep -q 'Downstream:.*c (required want=STOPPED via=chain)' \
+   && printf '%s\n' "$ti17" | grep -q 'Catchup Executed:.*0'; then
+    ok "DAG-EX-17c-c task-info 追加标签行 Chain Root:/Run:/Run State: + Upstream/Downstream 边（P6-09）"
+else
+    bad "DAG-EX-17c-c task-info 链行异常: [$(printf '%s\n' "$ti17" | grep -E 'Chain Root|Run|Upstream|Downstream|Catchup' | tr '\n' ';')]"
+fi
 
 # ── DAG-EX-18：editor 枚举 / trigger_decide 恒 due=N / IPC 19 op 零新增
 if tcfg_editor_trigger_ok chain && ! tcfg_editor_trigger_ok 'chain:extra' && ! tcfg_editor_trigger_ok 'CHAIN'; then

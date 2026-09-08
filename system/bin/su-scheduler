@@ -116,6 +116,7 @@ print_help() {
     echo -e "  ${GREEN}ipc${RESET} ${CYAN}<OP> [k=v ...]${RESET}         本地 IPC 控制面客户端 (P3-04) 🔌"
     echo -e "      ${YELLOW}OP:${RESET} GET_TASKS|GET_TASK_STATUS|GET_TASK_LOG|VALIDATE_TASK|CREATE_TASK|UPDATE_TASK|DELETE_TASK|ENABLE_TASK|DISABLE_TASK|START_TASK|STOP_TASK|RESTART_TASK|CHECK_TASK|GET_SUMMARY|GET_TASK_DETAIL|GET_TASK_EVENTS|GET_DAEMON_LOG|GET_TASK_EDIT|EDIT_TASK"
     echo -e "  ${GREEN}webui${RESET} ${CYAN}<OP> [k=v ...]${RESET}        WebUI 只读数据面 Reader (P3-05，只读 JSON) 🌐"
+    echo -e "  ${GREEN}chain${RESET} ${CYAN}[<chain-id>]${RESET}           DAG 链级只读查询 (P6-09，链根/run 态/成员/补偿余量) 🔗"
     echo -e "  ${GREEN}audit${RESET} ${YELLOW}[-f|-n NUM|clear]${RESET}    The Mission Auditor feed 🕵️"
     echo -e "  ${GREEN}history | all-tasks${RESET}      List all tasks (running & finished) 📜"
     echo -e "  ${GREEN}task-info${RESET} ${CYAN}<task_id>${RESET}       Get detailed task info 🔍"
@@ -527,6 +528,31 @@ cmd_task_info() {
             echo -e "${BOLD}Last Trigger Cause:${RESET} $(TASK_CLI_BASE="$DATA_DIR" task_cli_last_cause "$task_id" 2>/dev/null)"
             echo -e "${BOLD}Condition State:${RESET} $(obs_cond_state "$TASKS_DIR" "$task_id")"
             echo -e "${BOLD}Dependency State:${RESET} $(obs_dep_state "$TASKS_DIR" "$task_id")"
+            # P6-09：链路关系（上/下游边）、链当前节点（与 GET_TASK_DETAIL.dag
+            # 同源 web_dag_detail_compute）、跳拍补偿（追加行；既有行零改动）
+            TASK_CLI_BASE="$DATA_DIR" task_cli_dag_view "$DATA_DIR" "$TASKS_DIR" "$task_id" "$tinfo_trig"
+            echo -e "${BOLD}Upstream:${RESET} $(TASK_CLI_BASE="$DATA_DIR" task_cli_edge_summary "$DATA_DIR" "$task_id" up)"
+            echo -e "${BOLD}Downstream:${RESET} $(TASK_CLI_BASE="$DATA_DIR" task_cli_edge_summary "$DATA_DIR" "$task_id" down)"
+            echo -e "${BOLD}Last Tick Catchup:${RESET} $(TASK_CLI_BASE="$DATA_DIR" task_cli_last_tick_catchup 2>/dev/null)"
+            echo -e "${BOLD}Catchup Executed:${RESET} $(TASK_CLI_BASE="$DATA_DIR" task_cli_catchup_executed "$task_id")"
+            if [ -n "$webv_dd_role" ]; then
+                echo -e "${BOLD}Chain Root:${RESET} $webv_dd_root"
+                echo -e "${BOLD}Role:${RESET} $webv_dd_role"
+                echo -e "${BOLD}Run:${RESET} $webv_dd_run"
+                echo -e "${BOLD}Run State:${RESET} $webv_dd_rstate"
+                echo -e "${BOLD}Node State:${RESET} $webv_dd_nst"
+                echo -e "${BOLD}Node Note:${RESET} $webv_dd_note"
+                echo -e "${BOLD}Reason:${RESET} $webv_dd_reason"
+                tinfo_chains=$(task_cli_chain_membership "$DATA_DIR" "$task_id")
+                tinfo_nchain=0
+                for tinfo_c in $tinfo_chains; do
+                    tinfo_nchain=$((tinfo_nchain + 1))
+                done
+                if [ "$tinfo_nchain" -gt 1 ]; then
+                    # 多根共享：主行=字典序首链（P6-08 v1 口径）；本行列出全部所属链
+                    echo -e "${BOLD}Member Of Chains:${RESET} $tinfo_chains"
+                fi
+            fi
         fi
     fi
     echo -e "${BLUE}============================================================${RESET}"
@@ -1491,6 +1517,31 @@ cmd_webui() {
     fi
 }
 
+# 🔗 链级只读查询（P6-09，RUNTIME_LOADED 门控；零新 IPC op——daemon 不参与，
+# 纯读 $DATA_DIR/dag 账本 + registry 快照，CLI 离线可用；§13 task_cli_chain_*）。
+# 语法裁决：任务书 `chain [root|<chain-id>]` 的 "root" 语义（列全部链根）由**无参
+# 形态**承载（对齐既有 `task list`/`task-config list` 惯例，不引入字面量子词）；
+# `chain <chain-id>` 详情（根 id 或成员 id 均可，成员解析到归属链根）。
+#   su-scheduler chain               → 链根清单 + 最近 run 态 + 进行中/RUNS_MAX 余量
+#   su-scheduler chain <chain-id>    → 链详情（run/成员账本/闭包/历史/审计尾/校验错误）
+cmd_chain() {
+    if [ "$RUNTIME_LOADED" -ne 1 ]; then
+        echo "ERROR: chain subcommand requires production runtime library (${RUNTIME_LIB} not loaded)" >&2
+        return 1
+    fi
+    case "${1:-}" in
+        -h|--help)
+            echo "Usage: su-scheduler chain [<chain-id>]  (read-only: no arg = list chain roots/runs/headroom; <chain-id> = root or member detail)" >&2
+            return 0 ;;
+    esac
+    task_cli_attach "$DATA_DIR" >/dev/null 2>&1   # 失败退化账本视图（离线可用）
+    if [ $# -eq 0 ]; then
+        task_cli_chain_summary "$DATA_DIR"
+        return 0
+    fi
+    task_cli_chain_detail "$DATA_DIR" "$TASKS_DIR" "$1"
+}
+
 # 🚦 Main Dispatcher - Routes your command to the right function
 case "$1" in
     add) shift; cmd_add "$@" ;;
@@ -1504,6 +1555,7 @@ case "$1" in
     task-config) shift; cmd_task_config "$@" ;;
     ipc) shift; cmd_ipc "$@" ;;
     webui) shift; cmd_webui "$@" ;;
+    chain) shift; cmd_chain "$@" ;;
     audit) shift; cmd_audit "$@" ;;
     history|all-tasks) cmd_tasks_history ;;
     task-info) shift; cmd_task_info "$@" ;;

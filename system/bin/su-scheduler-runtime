@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.31.0"
+RUNTIME_LIB_VERSION="1.32.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1540,6 +1540,132 @@ task_cli_last_cause() {   # <id> → scheduler/audit.log 末条 op=exec 的 caus
     grep -F "task=$lc_id|" "$lc_f" 2>/dev/null | grep -F 'op=exec' | tail -1 \
         | sed -n 's/.*|cause=\([^|]*\).*/\1/p'
 }
+# ── P6-09 跳拍补偿只读查询（数据源 = scheduler/audit.log，只读零副作用）──────
+# last_tick_catchup：末条 op=tick 行的 catchup=<n>（聚合补偿计数；无 tick 记录 →
+# 空+rc1；P6-02 前的旧 tick 行无该字段 → 空）。
+task_cli_last_tick_catchup() {
+    tc_f=$(task_cli_audit_file)
+    [ -f "$tc_f" ] || return 1
+    tc_l=$(grep -F 'op=tick' "$tc_f" 2>/dev/null | tail -1)
+    [ -n "$tc_l" ] || return 1
+    printf '%s' "$tc_l" | sed -n 's/.*|catchup=\([^|]*\).*/\1/p'
+}
+# catchup_executed：该任务是否存在 catchup=1 标记的 op=exec 审计行（P6-09 逐任务
+# 补偿标记）→ 1/0（含无审计文件 → 0）。
+task_cli_catchup_executed() {
+    ce_f=$(task_cli_audit_file)
+    [ -f "$ce_f" ] || { echo 0; return 0; }
+    if grep -F "task=$1|" "$ce_f" 2>/dev/null | grep -F 'op=exec|' \
+       | grep -q 'catchup=1'; then echo 1; else echo 0; fi
+}
+# ── P6-09 CLI 链展示（与 §22 GET_TASK_DETAIL.dag 同源；零复制解析逻辑）────────
+# task_cli_dag_view <base> <tasks> <id> <trigger> → web_dag_detail_compute +
+# CLI 侧 reason 扩展（run_state=FAILED 且同源 reason 为空、且审计尾读有本 run 的
+# action=timeout → reason=run-timeout；超时可见性；WebUI JSON 键面不动）。
+# 结果置 webv_dd_* 全局；调用方按 webv_dd_role 非空判定链相关。
+task_cli_dag_view() {
+    web_dag_detail_compute "$1" "$2" "$3" "$4" || return 0
+    if [ -z "$webv_dd_reason" ] && [ "$webv_dd_rstate" = FAILED ] && [ -n "$webv_dd_run" ]; then
+        if tail -n 200 "$1/scheduler/audit.log" 2>/dev/null \
+           | grep -qF "op=dag|action=timeout|chain=$webv_dd_root|run=$webv_dd_run|"; then
+            webv_dd_reason=run-timeout
+        fi
+    fi
+    return 0
+}
+# task_cli_dag_lines <base> <tasks> <id> <trigger> → 追加 key=value 行（与
+# GET_TASK_DETAIL.dag 同名七键文本投影）；非链任务（role 空）零输出。
+task_cli_dag_lines() {
+    task_cli_dag_view "$1" "$2" "$3" "$4"
+    [ -n "$webv_dd_role" ] || return 0
+    echo "chain_root=$webv_dd_root"
+    echo "role=$webv_dd_role"
+    echo "run=$webv_dd_run"
+    echo "run_state=$webv_dd_rstate"
+    echo "node_state=$webv_dd_nst"
+    echo "note=$webv_dd_note"
+    echo "reason=$webv_dd_reason"
+    return 0
+}
+# task_cli_edge_summary <base> <id> <up|down> → 单行边摘要（'-'=>无）。
+# 上游 = 自身 dependency 条目（?Optional/:STATE 原样语义标注）；下游 = 引用本 id 的
+# 任务条目。relation：entry 所在侧 trigger=chain → chain（链边），否则 gate
+# （P4 依赖门）——与 §27 图语义一致；纯 registry 只读。
+task_cli_edge_summary() {
+    ees_base=$1; ees_id=$2; ees_dir=$3
+    ees_tf=$(registry_task_file "$ees_id" 2>/dev/null)
+    if [ "$ees_dir" = up ]; then
+        ees_efs=""
+        [ -n "$ees_tf" ] && ees_efs=$(dep_normalize "$(sched_task_field "$ees_tf" dependency)")
+        [ -n "$ees_efs" ] || { echo "-"; return 0; }
+        ees_trig=$(sched_task_field "$ees_tf" trigger)
+        ees_rel=gate
+        [ "$ees_trig" = chain ] && ees_rel=chain
+        ees_out=""; ees_sep=""
+        ees_sifs=$IFS; IFS=,
+        for ees_e in $ees_efs; do
+            [ -n "$ees_e" ] || continue
+            ees_opt=required
+            case "$ees_e" in '?'*) ees_opt=optional; ees_e=${ees_e#\?} ;; esac
+            ees_up=$ees_e; ees_want=STOPPED
+            case "$ees_e" in *:*) ees_up=${ees_e%%:*}; ees_want=${ees_e#*:} ;; esac
+            ees_out="$ees_out$ees_sep$ees_up ($ees_opt want=$ees_want via=$ees_rel)"
+            ees_sep="; "
+        done
+        IFS=$ees_sifs
+        [ -n "$ees_out" ] || ees_out="-"
+        printf '%s\n' "$ees_out"
+        return 0
+    fi
+    ees_out=""; ees_sep=""
+    for ees_c in $(registry_task_ids 2>/dev/null); do
+        [ "$ees_c" = "$ees_id" ] && continue
+        ees_ctf=$(registry_task_file "$ees_c" 2>/dev/null) || continue
+        ees_cdep=$(dep_normalize "$(sched_task_field "$ees_ctf" dependency)")
+        [ -n "$ees_cdep" ] || continue
+        ees_ctrig=$(sched_task_field "$ees_ctf" trigger)
+        ees_crel=gate
+        [ "$ees_ctrig" = chain ] && ees_crel=chain
+        ees_sifs=$IFS; IFS=,
+        for ees_e in $ees_cdep; do
+            [ -n "$ees_e" ] || continue
+            ees_opt=required
+            case "$ees_e" in '?'*) ees_opt=optional; ees_e=${ees_e#\?} ;; esac
+            ees_up=$ees_e; ees_want=STOPPED
+            case "$ees_e" in *:*) ees_up=${ees_e%%:*}; ees_want=${ees_e#*:} ;; esac
+            if [ "$ees_up" = "$ees_id" ]; then
+                ees_out="$ees_out$ees_sep$ees_c ($ees_opt want=$ees_want via=$ees_crel)"
+                ees_sep="; "
+            fi
+        done
+        IFS=$ees_sifs
+    done
+    [ -n "$ees_out" ] || ees_out="-"
+    printf '%s\n' "$ees_out"
+    return 0
+}
+# task_cli_chain_membership <base> <id> → id 参与的全部链根（空格分隔，字典序：
+# 账本事实源——目录名=根；成员=出现在某链展示 run 账本行）。多根共享时全部列出
+# （P6-08 展示口径：字典序首链为归属主链）。
+task_cli_chain_membership() {
+    cm_base=$1; cm_id=$2
+    [ -n "$cm_base" ] && secv_id_ok "$cm_id" || return 0
+    [ -d "$(dag_runs_root "$cm_base")" ] || return 0
+    cm_out=""
+    for cm_cd in "$cm_base"/dag/*/; do
+        [ -d "$cm_cd" ] || continue
+        cm_c=${cm_cd%/}; cm_c=${cm_c##*/}
+        secv_id_ok "$cm_c" || continue
+        if [ "$cm_c" = "$cm_id" ]; then
+            cm_out="$cm_out $cm_c"
+            continue
+        fi
+        web_dag_pick_run "$cm_base" "$cm_c" || continue
+        [ -n "$(dag_book_state "$webv_dagr_lines" "$cm_id")" ] && cm_out="$cm_out $cm_c"
+    done
+    printf '%s\n' "$cm_out" | sed 's/^ //; s/ $//'
+    return 0
+}
 
 task_cli_status() {
     id=$1
@@ -1601,6 +1727,11 @@ task_cli_status() {
     if [ -n "$obs_g" ]; then
         echo "Gate: $obs_g"
     fi
+    # P6-09：跳拍补偿 + DAG 链状态（追加行；链数据与 GET_TASK_DETAIL.dag 同源——
+    # web_dag_detail_compute 单一事实源；非链任务零新行，旧输出逐字节兼容）
+    echo "last_tick_catchup=$(task_cli_last_tick_catchup 2>/dev/null)"
+    echo "catchup_executed=$(task_cli_catchup_executed "$id")"
+    task_cli_dag_lines "$(task_cli_base)" "${TASK_CLI_TASKS_DIR:-}" "$id" "$st_trig"
     return 0
 }
 
@@ -2251,6 +2382,183 @@ task_cli_status_id() {   # <base> <tasks_dir> <lock> <id> → rc 沿 §7 三态
         echo "canonical_id=$canon"
     fi
     TASK_CLI_TASKS_DIR="$tasks" TASK_CLI_LOCK="$lock" task_cli_status "$canon"
+}
+# ── P6-09 链级只读查询（CLI `su-scheduler chain`；零新 IPC op、daemon 不参与）──
+# 数据源 = §27 账本（$base/dag，web_dag_pick_run/run_json/history **同源**）+
+# registry 快照现图（dag_root_map，未点火链的闭包）。attach 失败退化为账本视图
+# （CLI 离线可用）。全部只读、零 exec、零写盘。
+# 现图目录解析（task_cli_chain_graphdir）：快照目录优先；无快照/快照 KEPT（如
+# 图形超限配置被 P4-03 过滤后 current 不存在）→ 回退 task-config 权威存储
+# （与 P5-07 GET_SUMMARY.dep_errors 同源惯例；仅 managed）。
+task_cli_chain_graphdir() {   # → 现图 .task 目录（空=不可得）
+    cg_sdir=$(registry_snapshot_dir 2>/dev/null)
+    [ -n "$cg_sdir" ] && [ -d "$cg_sdir" ] && { printf '%s\n' "$cg_sdir"; return 0; }
+    if tcfg_is_managed 2>/dev/null && [ -d "$(tcfg_dir)" ]; then
+        printf '%s\n' "$(tcfg_dir)"
+        return 0
+    fi
+    return 0
+}
+# 现图 id/trigger 只读访问（快照或 tcfg 目录同构 .task 文件）
+task_cli_chain_graph_ids() {   # <gdir> → ids（升序）
+    d=$1
+    [ -n "$d" ] || return 0
+    for f in "$d"/*.task; do
+        [ -f "$f" ] || continue
+        i=${f##*/}
+        printf '%s\n' "${i%.task}"
+    done | sort
+}
+task_cli_chain_roots() {   # <base> → 链根集合（账本目录 ∪ 现图根；字典序去重；空格分隔）
+    cr_base=$1
+    cr_ids=""
+    if [ -d "$(dag_runs_root "$cr_base")" ]; then
+        for cr_cd in "$cr_base"/dag/*/; do
+            [ -d "$cr_cd" ] || continue
+            cr_c=${cr_cd%/}; cr_c=${cr_c##*/}
+            secv_id_ok "$cr_c" || continue
+            cr_ids="$cr_ids $cr_c"
+        done
+    fi
+    cr_sdir=$(task_cli_chain_graphdir)
+    if [ -n "$cr_sdir" ]; then
+        cr_chain=""
+        for cr_i in $(task_cli_chain_graph_ids "$cr_sdir"); do
+            [ -f "$cr_sdir/$cr_i.task" ] || continue
+            [ "$(sched_task_field "$cr_sdir/$cr_i.task" trigger)" = chain ] && cr_chain="$cr_chain $cr_i"
+        done
+        if [ -n "$cr_chain" ]; then
+            for cr_l in $(dag_root_map "$cr_sdir" "$cr_chain" | cut -d'|' -f1); do
+                secv_id_ok "$cr_l" || continue
+                case " $cr_ids " in *" $cr_l "*) : ;; *) cr_ids="$cr_ids $cr_l" ;; esac
+            done
+        fi
+    fi
+    printf '%s\n' $cr_ids | grep -v '^$' | sort -u | tr '\n' ' '
+    echo
+    return 0
+}
+task_cli_chain_closure() {   # <base> <root> → 现图成员 id（空格分隔；无图目录/无链→空）
+    cc_sdir=$(task_cli_chain_graphdir)
+    [ -n "$cc_sdir" ] || return 0
+    cc_chain=""
+    for cc_i in $(task_cli_chain_graph_ids "$cc_sdir"); do
+        [ -f "$cc_sdir/$cc_i.task" ] || continue
+        [ "$(sched_task_field "$cc_sdir/$cc_i.task" trigger)" = chain ] && cc_chain="$cc_chain $cc_i"
+    done
+    [ -n "$cc_chain" ] || return 0
+    # 输出稳定序（awk 关联数组遍历序不定 → 显式 sort；每行一 id）
+    dag_root_map "$cc_sdir" "$cc_chain" | awk -F'|' -v r="$2" '$1==r {print $2}' \
+        | tr ' ' '\n' | grep . | sort
+    return 0
+}
+task_cli_chain_summary() {   # <base> → 每链一行摘要 + 汇总行（恒 rc0）
+    cs_base=$1
+    cs_n=0
+    for cs_c in $(task_cli_chain_roots "$cs_base"); do
+        cs_n=$((cs_n + 1))
+        if web_dag_pick_run "$cs_base" "$cs_c" && web_dag_run_json; then
+            cs_inf=0
+            [ -n "$webv_dagj_frontier" ] && cs_inf=$(printf '%s' "$webv_dagj_frontier" | awk -F',' '{print NF}')
+            echo "chain=$cs_c run=$webv_dagr_token run_state=$webv_dagr_state done=$webv_dagj_done total=$webv_dagj_total inflight=$cs_inf"
+        else
+            cs_tot=1
+            for cs_m in $(task_cli_chain_closure "$cs_base" "$cs_c"); do
+                cs_tot=$((cs_tot + 1))
+            done
+            echo "chain=$cs_c run=- run_state=- done=- total=$cs_tot inflight=0"
+        fi
+    done
+    cs_act=$(dag_active_runs "$cs_base")
+    cs_rem=$((DAG_RUNS_MAX - cs_act))
+    [ "$cs_rem" -lt 0 ] 2>/dev/null && cs_rem=0
+    echo "chains=$cs_n active_runs=$cs_act limit=$DAG_RUNS_MAX remaining=$cs_rem"
+    return 0
+}
+task_cli_chain_detail() {   # <base> <tasks_dir> <id(根或成员)> → 详情行；未找到 rc1
+    cd_b=$1; cd_a=$3
+    cd_root=""
+    secv_id_ok "$cd_a" || { echo "ERROR: chain not found: $cd_a" >&2; return 1; }
+    if [ -d "$(dag_chain_dir "$cd_b" "$cd_a")" ]; then
+        cd_root="$cd_a"
+    else
+        # 成员 → 归属根（账本字典序首链，与 GET_TASK_DETAIL.dag 同口径；再退现图闭包）
+        for cd_cd in "$cd_b"/dag/*/; do
+            [ -d "$cd_cd" ] || continue
+            cd_c=${cd_cd%/}; cd_c=${cd_c##*/}
+            secv_id_ok "$cd_c" || continue
+            web_dag_pick_run "$cd_b" "$cd_c" || continue
+            [ -n "$(dag_book_state "$webv_dagr_lines" "$cd_a")" ] && { cd_root="$cd_c"; break; }
+        done
+        if [ -z "$cd_root" ]; then
+            cd_sdir=$(task_cli_chain_graphdir)
+            if [ -n "$cd_sdir" ] && [ -f "$cd_sdir/$cd_a.task" ]; then
+                for cd_r in $(task_cli_chain_roots "$cd_b"); do
+                    if [ "$cd_r" = "$cd_a" ]; then cd_root="$cd_a"; break; fi
+                    case " $(task_cli_chain_closure "$cd_b" "$cd_r") " in
+                        *" $cd_a "*) cd_root="$cd_r"; break ;;
+                    esac
+                done
+            fi
+        fi
+    fi
+    [ -n "$cd_root" ] || { echo "ERROR: chain not found: $cd_a" >&2; return 1; }
+    echo "chain=$cd_root"
+    [ "$cd_root" != "$cd_a" ] && echo "queried_id=$cd_a"
+    if web_dag_pick_run "$cd_b" "$cd_root" && web_dag_run_json; then
+        cd_created="$webv_dagr_created"; case "$cd_created" in ''|*[!0-9]*) cd_created="" ;; esac
+        echo "run=$webv_dagr_token"
+        echo "run_state=$webv_dagr_state"
+        echo "created=$cd_created"
+        echo "root_state=$(printf '%s' "$webv_dagr_rootline" | cut -d'|' -f2) attempt=$(printf '%s' "$webv_dagr_rootline" | cut -d'|' -f3)"
+        while IFS='|' read -r cd_nid cd_ntrig cd_nst cd_nnote; do
+            [ -n "$cd_nid" ] || continue
+            echo "member=$cd_nid state=$(web_dag_state_norm "$cd_nst") note=$cd_nnote"
+        done <<EOF
+$webv_dagr_lines
+EOF
+        # dash/mksh：while IFS= 前缀赋值随特殊内建持续生效（同 web_dag_pick_run 注释），显式恢复
+        IFS=" 	
+"
+        echo "done=$webv_dagj_done total=$webv_dagj_total"
+    else
+        echo "run=-"
+        echo "run_state=-"
+        echo "created="
+    fi
+    echo "closure=$(task_cli_chain_closure "$cd_b" "$cd_root" | tr '\n' ' ' | sed 's/ $//; s/^ //')"
+    echo "runs=$(web_dag_history_json "$cd_b" "$cd_root")"
+    cd_act=$(dag_active_runs "$cd_b")
+    cd_rem=$((DAG_RUNS_MAX - cd_act))
+    [ "$cd_rem" -lt 0 ] 2>/dev/null && cd_rem=0
+    echo "active_runs=$cd_act limit=$DAG_RUNS_MAX remaining=$cd_rem"
+    cd_au=$(tail -n 200 "$cd_b/scheduler/audit.log" 2>/dev/null \
+        | grep -F "op=dag|" | grep -F "chain=$cd_root|" | tail -n 5)
+    while IFS= read -r cd_al; do
+        [ -n "$cd_al" ] || continue
+        echo "audit=$cd_al"
+    done <<EOF
+$cd_au
+EOF
+    IFS=" 	
+"
+    # 配置期图形错误（如链维度超限被 P4-03 快照 KEPT 过滤）：读 task-config
+    # 权威目录（与 P5-05/07 dep_errors、apply/IPC 校验同一事实源）；legacy 域无
+    # 链，无校验面。原因文本剥 [task-config] ERROR: 前缀后与 IPC
+    # `configuration_invalid: <同文>` / CLI apply stderr 逐字一致（同一校验器）。
+    if tcfg_is_managed 2>/dev/null && [ -d "$(tcfg_dir)" ]; then
+        cd_ve=$(dep_graph_read "$(tcfg_dir)" \
+            | grep -F -e "'$cd_root'" -e 'chain depth ' -e 'chain nodes ' -e 'chain edges ' | sort -u)
+        while IFS= read -r cd_vl; do
+            [ -n "$cd_vl" ] || continue
+            echo "validation_error=$(printf '%s' "$cd_vl" | sed 's/^\[task-config\] ERROR: //')"
+        done <<EOF
+$cd_ve
+EOF
+        IFS=" 	
+"
+    fi
+    return 0
 }
 # ────────────────────────────────────────────────────────────────────────
 # §14 Daemon Lifecycle Startup（P2-09）
@@ -4143,7 +4451,12 @@ sched_execute_one() {   # <base> <config> <tasks_dir> <id> [now] [boot]
     elif case "$trig" in oneshot:*) true ;; *) false ;; esac; then
         sched_remove_task "$base" "$config" "$id" >/dev/null 2>&1
     fi
-    sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del|cause=$cause"
+    # P6-09：跳拍补偿逐任务标记——仅在 catch-up 上下文（scheduler_tick 补偿分支
+    # 置 sched_exec_catchup=1）追加 `|catchup=1` 字段；常规执行行逐字节不变
+    # （既有字段/顺序零改动，只增尾部可选字段，legacy 文本零破坏）。
+    sched_cc_mark=""
+    [ "${sched_exec_catchup:-0}" = "1" ] && sched_cc_mark="|catchup=1"
+    sched_audit "$base" "op=exec|task=$id|trigger=$trig|mode=$(sched_source_mode "$base")|rc=$arc|ron=$ron|del=$del|cause=$cause$sched_cc_mark"
     return "$arc"
 }
 # P6-02 跳拍补偿助手：HHMM → 当日分钟数（0-1439）；分钟 → 4 位 HHMM
@@ -4222,6 +4535,7 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
     last_file="$base/scheduler/last_tick"
     cc_n=0
     now_ck=$now
+    sched_exec_catchup=0   # P6-09：补偿上下文标志（op=exec 审计 catchup=1 门控）
     if [ -f "$last_file" ]; then
         last_token=$(cat "$last_file" 2>/dev/null)
         cur_token=$(sched_cycle_token)
@@ -4236,6 +4550,7 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
                     start=$((cmin - CATCHUP_MAX))
                 fi
                 m=$start
+                sched_exec_catchup=1
                 while [ "$m" -lt "$cmin" ]; do
                     mhhmm=$(sched_min_hhmm "$m")
                     for id in $(registry_task_ids); do
@@ -4257,6 +4572,7 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
                     done
                     m=$((m + 1))
                 done
+                sched_exec_catchup=0
             fi
         fi
     fi
@@ -5227,7 +5543,9 @@ EOF
 # node=出现在某链展示 run 账本成员行；trigger=chain 但尚无账本 → role=node、
 # chain_root=''（未点火，运行态无从可观测）。多根共享节点取字典序首个链（v1 口径）。
 # reason：note 含 gate-fail 时读节点 gate.fail 首行（D51 传播原因，只读）。
-web_dag_detail_json() {   # <base> <tasks> <id> <trigger> → stdout 对象 JSON
+# P6-09：计算体拆为 web_dag_detail_compute（置 webv_dd_* 全局，零输出），JSON 投影
+# 与 CLI 文本投影（task_cli_dag_lines / cmd_task_info）**共用同一事实源**。
+web_dag_detail_compute() {   # <base> <tasks> <id> <trigger> → 置 webv_dd_* 全局
     webv_dd_root=""; webv_dd_role=""; webv_dd_run=""; webv_dd_rstate=""
     webv_dd_nst=""; webv_dd_note=""; webv_dd_reason=""; webv_dd_hist="[]"
     webv_dd_base=${1:-}
@@ -5272,6 +5590,10 @@ web_dag_detail_json() {   # <base> <tasks> <id> <trigger> → stdout 对象 JSON
     case "$webv_dd_note" in *gate-fail*)
         webv_dd_reason=$(head -1 "$2/$webv_dd_id/gate.fail" 2>/dev/null) ;;
     esac
+    return 0
+}
+web_dag_detail_json() {   # <base> <tasks> <id> <trigger> → stdout 对象 JSON
+    web_dag_detail_compute "$1" "$2" "$3" "$4"
     printf '{"chain_root":%s,"role":%s,"run":%s,"run_state":%s,"node_state":%s,"note":%s,"reason":%s,"runs":%s}' \
         "$(web_json_str "$webv_dd_root")" "$(web_json_str "$webv_dd_role")" \
         "$(web_json_str "$webv_dd_run")" "$(web_json_str "$webv_dd_rstate")" \
@@ -7337,6 +7659,8 @@ EOF
     #    在途>0 → RUNNING；否则 PENDING
     dgv_allterm=1
     dgv_anyfail=0
+    dgv_nmem=0
+    dgv_cfail=0
     dgv_rst=$(printf '%s' "$dgv_rootline" | cut -d'|' -f2)
     case "$dgv_rst" in
         STOPPED|FAILED)
@@ -7354,6 +7678,8 @@ EOF
     esac
     while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
         [ -n "$dgv_nid" ] || continue
+        dgv_nmem=$((dgv_nmem + 1))
+        [ "$dgv_nst" = FAILED ] && dgv_cfail=$((dgv_cfail + 1))
         case "$dgv_nst" in
             STOPPED|FAILED)
                 dgv_nlive=$(runtime_current_state "$dgv_tasks/$dgv_nid" 2>/dev/null)
@@ -7378,6 +7704,14 @@ EOF
     else
         dgv_rstate=PENDING
     fi
+    # P6-09：run 终态回写 run.txt 时补完成审计（节点完成账→链级一行）。终态 run 在
+    # 函数入口早退，本分支仅在 PENDING/RUNNING→SUCCESS|FAILED 跃迁时进入——每 run
+    # 至多一条；timeout/corrupt 路径各有自身 action 审计（timeout/corrupt），不重复。
+    case "$dgv_rstate" in
+        SUCCESS|FAILED)
+            sched_audit "$dgv_base" "op=dag|action=complete|chain=$dgv_chain|run=$dgv_run|state=$dgv_rstate|nodes=$((dgv_nmem + 1))|failed=$dgv_cfail|mode=managed"
+            ;;
+    esac
     # ⑥ 整写（tmp+mv；无变化也幂等重写——单文件成本有界 ≤32 行）
     dag_run_emit | dag_run_write "$dgv_base" "$dgv_chain" "$dgv_run" >/dev/null 2>&1
     return 0
@@ -7658,10 +7992,13 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
                web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
                web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
-               web_dag_state_norm web_dag_pick_run web_dag_run_json web_dag_summary_json \
-               web_dag_history_json web_dag_detail_json \
-              obs_gate_state obs_dep_state obs_cond_state \
-              task_cli_base task_cli_audit_file task_cli_trigger_kind task_cli_next_due task_cli_last_cause \
+                web_dag_state_norm web_dag_pick_run web_dag_run_json web_dag_summary_json \
+               web_dag_history_json web_dag_detail_json web_dag_detail_compute \
+               obs_gate_state obs_dep_state obs_cond_state \
+               task_cli_base task_cli_audit_file task_cli_trigger_kind task_cli_next_due task_cli_last_cause \
+               task_cli_last_tick_catchup task_cli_catchup_executed task_cli_dag_view task_cli_dag_lines \
+               task_cli_edge_summary task_cli_chain_membership task_cli_chain_roots \
+               task_cli_chain_closure task_cli_chain_summary task_cli_chain_detail \
               tcfg_editor_num tcfg_editor_bool tcfg_editor_id_ok tcfg_editor_trigger_ok tcfg_editor_action_ok \
               tcfg_editor_health_ok tcfg_editor_recovery_ok tcfg_editor_validate_payload tcfg_apply_task ipc_op_get_task_edit ipc_op_edit_task \
               ipc_op_create ipc_op_update ipc_op_delete ipc_op_set_enabled \
