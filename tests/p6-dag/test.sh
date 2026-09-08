@@ -1047,6 +1047,175 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════
+# §P6-07 — DAG 资源 / 安全 / 并发控制加固（P6-07：重复派发幂等 + 注入面扩测 +
+#          运行期有界收敛 + §27 零 eval/零强杀 结构审计）
+# ═══════════════════════════════════════════════════════════════════════════
+dpass() {   # 直接单跑链引擎 pass（不经 scheduler_tick）
+    scheduler_dag_pass "$E_BASE" "$E_CFG" "$E_TASKS" "$1" >/dev/null 2>&1
+}
+
+ex_new   # ── P7-01：run.txt `disp` 标记幂等——重复调用 scheduler_dag_pass 不重复派发
+ex_task rt0 0830 ""; ex_task b chain rt0; ex_task c chain b
+touch "$E_SLOWDIR/b"
+etick 0830; etick 0831            # 登记 run + b 释放（disp，RUNNING 在途）
+rf="$(run_of rt0 202609080830)"
+md_a=$(md5sum "$rf" | cut -d' ' -f1)
+dpass 0831; dpass 0831; dpass 0831   # 同 tick 多波：账本 disp 幂等，b 不重派、c 不越层
+md_b=$(md5sum "$rf" | cut -d' ' -f1)
+if [ "$(grep -c '^b|' "$E_EXEC" | tr -d ' ')" = "1" ] && [ -z "$(grep '^c|' "$E_EXEC")" ] \
+   && [ "$md_a" = "$md_b" ] && [ "$(ls "$E_BASE/dag/rt0/runs" | wc -l | tr -d ' ')" = "1" ]; then
+    ok "DAG-P7-01 重复 scheduler_dag_pass 调用幂等：b 执行恒 1 次、c 不提前、run.txt 逐字节稳定、run 数 1（检查项5）"
+else
+    bad "DAG-P7-01 派发幂等破坏 b=$(grep -c '^b|' "$E_EXEC") c=$(grep -c '^c|' "$E_EXEC") md=$md_a/$md_b"
+fi
+rm -f "$E_SLOWDIR/b"; echo 0 > "$E_TASKS/b/exit_code.txt"
+etick 0832; etick 0833            # 正常推进：c 释放 → run SUCCESS（幂等不阻断前进）
+if grep -q '^state=SUCCESS$' "$(run_of rt0 202609080830)" && [ "$(grep -c '^c|' "$E_EXEC")" = "1" ]; then
+    ok "DAG-P7-01b 幂等后正常 tick 推进不受影响（c 恰 1 次、run SUCCESS）"
+else
+    bad "DAG-P7-01b 推进异常 c=$(grep -c '^c|' "$E_EXEC")"
+fi
+
+ex_new   # ── P7-07：不同 cycle token → 第二 run 并行登记（去重按 token 非按 root）
+DAG_RUNS_MAX=8
+ex_task rt0 0830 ""; ex_task b chain rt0
+touch "$E_SLOWDIR/b"
+etick 0830; etick 0831                       # run#1 登记，b 在途
+printf 'rt0\n' > "$E_BASE/scheduler/cycle-202609080835"   # 模拟更晚窗口根再次执行（标记回读）
+etick 0836
+n_runs=$(ls "$E_BASE/dag/rt0/runs" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$n_runs" = "2" ] && [ -f "$(run_of rt0 202609080835)" ] \
+   && grep -q '^state=' "$(run_of rt0 202609080830)"; then
+    ok "DAG-P7-07 去重粒度=cycle token：不同 token 各自一 run（同 root 双 run 并行；重复触发仅同窗去重，检查项5）"
+else
+    bad "DAG-P7-07 token 粒度异常 n=$n_runs"
+fi
+
+# ── P7-02：§27 结构安全审计（零 eval / 零 sh -c / 零强杀在途——签核③）──────
+sec27=$(sed -n '/^# §27 DAG/,$p' "$RT" | sed -n '1,/^# ─*$/p' | sed 's/#.*$//')
+n_eval=$(printf '%s\n' "$sec27" | grep -cE '(^|[;&|(])[[:space:]]*eval([[:space:]]|$)')
+n_shc=$(printf '%s\n' "$sec27" | grep -cE '(^|[;&|(])[[:space:]]*(sh|bash|mksh)[[:space:]]+-c([[:space:]]|$)')
+n_kl=$(printf '%s\n' "$sec27" | grep -cE '(^|[;&|])[[:space:]]*(pkill|killall|kill)([[:space:]]|$|[-0-9])')
+n_bt=$(printf '%s\n' "$sec27" | grep -c '`')
+if [ "$n_eval" = "0" ] && [ "$n_shc" = "0" ] && [ "$n_kl" = "0" ] && [ "$n_bt" = "0" ]; then
+    ok "DAG-P7-02 §27 代码行审计：零 eval / 零 sh -c / 零 kill 系 / 零反引号（无任意执行、超时不强杀，检查项9/签核③）"
+else
+    bad "DAG-P7-02 §27 审计命中 eval=$n_eval sh-c=$n_shc kill=$n_kl backtick=$n_bt"
+fi
+dtb=$(sed -n '/^dag_token_ok()/,/^}/p' "$RT")
+ones=$(printf '%s' "$dtb" | grep -o '\[0-9\]' | wc -l | tr -d ' ')
+if [ "$ones" -ge 12 ]; then
+    ok "DAG-P7-02b run 目录名门=12 位数字字面枚举（dag_token_ok 先于一切路径拼接，检查项9）"
+else
+    bad "DAG-P7-02b dag_token_ok 数字位模式异常 ones=$ones"
+fi
+
+ex_new   # ── P7-03：伪造 token 目录（非 12 位数字/含元字符）→ sweep 有界清理
+ex_completed
+mkdir -p "$E_BASE/dag/rt0/runs/20260908083" "$E_BASE/dag/rt0/runs/20260908083012" \
+         "$E_BASE/dag/rt0/runs/ab2609080830" "$E_BASE/dag/rt0/runs/20;26090830"
+for d in 20260908083 20260908083012 ab2609080830 '20;26090830'; do
+    printf 'chain=rt0\nrun=%s\nstate=PENDING\ncreated=1\nroot=x|PENDING|1\n' "$d" \
+        > "$E_BASE/dag/rt0/runs/$d/run.txt"
+done
+etick 0900
+kept=$(ls "$E_BASE/dag/rt0/runs" 2>/dev/null | tr '\n' ',')
+if [ ! -d "$E_BASE/dag/rt0/runs/20260908083" ] && [ ! -d "$E_BASE/dag/rt0/runs/20260908083012" ] \
+   && [ ! -d "$E_BASE/dag/rt0/runs/ab2609080830" ] && [ ! -d "$E_BASE/dag/rt0/runs/20;26090830" ] \
+   && [ -d "$E_BASE/dag/rt0/runs/202609080830" ]; then
+    ok "DAG-P7-03 伪造 run 目录（11/14 位、含字母、含 ';'）全部 rm 回收；合法 token 目录存续（检查项9）"
+else
+    bad "DAG-P7-03 伪造目录未清理 kept=$kept"
+fi
+
+ex_new   # ── P7-04：run.txt 内容注入 → corrupt 路径收敛，零 shell 求值副作用
+ex_task keeper 0830 ""; etick 0830   # 先建快照（生产语义：有 run 必有快照域）
+PWN_DAG="$E_DIR/pwn_dag"
+mkdir -p "$E_BASE/dag/inj1/runs/202609080500" "$E_BASE/dag/inj2/runs/202609080501"
+printf 'chain=$(touch %s)\nrun=202609080500\nstate=PENDING\ncreated=1789190000\nroot=inj1|PENDING|1\n' "$PWN_DAG" \
+    > "$E_BASE/dag/inj1/runs/202609080500/run.txt"
+{
+    echo 'chain=inj2'; echo 'run=202609080501'; echo 'state=PENDING'
+    echo 'created=1789190000'; echo 'root=inj2|PENDING|1'
+    printf 'x;id|chain|PENDING|\n'
+} > "$E_BASE/dag/inj2/runs/202609080501/run.txt"
+etick 0900; etick 0901
+r_i1="$E_BASE/dag/inj1/runs/202609080500/run.txt"
+r_i2="$E_BASE/dag/inj2/runs/202609080501/run.txt"
+if [ ! -e "$PWN_DAG" ] \
+   && grep -q '^state=FAILED$' "$r_i1" && grep -q '^chain=inj1$' "$r_i1" \
+   && grep -q '^state=FAILED$' "$r_i2" && ! grep -q 'x;id' "$r_i2" \
+   && grep -q 'action=corrupt|chain=inj1|run=202609080500' "$E_BASE/scheduler/audit.log" \
+   && grep -q 'action=corrupt|chain=inj2|run=202609080501' "$E_BASE/scheduler/audit.log"; then
+    ok "DAG-P7-04 run.txt 注入（chain=\$(...)、成员 'x;id'）→ corrupt→FAILED 重写，注入串仅作数据、零求值、零副作用（检查项9）"
+else
+    bad "DAG-P7-04 注入未被 corrupt 收敛: pwn=$([ -e "$PWN_DAG" ] && echo YES) i1=$(grep '^state=' "$r_i1" 2>/dev/null) i2=$(grep '^state=' "$r_i2" 2>/dev/null)"
+fi
+
+ex_new   # ── P7-05：注册入口直调拒绝（非法 token/chain id 不建目录、不落文件）
+before_n=$(ls "$E_BASE/dag" 2>/dev/null | wc -l | tr -d ' ')
+ok_r=0
+dag_try_register "$E_BASE" "$E_TASKS" 'a;b' 202609080830 'x' 2>/dev/null && ok_r=1
+dag_try_register "$E_BASE" "$E_TASKS" '../esc' 202609080830 'x' 2>/dev/null && ok_r=1
+dag_try_register "$E_BASE" "$E_TASKS" 'okid' '2026090808ab' 'x' 2>/dev/null && ok_r=1
+dag_try_register "$E_BASE" "$E_TASKS" 'okid' '20260908083;0' 'x' 2>/dev/null && ok_r=1
+after_n=$(ls "$E_BASE/dag" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$ok_r" = "0" ] && [ "$before_n" = "$after_n" ] && [ ! -e "$E_BASE/../esc" ] \
+   && [ ! -d "$E_BASE/dag/okid" ]; then
+    ok "DAG-P7-05 dag_try_register 对注入 id（';'、'..'）与非法 token（字母/分号）全部 rc≠0 且零目录副作用（检查项9）"
+else
+    bad "DAG-P7-05 注册门漏放 ok_r=$ok_r n=$before_n/$after_n"
+fi
+
+ex_new   # ── P7-08：cycle 标记匹配必须是整行字面（`.` 不放过正则误配）
+# 两链根 id：'v1.2'（0830 执行）与 'v1x2'（0831 执行）。若引擎用 grep -qx 以 id 作
+# **正则**匹配，则 'v1.2' 会在 cycle-0831 的行 'v1x2' 上误命中 → 为 v1.2 虚假登记
+# run 202609080831（该分钟 v1.2 从未执行）。字面匹配（-F）则各归各窗。
+ex_task 'v1.2' 0830 ""; ex_task 'nA' chain 'v1.2'
+ex_task 'v1x2' 0831 ""; ex_task 'nB' chain 'v1x2'
+etick 0830; etick 0831; etick 0832; etick 0833
+ghost="$(run_of 'v1.2' 202609080831)"
+real_a="$(run_of 'v1.2' 202609080830)"
+real_b="$(run_of 'v1x2' 202609080831)"
+if [ ! -e "$ghost" ] && [ -f "$real_a" ] && [ -f "$real_b" ]; then
+    ok "DAG-P7-08 cycle 标记按字面整行匹配：'v1.2' 不在 0831 虚假建 run（正则 `.` 误配被拒），两链各窗各一 run（检查项9）"
+else
+    bad "DAG-P7-08 正则误配：ghost=$([ -e "$ghost" ] && echo CREATED) a=$([ -f "$real_a" ] && echo y) b=$([ -f "$real_b" ] && echo y)"
+fi
+
+ex_new   # ── P7-09：运行中删除根任务 → 账本前滚、成员照常收敛（无永久 RUNNING）
+ex_task rt0 0830 ""; ex_task b chain rt0; ex_task c chain b
+etick 0830; etick 0831                        # run 登记（root 行 STOPPED 已冻结入册）
+rm -f "$E_TCFG/rt0.task"                      # 删除根声明（运行态前滚，D56/D-09）
+etick 0832; etick 0833; etick 0834
+rf="$(run_of rt0 202609080830)"
+if grep -q '^state=SUCCESS$' "$rf" && [ "$(grep -c '^b|' "$E_EXEC")" = "1" ] \
+   && [ "$(grep -c '^c|' "$E_EXEC")" = "1" ]; then
+    ok "DAG-P7-09 根删除后活跃 run 有界收敛：成员 b/c 各恰 1 次执行、run=SUCCESS（现图+账本判定，不留永久 RUNNING，检查项8）"
+else
+    bad "DAG-P7-09 删除根后未收敛: $(grep '^state=' "$rf" 2>/dev/null) b=$(grep -c '^b|' "$E_EXEC") c=$(grep -c '^c|' "$E_EXEC")"
+fi
+
+ex_new   # ── P7-10：孤儿 run（链已不在配置）→ DAG_RUN_TIMEOUT 有界回收 + prune 域
+ex_task keeper 0830 ""; etick 0830   # 先建快照（同上，非引擎缺陷：空配置无快照）
+DAG_RUN_TIMEOUT=60
+mkdir -p "$E_BASE/dag/orph/runs/202609080400"
+printf 'chain=orph\nrun=202609080400\nstate=PENDING\ncreated=1789190000\nroot=orph|PENDING|1\nm1|chain|PENDING|\n' \
+    > "$E_BASE/dag/orph/runs/202609080400/run.txt"
+etick 0831
+rf="$E_BASE/dag/orph/runs/202609080400/run.txt"
+if grep -q '^state=FAILED$' "$rf" \
+   && grep -q 'action=timeout|chain=orph' "$E_BASE/scheduler/audit.log"; then
+    ok "DAG-P7-10 残 run（配置无此链）→ 超时路径 FAILED 有界终局（D49/D-09），进入 prune 域；不阻 RUNS_MAX 名额（检查项8）"
+else
+    bad "DAG-P7-10 孤儿 run 未收敛: $(cat "$rf" 2>/dev/null | tr '\n' ';')"
+fi
+# 名额验证：FAILED 后 dag_active_runs 不含该 run
+n_act=$(dag_active_runs "$E_BASE")
+[ "$n_act" = "0" ] && ok "DAG-P7-10b 终态 run 不计活跃名额（dag_active_runs=0，检查项3/8）" \
+    || bad "DAG-P7-10b 名额未释放 active=$n_act"
+
+# ═══════════════════════════════════════════════════════════════════════════
 # §posix — 自身与 fixtures 工具语法（lint 惯例：dash 可用则 dash -n，否则 bash -n；sh -n 恒跑）
 # ═══════════════════════════════════════════════════════════════════════════
 SELF="tests/p6-dag/test.sh"

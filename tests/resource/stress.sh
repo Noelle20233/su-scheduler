@@ -166,6 +166,259 @@ supervisor_tick "$TASKS_DIR" "$BASE" >/dev/null 2>&1
 t1=$(date +%s)
 [ $((t1 - t0)) -le 60 ] && ok "P3-08 stress-e: supervisor re-entry bounded (no runaway)" || bad "P3-08 stress-e: took $((t1 - t0))s"
 
+# ═══════════════════════════════════════════════════════════════════════════
+# P6-07 §dag — 链引擎资源压测（节点数/深度/并发 run 逼近上限 + 历史扫描有界）
+# ═══════════════════════════════════════════════════════════════════════════
+# 手法与 tests/p6-dag 同源：execute_task shim 同步落工件；SCHED_CYCLE_NOW/GATE_NOW
+# 确定性时钟；上限常量用环境变量短阈值覆盖（同 EX-09/11，**不**跑 86400s 真超时）。
+# 时界断言与 p6-reliability §perf 同界（scheduler_tick ≤2000ms 宽松上界）。
+RS_N=0
+execute_task() {           # 7 参 daemon 上下文委托（p6-dag shim 同构）
+    rs_e=$1; rs_d="$TASKS_DIR/$rs_e"; mkdir -p "$rs_d" 2>/dev/null
+    echo "$rs_e" >> "$RS_EXEC"
+    if [ -f "$RS_SLOW/$rs_e" ]; then
+        echo "RUNNING" > "$rs_d/status.txt"
+    else
+        echo "0" > "$rs_d/exit_code.txt"; echo "SUCCESS" > "$rs_d/status.txt"
+    fi
+    return 0
+}
+rs_new() {                 # 独立链沙箱
+    RS_N=$((RS_N + 1))
+    RS_DIR="$T/rs$RS_N"; RS_BASE="$RS_DIR/base"; RS_TASKS="$RS_DIR/tasks"
+    RS_TCFG="$RS_DIR/tcfg"; RS_SLOW="$RS_DIR/slow"
+    mkdir -p "$RS_BASE" "$RS_TASKS" "$RS_TCFG" "$RS_SLOW"
+    echo managed > "$RS_TCFG/MANAGED"
+    export TCFG_DIR="$RS_TCFG" TASKS_DIR="$RS_TASKS"
+    # 重挂 registry（sched_ensure_base 仅当 TR_BASE 空才 attach；同 p6-dag ex_new）
+    TR_BASE=""; TR_CONFIG_PATH=""; TASK_REGISTRY_SNAPSHOT=""
+    RS_CFG="$RS_DIR/config.txt"; : > "$RS_CFG"
+    RS_EXEC="$RS_DIR/exec.log"; : > "$RS_EXEC"
+    RS_SEQ=0; RS_EPOCH=1789192800
+    DAG_CHAIN_NODES_MAX=32; DAG_CHAIN_EDGES_MAX=128; DAG_CHAIN_DEPTH_MAX=16
+    DAG_RUNS_MAX=8; DAG_PARALLEL_MAX=4; DAG_RUN_TIMEOUT=86400; DAG_RUNS_KEEP=8
+    WAIT_MAX=86400
+}
+rs_task() {                # <id> <trigger> <dep>
+    { echo "schema_version=2"; echo "id=$1"; echo "name=$1"; echo "enabled=1"
+      echo "trigger=$2"; echo "condition="; echo "dependency=$3"
+      echo "action.type=command"; echo "action.command=echo rs-$1"
+      echo "action.notify_start=0"; echo "action.notify_end=0"; echo "action.delete=0"
+      echo "action.termux=0"; echo "action.interactive=0"; echo "action.run_once_now=0"
+      echo "action.boot=0"; echo "action.msg="; echo "health.type=none"
+      echo "recovery.type=none"; echo "retry.max=0"; echo "retry.interval=60"
+    } > "$RS_TCFG/$1.task"
+}
+rstick() {                 # 完整 scheduler_tick（根执行/登记入口）
+    RS_SEQ=$((RS_SEQ + 1)); SCHED_CYCLE_NOW="20260908$1"; GATE_NOW=$((RS_EPOCH + RS_SEQ * 60))
+    state_sync_all "$RS_TASKS" >/dev/null 2>&1
+    scheduler_tick "$RS_BASE" "$RS_CFG" "$RS_TASKS" "$1" >/dev/null 2>&1
+    state_sync_all "$RS_TASKS" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=""; GATE_NOW=""
+}
+rs_ms=0
+rspass() {                 # 单跑链引擎 pass + 计时（ms 入全局 rs_ms）
+    SCHED_CYCLE_NOW="$1"; GATE_NOW="$2"
+    state_sync_all "$RS_TASKS" >/dev/null 2>&1
+    _t0=$(date +%s%N)
+    scheduler_dag_pass "$RS_BASE" "$RS_CFG" "$RS_TASKS" "0831" >/dev/null 2>&1
+    _t1=$(date +%s%N)
+    state_sync_all "$RS_TASKS" >/dev/null 2>&1
+    rs_ms=$(( (_t1 - _t0) / 1000000 ))
+    SCHED_CYCLE_NOW=""; GATE_NOW=""
+}
+
+# ── H1：节点数恰达上限 32（root+31 leaves）：配置期接受 + 运行收敛 + pass 时界 ──
+rs_new
+rs_task h1r 0830 ""
+for i in $(seq 1 31); do rs_task "$(printf 'h1l%02d' "$i")" chain h1r; done
+if dep_validate_graph "$RS_TCFG" "" "" "[task-config] ERROR:" >/dev/null 2>&1; then
+    ok "P6-07 dag-H1: 32 节点闭包（=DAG_CHAIN_NODES_MAX 界内）配置期接受"
+else
+    bad "P6-07 dag-H1: 界内 32 节点被误拒"
+fi
+rstick 0830
+h1_max=0; h1_p=1
+while [ "$h1_p" -le 12 ]; do
+    rspass "20260908084$h1_p" $((RS_EPOCH + h1_p * 60))
+    [ "$rs_ms" -gt "$h1_max" ] && h1_max=$rs_ms
+    h1_p=$((h1_p + 1))
+done
+rfh1="$RS_BASE/dag/h1r/runs/202609080830/run.txt"
+h1_exec=$(grep -c '^h1l' "$RS_EXEC" | tr -d ' ')
+if [ -f "$rfh1" ] && grep -q '^state=SUCCESS$' "$rfh1" && [ "$h1_exec" = "31" ] \
+   && [ "$(awk 'END{print NR}' "$rfh1" | tr -d ' ')" -le 40 ]; then
+    ok "P6-07 dag-H1: 32 节点 run 有限波内收敛 SUCCESS（31 leaves 各恰 1 次；账本行数有界）"
+else
+    bad "P6-07 dag-H1 收敛异常 state=$(grep '^state=' "$rfh1" 2>/dev/null) exec=$h1_exec"
+fi
+[ "$h1_max" -le 2000 ] && ok "P6-07 dag-H1-perf: 32 节点 pass 峰值 ${h1_max}ms (≤2000ms §perf 同界)" \
+    || bad "P6-07 dag-H1-perf: pass 峰值 ${h1_max}ms 超界"
+
+# ── H2：深度恰达上限 16（root+15 梯）：配置期接受 + 逐层推进收敛 + 时界 ─────
+rs_new
+rs_task h2r 0830 ""
+prev=h2r; i=1
+while [ "$i" -le 15 ]; do
+    cur=$(printf 'h2n%02d' "$i"); rs_task "$cur" chain "$prev"; prev=$cur; i=$((i + 1))
+done
+if dep_validate_graph "$RS_TCFG" "" "" "[task-config] ERROR:" >/dev/null 2>&1; then
+    ok "P6-07 dag-H2: 深度 16 闭包（=DAG_CHAIN_DEPTH_MAX 界内）配置期接受"
+else
+    bad "P6-07 dag-H2: 界内深度 16 被误拒"
+fi
+rstick 0830
+h2_max=0; h2_p=1
+while [ "$h2_p" -le 19 ]; do
+    rspass "2026090809$(printf '%02d' "$h2_p")" $((RS_EPOCH + h2_p * 60))
+    [ "$rs_ms" -gt "$h2_max" ] && h2_max=$rs_ms
+    h2_p=$((h2_p + 1))
+done
+rfh2="$RS_BASE/dag/h2r/runs/202609080830/run.txt"
+if [ -f "$rfh2" ] && grep -q '^state=SUCCESS$' "$rfh2" \
+   && [ "$(grep -c '^h2n' "$RS_EXEC" | tr -d ' ')" = "15" ]; then
+    ok "P6-07 dag-H2: 深 16 梯逐层推进有限步收敛 SUCCESS（15 节点各恰 1 次）"
+else
+    bad "P6-07 dag-H2 收敛异常 state=$(grep '^state=' "$rfh2" 2>/dev/null) exec=$(grep -c '^h2n' "$RS_EXEC")"
+fi
+[ "$h2_max" -le 2000 ] && ok "P6-07 dag-H2-perf: 深 16 pass 峰值 ${h2_max}ms (≤2000ms)" \
+    || bad "P6-07 dag-H2-perf: pass 峰值 ${h2_max}ms 超界"
+
+# ── H3：默认 DAG_RUNS_MAX=8：并发拒新 run、在途不杀、释放后新 run 可起 ──────
+rs_new
+for i in 1 2 3 4 5 6 7 8 9; do rs_task "h3r$i" 0830 ""; rs_task "h3l$i" chain "h3r$i"; touch "$RS_SLOW/h3l$i"; done
+rstick 0830
+h3_p=1; rspass 202609080832 $((RS_EPOCH + 60))   # 登记波 + 首派发
+n_dirs=$(ls "$RS_BASE/dag" 2>/dev/null | grep -c '^h3r' | tr -d ' ')
+h3_audit=$(grep -c 'action=limit|chain=h3r9' "$RS_BASE/scheduler/audit.log" | tr -d ' ')
+if [ "$n_dirs" = "8" ] && [ "$h3_audit" -ge 1 ] && [ ! -d "$RS_BASE/dag/h3r9/runs/202609080830" ]; then
+    ok "P6-07 dag-H3: 活跃 run=8（默认上限）→ 第 9 链拒新 run + action=limit 审计（在途 8 不杀）"
+else
+    bad "P6-07 dag-H3 并发闸异常 dirs=$n_dirs limit=$h3_audit"
+fi
+rspass 202609080833 $((RS_EPOCH + 120))          # 在途保持：8 run 不被触碰（不杀）
+alive=$(grep -l '^state=RUNNING$' "$RS_BASE"/dag/h3r*/runs/202609080830/run.txt 2>/dev/null | wc -l | tr -d ' ')
+h3_exec=$(grep -c '^h3l' "$RS_EXEC" | tr -d ' ')
+if [ "$alive" = "8" ] && [ "$h3_exec" = "8" ]; then
+    ok "P6-07 dag-H3b: 拒新 run 期间在途 8 run 全 RUNNING 存续、节点各恰 1 次派发（零误杀零重派）"
+else
+    bad "P6-07 dag-H3b 在途受损 alive=$alive exec=$h3_exec"
+fi
+rm -f "$RS_SLOW/h3l1" "$RS_SLOW/h3l2" "$RS_SLOW/h3l3"
+rs_j=1
+while [ "$rs_j" -le 3 ]; do
+    echo 0 > "$RS_TASKS/h3l$rs_j/exit_code.txt"; echo SUCCESS > "$RS_TASKS/h3l$rs_j/status.txt"
+    rs_j=$((rs_j + 1))
+done
+h3_free=1
+while [ "$h3_free" -le 8 ]; do
+    rspass "2026090809$(printf '%02d' "$((h3_free + 5))")" $((RS_EPOCH + h3_free * 600))
+    h3_free=$((h3_free + 1))
+    [ -d "$RS_BASE/dag/h3r9/runs/202609080830" ] && break
+done
+if [ -d "$RS_BASE/dag/h3r9/runs/202609080830" ]; then
+    ok "P6-07 dag-H3c: 名额释放后 h3r9 补登记（拒启动不丢弃；pending 后滚，检查项3/5）"
+else
+    bad "P6-07 dag-H3c 释放后 h3r9 未补登记"
+fi
+
+# ── H4：默认超时语义（短阈值覆盖）：run=FAILED 传播、不强杀在途进程 ─────────
+rs_new
+DAG_RUN_TIMEOUT=120
+rs_task h4r 0830 ""; rs_task h4b chain h4r; touch "$RS_SLOW/h4b"
+rstick 0830
+rspass 202609080832 $((RS_EPOCH + 60))     # 登记 + b 在途
+rspass 202609080833 $((RS_EPOCH + 3600))   # GATE 跳 1h → 超时
+rfh4="$RS_BASE/dag/h4r/runs/202609080830/run.txt"
+if grep -q '^state=FAILED$' "$rfh4" && grep -q 'action=timeout|chain=h4r' "$RS_BASE/scheduler/audit.log" \
+   && [ "$(cat "$RS_TASKS/h4b/state.txt" 2>/dev/null)" = "RUNNING" ] \
+   && grep -q '^h4b|chain|RUNNING|disp$' "$rfh4"; then
+    ok "P6-07 dag-H4: 默认 RUN_TIMEOUT 语义（阈值覆盖法）：run=FAILED + 审计，在途 b 仍 RUNNING 不强杀（签核③）"
+else
+    bad "P6-07 dag-H4 超时语义异常 state=$(grep '^state=' "$rfh4" 2>/dev/null) b=$(cat "$RS_TASKS/h4b/state.txt" 2>/dev/null)"
+fi
+
+# ── H5：cycle 历史积累下的登记扫描有界（cycle-* 每分钟累积、全局零清理）────
+# 长 uptime 设备事实：$base/scheduler/cycle-<token> 随每次执行累积且无任何删除
+# 路径（sched_cycle_mark 只追加；supervisor/runtime_protect 不清理）。登记扫描若
+# 逐文件 grep → O(历史文件数×根数)/tick（根 long-idle 时其 last 之下永不推进）。
+# 复现：400 历史 token（≈13h busy 积累）× 8 活跃链 → 稳定态 pass 必须 ≤2000ms。
+rs_new
+rs_w=1
+while [ "$rs_w" -le 8 ]; do
+    rs_task "h5r$rs_w" 0830 ""; rs_task "h5n$rs_w" chain "h5r$rs_w"; touch "$RS_SLOW/h5n$rs_w"
+    rs_w=$((rs_w + 1))
+done
+rstick 0830                                   # 8 根执行并 mark cycle-202609080830
+rs_i=0
+while [ "$rs_i" -lt 400 ]; do
+    printf 'zz_unrelated_%03d\n' "$rs_i" > "$RS_BASE/scheduler/cycle-20260908$(printf '%02d%02d' $((9 + rs_i / 60)) $((rs_i % 60)))"
+    rs_i=$((rs_i + 1))
+done
+rspass 202609090000 $((RS_EPOCH + 86400))     # 登记波 + 历史首扫（预热不计时）
+h5_max=0; h5_p=1
+while [ "$h5_p" -le 3 ]; do
+    rspass "20260909000$h5_p" $((RS_EPOCH + 86400 + h5_p * 60))
+    [ "$rs_ms" -gt "$h5_max" ] && h5_max=$rs_ms
+    h5_p=$((h5_p + 1))
+done
+if [ "$h5_max" -le 2000 ] \
+   && [ -f "$RS_BASE/dag/h5r1/runs/202609080830/run.txt" ]; then
+    ok "P6-07 dag-H5: 400 历史 cycle token × 8 活跃链稳定态 pass 峰值 ${h5_max}ms (≤2000ms) — 登记扫描有界"
+else
+    bad "P6-07 dag-H5: 历史扫描风暴 — 稳定态 pass 峰值 ${h5_max}ms (want ≤2000)"
+fi
+# 功能不回归：释放一个名额后，新 token 的根标记仍能补登（同根第二轮 run）
+rm -f "$RS_SLOW/h5n1"; echo 0 > "$RS_TASKS/h5n1/exit_code.txt"; echo SUCCESS > "$RS_TASKS/h5n1/status.txt"
+rspass 202609090010 $((RS_EPOCH + 87000))     # run-0830 收敛 SUCCESS（名额→7）
+printf 'h5r1\n' > "$RS_BASE/scheduler/cycle-202609090100"
+rspass 202609090101 $((RS_EPOCH + 90060))
+if [ -d "$RS_BASE/dag/h5r1/runs/202609090100" ]; then
+    ok "P6-07 dag-H5b: 有界扫描不丢登记——cycle-0100 新标记下一 pass 即补 run（检查项5）"
+else
+    bad "P6-07 dag-H5b: 新 cycle 标记未被补登记（扫描窗推进过度？）"
+fi
+# 已扫历史不再逐 tick 复扫（高水位推进后的稳态成本）
+rspass 202609090102 $((RS_EPOCH + 90120))
+[ "$rs_ms" -le 2000 ] && ok "P6-07 dag-H5c: 高水位推进后稳态 pass ${rs_ms}ms (≤2000ms)，历史 token 不重复复扫" \
+    || bad "P6-07 dag-H5c: 稳态 pass 仍 ${rs_ms}ms（历史复扫未消除）"
+
+# ── H6：多链满历史 run 目录（40 链×8 keep 终态）下的 pass 有界 ──────────────
+# 活跃 run 计数若逐 run.txt 起 3 子进程（grep|head|cut）且每登记根重算一次 →
+# O(链×keep×子进程)/tick 爆炸（40 根同窗登记时最坏）。稳定态 pass 必须 ≤2000ms。
+rs_new
+rs_h=1
+while [ "$rs_h" -le 40 ]; do
+    rs_ch=$(printf 'h6c%02d' "$rs_h")
+    mkdir -p "$RS_BASE/dag/$rs_ch/runs"
+    rs_k=1
+    while [ "$rs_k" -le 8 ]; do
+        rs_td=$(printf '20260907%02d0%02d' "$rs_h" "$rs_k")
+        mkdir -p "$RS_BASE/dag/$rs_ch/runs/$rs_td"
+        printf 'chain=%s\nrun=%s\nstate=SUCCESS\ncreated=1789100000\nroot=%s|STOPPED|1\n' "$rs_ch" "$rs_td" "$rs_ch" \
+            > "$RS_BASE/dag/$rs_ch/runs/$rs_td/run.txt"
+        rs_k=$((rs_k + 1))
+    done
+    rs_task "$rs_ch" 0830 ""
+    rs_task "${rs_ch}n" chain "$rs_ch"; touch "$RS_SLOW/${rs_ch}n"
+    rs_h=$((rs_h + 1))
+done
+rstick 0830
+rspass 202609080831 $((RS_EPOCH + 60))     # 40 根同窗 → 8 登记 + 32 拒（预热不计时）
+h6_max=0; h6_p=1
+while [ "$h6_p" -le 3 ]; do
+    rspass "20260908084$h6_p" $((RS_EPOCH + h6_p * 60))
+    [ "$rs_ms" -gt "$h6_max" ] && h6_max=$rs_ms
+    h6_p=$((h6_p + 1))
+done
+h6_dirs=$(ls "$RS_BASE/dag" 2>/dev/null | grep -c '^h6c' | tr -d ' ')
+h6_runs=$(find "$RS_BASE/dag" -name run.txt 2>/dev/null | wc -l | tr -d ' ')
+if [ "$h6_max" -le 2000 ] && [ "$h6_dirs" = "40" ] && [ "$h6_runs" -le 400 ]; then
+    ok "P6-07 dag-H6: 40 链×8 历史 run.txt（320+ 文件）稳定态 pass 峰值 ${h6_max}ms (≤2000ms)，计数/登记/prune 有界"
+else
+    bad "P6-07 dag-H6: 活跃计数风暴 — pass 峰值 ${h6_max}ms dirs=$h6_dirs files=$h6_runs"
+fi
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "resource stress tests: PASS=$PASS FAIL=$FAIL"

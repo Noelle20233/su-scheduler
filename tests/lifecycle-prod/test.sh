@@ -179,6 +179,116 @@ else
     bash -n "$PWD/$RTLIB" && ok "P2-09 POSIX: bash -n ok (dash unavailable)" || bad "P2-09 POSIX: bash -n failed"
 fi
 
+# ── 7) P6-07：DAG 链路 daemon 重启恢复（run 账本存续 / 在途 stale 处置 / 成功不重放）──
+# 真实进程重启（同 §4 fake-daemon 手法）：A 进程跑 tick 至 b 在途 RUNNING（pid=
+# $$A）→ kill -9（崩溃）→ B 进程先 lifecycle_startup_recover（stale 扫描既有语义）
+# 再继续 tick。断言：run 存续且继续推进（一条链重试后续行至 SUCCESS）；崩溃节点
+# 走 stale→FAILED→节点级重试（attempt 1/max，非引擎重放）；根执行总数 1（不重放）；
+# 无重试预算的链走传播 FAILED 终局；同 token 重启不重复建 run。
+R7="$T/dag7"
+R7BASE="$R7/base"; R7TASKS="$R7/tasks"; R7SLOW="$R7/slow"
+R7TCFG="$R7BASE/task-config"        # fake daemon 内 TCFG_DIR=$base/task-config
+mkdir -p "$R7BASE" "$R7TASKS" "$R7TCFG" "$R7SLOW"
+echo managed > "$R7TCFG/MANAGED"
+: > "$R7/config.txt"
+R7X="$R7/exec.log"; : > "$R7X"
+r7_task() {   # <id> <trigger> <dep> [retry.max]
+    { echo "schema_version=2"; echo "id=$1"; echo "name=$1"; echo "enabled=1"
+      echo "trigger=$2"; echo "condition="; echo "dependency=$3"
+      echo "action.type=command"; echo "action.command=echo r7-$1"
+      echo "action.notify_start=0"; echo "action.notify_end=0"; echo "action.delete=0"
+      echo "action.termux=0"; echo "action.interactive=0"; echo "action.run_once_now=0"
+      echo "action.boot=0"; echo "action.msg="; echo "health.type=none"
+      echo "recovery.type=none"; echo "retry.max=${4:-0}"; echo "retry.interval=60"
+    } > "$R7TCFG/$1.task"
+}
+r7_task lr 0830 ""; r7_task lb chain lr 2; r7_task lc chain lb; r7_task ld chain lc
+r7_task lr2 0830 ""; r7_task lb2 chain lr2; r7_task lc2 chain lb2   # 无重试预算 → 传播
+touch "$R7SLOW/lb" "$R7SLOW/lb2"    # 两链在途节点均挂起（kill 时真实 RUNNING）
+R7FAKE="$T/fake-daemon-dag.sh"
+cat > "$R7FAKE" <<'EOF'
+#!/usr/bin/env bash
+# fake daemon（DAG 版）：$1=reporoot $2=lib $3=base $4=cfg $5=tasks $6=xlog $7=slowdir
+# $8=pidfile $9=...ticks；启动序：recover（$RECOVER=1 时）→ 逐 tick
+set -u
+cd "$1" || exit 2
+. ./"$2" || exit 2
+base=$3 cfg=$4 tasks=$5 xlog=$6 slow=$7 pidf=$8
+shift 8
+export TCFG_DIR="$base/task-config" TASKS_DIR="$tasks"
+execute_task() {
+    id=$1; d="$TASKS_DIR/$id"; mkdir -p "$d" 2>/dev/null
+    echo "$id" >> "$xlog"
+    if [ -f "$slow/$id" ]; then
+        echo "$$" > "$d/pid.txt"; echo "RUNNING" > "$d/status.txt"
+    else
+        echo "0" > "$d/exit_code.txt"; echo "SUCCESS" > "$d/status.txt"
+    fi
+    return 0
+}
+echo "$$" > "$pidf"
+if [ "${RECOVER:-0}" = "1" ]; then
+    lifecycle_startup_recover "$tasks" >/dev/null 2>&1
+fi
+for tk in "$@"; do
+    m=$((10#$tk % 100))
+    SCHED_CYCLE_NOW="20260908$tk"; GATE_NOW=$((1789192800 + m * 60))
+    state_sync_all "$tasks" >/dev/null 2>&1
+    scheduler_tick "$base" "$cfg" "$tasks" "$tk" >/dev/null 2>&1
+    state_sync_all "$tasks" >/dev/null 2>&1
+done
+EOF
+chmod +x "$R7FAKE"
+R7LKA="$T/r7a.lock"; : > "$R7LKA"
+bash "$R7FAKE" "$PWD" "$RTLIB" "$R7BASE" "$R7/config.txt" "$R7TASKS" "$R7X" "$R7SLOW" "$R7LKA" 0830 0831 0832 >/dev/null 2>&1 &
+wi=0
+while [ "$wi" -lt 120 ]; do
+    if grep -q '^lb|chain|RUNNING|disp$' "$R7BASE/dag/lr/runs/202609080830/run.txt" 2>/dev/null \
+       && grep -q '^lb2|chain|RUNNING|disp$' "$R7BASE/dag/lr2/runs/202609080830/run.txt" 2>/dev/null; then
+        break
+    fi
+    sleep 0.25; wi=$((wi + 1))
+done
+R7PA=$(cat "$R7LKA" 2>/dev/null)
+[ -f "$R7BASE/dag/lr/runs/202609080830/run.txt" ] && [ -n "$R7PA" ] \
+    && ok "P6-07 R7-0: fake daemon A：两 run 已登记（0830 token）、lb/lb2 均在途 RUNNING 账本静止（pid 存活）" \
+    || bad "P6-07 R7-0 daemon A 未达在途稳态 pa=$R7PA"
+rm -f "$R7SLOW/lb"                                # b 崩溃后重试将成功（有界恢复剧本）
+kill -9 "$R7PA" 2>/dev/null
+wi=0; while [ "$wi" -lt 40 ] && [ -d "/proc/$R7PA" ]; do sleep 0.1; wi=$((wi + 1)); done
+[ ! -d "/proc/$R7PA" ] && ok "P6-07 R7-1: daemon A 崩溃（SIGKILL，run 进行中）" || bad "P6-07 R7-1 A 未死"
+RECOVER=1 bash "$R7FAKE" "$PWD" "$RTLIB" "$R7BASE" "$R7/config.txt" "$R7TASKS" "$R7X" "$R7SLOW" "$T/r7b.lock" 0833 0834 0835 0836 0837 0838 >/dev/null 2>&1
+rf7="$R7BASE/dag/lr/runs/202609080830/run.txt"
+rf72="$R7BASE/dag/lr2/runs/202609080830/run.txt"
+R7_LR=$(grep -c '^lr$' "$R7X" | tr -d ' ')
+R7_LB=$(grep -c '^lb$' "$R7X" | tr -d ' ')
+R7_LC=$(grep -c '^lc$' "$R7X" | tr -d ' ')
+R7_LD=$(grep -c '^ld$' "$R7X" | tr -d ' ')
+R7_LC2=$(grep -c '^lc2$' "$R7X" | tr -d ' ')
+R7_RUNS=$(ls "$R7BASE/dag/lr/runs" 2>/dev/null | wc -l | tr -d ' ')
+R7_RUNS2=$(ls "$R7BASE/dag/lr2/runs" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$R7_LR" = "1" ] && [ "$R7_LC" = "1" ] && [ "$R7_LD" = "1" ] \
+   && grep -q '^state=SUCCESS$' "$rf7" && grep -q '^lb|chain|STOPPED|disp$' "$rf7" \
+   && [ "$R7_RUNS" = "1" ]; then
+    ok "P6-07 R7-2: 重启后 tick 继续推进 run 至 SUCCESS；根 lr 执行总数=1（成功不重放）、lc/ld 各恰 1 次（账本 disp 幂等，无重复派发）"
+else
+    bad "P6-07 R7-2 恢复推进异常 lr=$R7_LR lc=$R7_LD ld=$R7_LD st=$(grep '^state=' "$rf7" 2>/dev/null) runs=$R7_RUNS"
+fi
+if [ "$R7_LB" = "2" ] \
+   && grep -q '|daemon_restart|FAILED|' "$R7TASKS/lb/events.log" 2>/dev/null \
+   && grep -q 'op=retry|task=lb|action=backoff|attempt=1|max=2' "$R7BASE/scheduler/audit.log"; then
+    ok "P6-07 R7-3: 在途节点按既有 stale 扫描语义处置（daemon_restart→FAILED）→ 节点级重试仅 1 次（b 总执行 2=崩溃前1+重试1），非引擎重放"
+else
+    bad "P6-07 R7-3 在途处置异常 lb_ex=$R7_LB events=$(grep -c daemon_restart "$R7TASKS/lb/events.log" 2>/dev/null)"
+fi
+if [ "$R7_LC2" = "0" ] && grep -q '^state=FAILED$' "$rf72" \
+   && grep -q '^lc2|chain|FAILED|gate-fail$' "$rf72" && [ "$R7_RUNS2" = "1" ]; then
+    ok "P6-07 R7-4: 无重试预算的崩溃节点（lb2 stale）→ Required 下游传播、run 重启后终局 FAILED；两链同 token 均无重复 run（重启幂等）"
+else
+    bad "P6-07 R7-4 传播终局异常 lc2=$R7_LC2 st=$(grep '^state=' "$rf72" 2>/dev/null) runs2=$R7_RUNS2"
+fi
+rm -f "$R7LKA"
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "lifecycle-prod tests: PASS=$PASS FAIL=$FAIL"

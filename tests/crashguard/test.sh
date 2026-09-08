@@ -503,6 +503,166 @@ claim_ln=$(grep -n 'set -C' "$DAEMON" | head -1 | cut -d: -f1)
 [ -n "$claim_ln" ] && ok "D-P5-01 order: noclobber atomic claim present (set -C L$claim_ln)" \
     || bad "D-P5-01 order: set -C atomic claim missing"
 
+# ── 15) P6-07：Crash Loop × 节点级 Retry × 链不重放 联动（有界收敛，无死循环）──
+# 检查项6：链节点 action 进程反复崩溃（shim 以 exit_code=1 建模）→ P4-07 退避
+# 钳制（exec = 1+retry.max；retry.count 不超上限）× 链引擎（D51 传播 / D-06 不
+# 自动重放 / 超时后滚）× guard（降级窗口内引擎零活动）三者联动有限步收敛。
+# harness 与 tests/p6-dag §engine 同源（execute_task shim + SCHED_CYCLE_NOW/GATE_NOW
+# 确定性时钟 + etick=sync→tick→sync）。
+CG_N=0
+execute_task() {           # 7 参 daemon 上下文委托；CG_FAILDIR 下恒失败 exit 1
+    cg_id=$1; cg_d="$CG_TASKS/$cg_id"; mkdir -p "$cg_d" 2>/dev/null
+    echo "$cg_id" >> "$CG_EXEC"
+    if [ -f "$CG_FAILDIR/$cg_id" ]; then
+        echo "1" > "$cg_d/exit_code.txt"; echo "FAILED" > "$cg_d/status.txt"
+    elif [ -f "$CG_SLOWDIR/$cg_id" ]; then
+        echo "RUNNING" > "$cg_d/status.txt"
+    else
+        echo "0" > "$cg_d/exit_code.txt"; echo "SUCCESS" > "$cg_d/status.txt"
+    fi
+    return 0
+}
+cg_new() {
+    CG_N=$((CG_N + 1))
+    CG_DIR="$T/cg$CG_N"; CG_BASE="$CG_DIR/base"; CG_TASKS="$CG_DIR/tasks"
+    CG_TCFG="$CG_DIR/tcfg"; CG_FAILDIR="$CG_DIR/fail"; CG_SLOWDIR="$CG_DIR/slow"
+    mkdir -p "$CG_BASE" "$CG_TASKS" "$CG_TCFG" "$CG_FAILDIR" "$CG_SLOWDIR"
+    echo managed > "$CG_TCFG/MANAGED"
+    export TCFG_DIR="$CG_TCFG"
+    # 重挂 registry（前序 §2/§8 段已置 TR_BASE；sched_ensure_base 仅空时 attach）
+    TR_BASE=""; TR_CONFIG_PATH=""; TASK_REGISTRY_SNAPSHOT=""
+    CG_CFG="$CG_DIR/config.txt"; : > "$CG_CFG"
+    CG_EXEC="$CG_DIR/exec.log"; : > "$CG_EXEC"
+    CG_SEQ=0; CG_EPOCH=1789192800
+    DAG_CHAIN_NODES_MAX=32; DAG_CHAIN_EDGES_MAX=128; DAG_CHAIN_DEPTH_MAX=16
+    DAG_RUNS_MAX=8; DAG_PARALLEL_MAX=4; DAG_RUN_TIMEOUT=86400; DAG_RUNS_KEEP=8
+    WAIT_MAX=86400
+}
+cg_task() {                # <id> <trigger> <dep> [retry.max]
+    { echo "schema_version=2"; echo "id=$1"; echo "name=$1"; echo "enabled=1"
+      echo "trigger=$2"; echo "condition="; echo "dependency=$3"
+      echo "action.type=command"; echo "action.command=echo cg-$1"
+      echo "action.notify_start=0"; echo "action.notify_end=0"; echo "action.delete=0"
+      echo "action.termux=0"; echo "action.interactive=0"; echo "action.run_once_now=0"
+      echo "action.boot=0"; echo "action.msg="; echo "health.type=none"
+      echo "recovery.type=none"; echo "retry.max=${4:-0}"; echo "retry.interval=60"
+    } > "$CG_TCFG/$1.task"
+}
+cgetick() {
+    CG_SEQ=$((CG_SEQ + 1)); SCHED_CYCLE_NOW="20260908$1"; GATE_NOW=$((CG_EPOCH + CG_SEQ * 60))
+    state_sync_all "$CG_TASKS" >/dev/null 2>&1
+    scheduler_tick "$CG_BASE" "$CG_CFG" "$CG_TASKS" "$1" >/dev/null 2>&1
+    state_sync_all "$CG_TASKS" >/dev/null 2>&1
+    SCHED_CYCLE_NOW=""; GATE_NOW=""
+}
+
+cg_new   # G1：单节点崩溃循环——retry 钳制（1+max 次）、传播不接退避、链零重放、有限步收敛
+cg_task cg1r 0830 ""
+cg_task cg1b chain cg1r 2          # 崩溃-重试-崩溃-重试-崩溃（共 3 次执行）后终局
+cg_task cg1c chain cg1b 3          # 传播失败：retry.max=3 亦不接退避（D25/D53）
+touch "$CG_FAILDIR/cg1b"
+cgetick 0830                                # 根执行并 mark
+CG_G1_N=0
+while [ "$CG_G1_N" -lt 8 ]; do
+    CG_G1_N=$((CG_G1_N + 1))
+    cgetick "083$CG_G1_N"
+    grep -q '^state=FAILED$' "$CG_BASE/dag/cg1r/runs/202609080830/run.txt" 2>/dev/null && break
+done
+rf1="$CG_BASE/dag/cg1r/runs/202609080830/run.txt"
+CG_B_EX=$(grep -c '^cg1b$' "$CG_EXEC" | tr -d ' ')
+CG_C_EX=$(grep -c '^cg1c$' "$CG_EXEC" | tr -d ' ')
+CG_A1=$(grep -c 'op=retry|task=cg1b|action=backoff|attempt=1|max=2' "$CG_BASE/scheduler/audit.log" | tr -d ' ')
+CG_A2=$(grep -c 'op=retry|task=cg1b|action=backoff|attempt=2|max=2' "$CG_BASE/scheduler/audit.log" | tr -d ' ')
+CG_A3=$(grep -c 'attempt=3|max=2' "$CG_BASE/scheduler/audit.log" | tr -d ' ')
+if [ "$CG_B_EX" = "3" ] && [ "$CG_A1" = "1" ] && [ "$CG_A2" = "1" ] && [ "$CG_A3" = "0" ] \
+   && [ "$CG_C_EX" = "0" ] && [ -f "$CG_TASKS/cg1c/gate.fail" ] && [ ! -f "$CG_TASKS/cg1c/retry.until" ] \
+   && grep -q '^state=FAILED$' "$rf1" \
+   && [ "$(ls "$CG_BASE/dag/cg1r/runs" 2>/dev/null | wc -l | tr -d ' ')" = "1" ]; then
+    ok "P6-07 G1: 崩溃循环 × retry 钳制（b 恰 1+2 次执行、backoff 仅 attempt=1,2 各一次、无 attempt≥3）× 传播不接退避（c 零执行无 until）× 链零重放（run 恒 1）× ≤$CG_G1_N tick 收敛 FAILED（检查项6）"
+else
+    bad "P6-07 G1 联动异常 b=$CG_B_EX a1=$CG_A1 a2=$CG_A2 a3=$CG_A3 c=$CG_C_EX st=$(grep '^state=' "$rf1" 2>/dev/null) ticks=$CG_G1_N"
+fi
+# 终局后再多跑 4 tick：不得复活（无无限链式触发；FAILED 粘滞）
+cgetick 0839; cgetick 0840; cgetick 0841; cgetick 0842
+CG_B2=$(grep -c '^cg1b$' "$CG_EXEC" | tr -d ' ')
+CG_RUNS2=$(ls "$CG_BASE/dag/cg1r/runs" 2>/dev/null | wc -l | tr -d ' ')
+if [ "$CG_B2" = "3" ] && [ "$CG_RUNS2" = "1" ] && grep -q '^state=FAILED$' "$rf1"; then
+    ok "P6-07 G1b: 收敛后 4 tick 零复活（b 执行数/run 数/run 态全粘滞，无死循环，检查项6）"
+else
+    bad "P6-07 G1b 粘滞破坏 b=$CG_B2 runs=$CG_RUNS2"
+fi
+
+cg_new   # G2：环外最坏图（深度 6 长梯全节点崩溃、各带 retry.max=1）——有限步收敛
+cg_task cg2r 0830 ""
+CG2_PREV=cg2r; CG2_I=1
+while [ "$CG2_I" -le 6 ]; do
+    CG2_CUR=$(printf 'cg2n%d' "$CG2_I")
+    cg_task "$CG2_CUR" chain "$CG2_PREV" 1
+    touch "$CG_FAILDIR/$CG2_CUR"
+    CG2_PREV=$CG2_CUR; CG2_I=$((CG2_I + 1))
+done
+cgetick 0830                                # 根执行并 mark
+CG_G2_N=1
+while [ "$CG_G2_N" -le 14 ]; do
+    cgetick "$(printf '08%02d' $((30 + CG_G2_N)))"
+    grep -q '^state=FAILED$' "$CG_BASE/dag/cg2r/runs/202609080830/run.txt" 2>/dev/null && break
+    CG_G2_N=$((CG_G2_N + 1))
+done
+rf2="$CG_BASE/dag/cg2r/runs/202609080830/run.txt"
+CG2_EXEC_MAX=0; CG2_K=1
+while [ "$CG2_K" -le 6 ]; do
+    CG2_CNT=$(grep -c "^cg2n$CG2_K$" "$CG_EXEC" | tr -d ' ')
+    [ "$CG2_CNT" -gt "$CG2_EXEC_MAX" ] && CG2_EXEC_MAX=$CG2_CNT
+    CG2_K=$((CG2_K + 1))
+done
+CG2_NONTERM=$(awk -F'|' 'NR>5 && ($3=="PENDING"||$3=="RUNNING") {n++} END{print n+0}' "$rf2" 2>/dev/null)
+if grep -q '^state=FAILED$' "$rf2" && [ "$CG2_EXEC_MAX" -le 2 ] && [ "$CG2_NONTERM" = "0" ] \
+   && [ "$(ls "$CG_BASE/dag/cg2r/runs" | wc -l | tr -d ' ')" = "1" ]; then
+    ok "P6-07 G2: 长梯全崩溃 ≤$CG_G2_N tick 收敛 FAILED（单节点执行≤$CG2_EXEC_MAX≤1+max、无永久 waiting/在途、run 数 1，检查项6）"
+else
+    bad "P6-07 G2 收敛异常 st=$(grep '^state=' "$rf2" 2>/dev/null) maxexec=$CG2_EXEC_MAX nonterm=$CG2_NONTERM ticks=$CG_G2_N"
+fi
+
+cg_new   # G3：daemon Crash Loop guard × 活跃 run——降级窗口引擎零活动，恢复后账本前滚完成
+export CRASH_THRESHOLD=2 CRASH_MIN_START_INTERVAL=0 CRASH_COOLDOWN=300
+cg_task cg3r 0830 ""
+cg_task cg3b chain cg3r
+cg_task cg3c chain cg3b
+touch "$CG_SLOWDIR/cg3b"
+cgetick 0830; cgetick 0831                 # run 登记，b 在途
+rf3="$CG_BASE/dag/cg3r/runs/202609080830/run.txt"
+CG3_MD_A=$(md5sum "$rf3" | cut -d' ' -f1)
+CG3_EX_A=$(wc -l < "$CG_EXEC" | tr -d ' ')
+crash_guard_enter "$CG_BASE" >/dev/null 2>&1
+crash_guard_enter "$CG_BASE" >/dev/null 2>&1
+CG3_RC=0
+crash_guard_enter "$CG_BASE" >/dev/null 2>&1 || CG3_RC=$?
+CG3_RC2=0
+crash_guard_enter "$CG_BASE" >/dev/null 2>&1 || CG3_RC2=$?
+CG3_MD_B=$(md5sum "$rf3" | cut -d' ' -f1)
+CG3_EX_B=$(wc -l < "$CG_EXEC" | tr -d ' ')
+if [ "$CG3_RC" = "2" ] && [ "$CG3_RC2" = "2" ] \
+   && [ "$CG3_MD_A" = "$CG3_MD_B" ] && [ "$CG3_EX_A" = "$CG3_EX_B" ]; then
+    ok "P6-07 G3: 崩溃序列达阈值 → rc2 降级且窗口内快速退出；降级期间 run.txt 逐字节静止、零派发（引擎仅 tick 驱动，检查项6）"
+else
+    bad "P6-07 G3 降级窗口越界 rc=$CG3_RC/$CG3_RC2 md=$CG3_MD_A/$CG3_MD_B ex=$CG3_EX_A/$CG3_EX_B"
+fi
+# 窗口过期恢复（有界模拟：直接回写 degraded_until，同 §5 时序操控手法）
+g3f=$(crash_guard_file "$CG_BASE")
+crash_write "$g3f" degraded_until 1
+CG3_RC=0
+crash_guard_enter "$CG_BASE" >/dev/null 2>&1 || CG3_RC=$?
+crash_record_exit "$CG_BASE" 0 >/dev/null 2>&1
+rm -f "$CG_SLOWDIR/cg3b"; echo 0 > "$CG_TASKS/cg3b/exit_code.txt"
+cgetick 0832; cgetick 0833; cgetick 0834
+CG3_B_EX=$(grep -c '^cg3b$' "$CG_EXEC" | tr -d ' ')
+if [ "$CG3_RC" = "0" ] && grep -q '^state=SUCCESS$' "$rf3" && [ "$CG3_B_EX" = "1" ]; then
+    ok "P6-07 G3b: guard 放行恢复后 tick 继续推进 run 至 SUCCESS；b 总执行仍 1 次（账本 disp 幂等，无重启重放，检查项6/7）"
+else
+    bad "P6-07 G3b 恢复异常 rc=$CG3_RC st=$(grep '^state=' "$rf3" 2>/dev/null) b=$CG3_B_EX"
+fi
+unset CRASH_THRESHOLD CRASH_MIN_START_INTERVAL CRASH_COOLDOWN
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "crashguard tests: PASS=$PASS FAIL=$FAIL"

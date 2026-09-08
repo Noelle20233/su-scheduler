@@ -252,6 +252,91 @@ rc=$(req_rc "cron1")
 [ "$(tc_snap)" = "$SNAP_CRON" ] && ok "P5-09 fuzz: task-config byte-identical after cron list injection" \
     || bad "P5-09 fuzz: config mutated by cron list injection"
 
+# ── P6-07 链注入面扩测：chain id/边/run 目录名经四写路径 + IPC + 引擎残树 ────
+# §27 声明（ADR §4）：chain/node id 全过 secv_id_ok、边过 dep_validate、
+# run 目录名仅 [0-9]{12}；本段把注入串送入 VALIDATE/CREATE/EDIT 载荷与伪造
+# $base/dag 残树，断言全部拒绝/无害化：rc∈{1,4}、零执行、零写盘、零求值副作用。
+chain_inj_cases=(
+  'rt0; touch /tmp/pwn_ci'
+  'rt0|touch /tmp/pwn_ci'
+  'rt0 & touch /tmp/pwn_ci'
+  '$(touch /tmp/pwn_ci)'
+  '../escape'
+  'a/b:c'
+  'rt0:STOPPED;x;id'
+  'rt0;rm -rf /'
+)
+xid=0
+for dexpr in "${chain_inj_cases[@]}"; do
+    xid=$((xid + 1))
+    ch_payload=$(printf 'schema_version=2\nid=chain_inj_%d\ntrigger=chain\ndependency=%s\naction.command=echo ok\n' "$xid" "$dexpr")
+    drop_req "chinj$xid" "chinj$xid|VALIDATE_TASK|payload=$(b64 "$ch_payload")"
+done
+# 超长 id（>SECV_ID_MAXLEN=128）+ 空格/换行注入 id
+bigid=$(printf 'x%.0s' $(seq 1 129))
+drop_req "chinjB1" "chinjB1|VALIDATE_TASK|payload=$(printf 'schema_version=2\nid=%s\ntrigger=chain\ndependency=root_ok\naction.command=echo ok\n' "$bigid" | base64 | tr -d '\n')"
+drop_req "chinjB2" "chinjB2|VALIDATE_TASK|payload=$(b64 "$(printf 'schema_version=2\nid=chain bad;id\ntrigger=chain\ndependency=root_ok\naction.command=echo ok\n')")"
+EXEC_N0=$(wc -l < "$EXEC_LOG" | tr -d ' ')
+poll
+xinj_bad=0
+for rid in $(seq 1 ${#chain_inj_cases[@]}) B1 B2; do
+    rc=$(req_rc "chinj$rid")
+    case "$rc" in 1|4) : ;; *) xinj_bad=$((xinj_bad + 1)) ;; esac
+done
+if [ "$xinj_bad" = "0" ]; then
+    ok "P6-07 fuzz-chain: ${#chain_inj_cases[@]} 链 dependency 注入 + 超长/含空格注入 id 全部拒绝（rc∈{1,4}）"
+else
+    bad "P6-07 fuzz-chain: $xinj_bad 个链注入未被拒绝"
+fi
+[ "$(wc -l < "$EXEC_LOG" | tr -d ' ')" = "$EXEC_N0" ] && ok "P6-07 fuzz-chain: 链注入零执行（EXEC_LOG 行数不变）" \
+    || bad "P6-07 fuzz-chain: 注入后出现执行记录"
+[ ! -e /tmp/pwn_ci ] && [ ! -e /tmp/escape ] && ok "P6-07 fuzz-chain: 注入副作用文件不存在（零求值）" \
+    || bad "P6-07 fuzz-chain: 注入产生了文件！"
+
+# CREATE_TASK 参数式请求：trigger=chain 新孤儿 → D55 配置期拒（rc4，create 图校验）；id 穿越 → 拒
+drop_req "chr1" "chr1|CREATE_TASK|id=$(b64 'chain_orphan')&trigger=$(b64 'chain')&command=$(b64 'echo x')"
+drop_req "chr2" "chr2|CREATE_TASK|id=$(b64 '../../etc_escape')&trigger=$(b64 '09:00')&command=$(b64 'echo x')"
+poll
+rc=$(req_rc "chr1")
+[ "$rc" = "4" ] && ok "P6-07 fuzz-chain: CREATE_TASK trigger=chain 孤儿 → configuration_invalid（D55 create 面）" \
+    || bad "P6-07 fuzz-chain: 孤儿 create rc=$rc"
+rc=$(req_rc "chr2")
+if [ "$rc" = "1" ] || [ "$rc" = "4" ]; then
+    ok "P6-07 fuzz-chain: CREATE_TASK 路径穿越 id 拒绝（rc $rc）"
+    if [ ! -e "$T/etc_escape" ] && [ ! -e "$T/etc_escape.task" ] && [ ! -e "$BASE/etc_escape" ]; then
+        ok "P6-07 fuzz-chain: 穿越 id 未在任何逃逸位置落盘"
+    else
+        bad "P6-07 fuzz-chain: 穿越落盘！"
+    fi
+else
+    bad "P6-07 fuzz-chain: 穿越 id rc=$rc"
+fi
+
+# EDIT_TASK（id+payload 参数式）：链字段 + 注入边 → 后端权威拒绝 rc4
+drop_req "che1" "che1|EDIT_TASK|id=$(b64 'task_fz_1')&payload=$(b64 "$(printf 'schema_version=2\nid=task_fz_1\ntrigger=chain\ndependency=$(touch /tmp/pwn_ed)\naction.command=echo safe\n')")"
+poll
+rc=$(req_rc "che1")
+[ "$rc" = "4" ] && ok "P6-07 fuzz-chain: EDIT_TASK 链字段+注入边 → configuration_invalid" || bad "P6-07 fuzz-chain: edit 注入 rc=$rc"
+[ ! -e /tmp/pwn_ed ] && ok "P6-07 fuzz-chain: EDIT 注入未求值" || bad "P6-07 fuzz-chain: EDIT 注入被执行"
+
+# 引擎残树免疫：伪造非法链目录（secv 拒）+ 合法目录名但内容注入 run.txt →
+# 引擎 pass 跳过/按 corrupt 收敛；全程零执行零求值。
+mkdir -p "$BASE/dag/inj;semi/runs/202609080830" "$BASE/dag/injb/runs/202609080830"
+printf 'chain=x\nrun=y\nstate=PENDING\n' > "$BASE/dag/inj;semi/runs/202609080830/run.txt"
+printf 'chain=$(touch /tmp/pwn_rt)\nrun=202609080830\nstate=PENDING\ncreated=1\nroot=injb|PENDING|1\n' \
+    > "$BASE/dag/injb/runs/202609080830/run.txt"
+EXEC_N1=$(wc -l < "$EXEC_LOG" | tr -d ' ')
+SCHED_CYCLE_NOW="202609080831" scheduler_dag_pass "$BASE" "$CFG" "$TASKS_DIR" "0831" >/dev/null 2>&1
+rc=$?
+if [ "$rc" = "0" ] && [ "$(cat "$BASE/dag/injb/runs/202609080830/run.txt" 2>/dev/null | grep '^state=' | head -1 | cut -d= -f2)" = "FAILED" ] \
+   && [ ! -e /tmp/pwn_rt ] && [ "$(wc -l < "$EXEC_LOG" | tr -d ' ')" = "$EXEC_N1" ]; then
+    ok "P6-07 fuzz-chain: 引擎对伪造 dag 树免疫——非法 id 目录不触碰、注入 run.txt 按 corrupt→FAILED 有界收敛、零求值零执行（rc 恒 0）"
+else
+    bad "P6-07 fuzz-chain: 残树免疫破坏 rc=$rc pwn=$([ -e /tmp/pwn_rt ] && echo YES)"
+fi
+# 注入残留清理（不影响后续汇总）
+rm -rf "$BASE/dag" /tmp/pwn_ci /tmp/pwn_ed 2>/dev/null
+
 # ── 副作用：task-config 逐字节不变；EXEC_LOG 仅安全启动那一次（如有）───
 # 前面所有恶意请求不应改 task-config（除 UPDATE 合法更新 command 外）
 grep -q '^action.command=echo ok; rm -rf /$' "$TCFG_DIR/$mkid.task" 2>/dev/null \
