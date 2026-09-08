@@ -774,9 +774,9 @@ rtick() {   # <now> → 单次调度周期 + 终态对账
 }
 rexec_count() { grep -c "$1" "$R_EXEC" 2>/dev/null || echo 0; }
 
-# 版本一致性：RUNTIME_LIB_VERSION = 1.30.0（P5-08 递增，B5 版本线同步）
-[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.30.0" ] \
-    && ok "P5-06 version: RUNTIME_LIB_VERSION=1.30.0 (P5-08 CLI/审计能力增强)" \
+# 版本一致性：RUNTIME_LIB_VERSION = 1.31.0（P6-06 DAG 链引擎递增，B5 版本线同步）
+[ "$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')" = "1.31.0" ] \
+    && ok "P5-06 version: RUNTIME_LIB_VERSION=1.31.0 (P6-06 DAG 链引擎)" \
     || bad "P5-06 version: RUNTIME_LIB_VERSION=$(grep '^RUNTIME_LIB_VERSION=' "$RTLIB" | cut -d= -f2 | tr -d '"')"
 
 # R1) FAILED>WAITING 退避接线：retry.max=1 任务执行失败 → FAILED → 下一 tick 接

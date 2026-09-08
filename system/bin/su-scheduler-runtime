@@ -30,7 +30,7 @@
 #   daemon 启动时记录一次 WARNING；CLI 不输出加载噪音。
 # ═══════════════════════════════════════════════════════════════════════════
 
-RUNTIME_LIB_VERSION="1.30.0"
+RUNTIME_LIB_VERSION="1.31.0"
 
 # ────────────────────────────────────────────────────────────────────────
 # §1 State Machine（P1-03 验证原语 → P2-02 生产化）
@@ -1037,7 +1037,9 @@ provider_register recovery builtin tpr_recovery_builtin
 # STARTING / gate_fail=门控超时/终态失败）。它们不属于 TSM_CAUSES（语义 cause 仍为
 # time_trigger / action_failure，见 task-state-machine.md）；state_log_event 对
 # WAITING 边不校验 cause（边本身在 TSM_ALLOWED），故写入校验通过、事件令牌可审计。
-RT_EVENTS='create delete config_load time_trigger manual_exec spawn action_success action_failure timeout stop_request daemon_restart rearm enable disable supervisor probe recover gate_wait gate_ok gate_fail'
+# P6-06（ADR D50）：链引擎新事件令牌仅 2 个（dag_register=run 创建、dag_dispatch=节点释放→
+# 执行）；不入 TSM_CAUSES（183 迁移表零改动），传播失败节点级仍用 gate_wait/gate_fail。
+RT_EVENTS='create delete config_load time_trigger manual_exec spawn action_success action_failure timeout stop_request daemon_restart rearm enable disable supervisor probe recover gate_wait gate_ok gate_fail dag_register dag_dispatch'
 
 runtime_log() {
     [ "${RT_LOG:-1}" = "1" ] && echo "[runtime] $1" >&2
@@ -1972,6 +1974,11 @@ trigger_decide() {
                 echo "task=$tid|trigger=$trig|due=Y|cause=advanced"
                 return 0
             fi
+            echo "task=$tid|trigger=$trig|due=N|cause="
+            return 1 ;;
+        chain)
+            # P6-06（ADR D47）：链节点无自主时间触发，恒 due=N——释放不经时间窗口，
+            # 由链引擎 pass 依 run.txt frontier（D49/D52）经 dag_dispatch 通道执行。
             echo "task=$tid|trigger=$trig|due=N|cause="
             return 1 ;;
         *)
@@ -4185,6 +4192,10 @@ scheduler_tick() {   # <base> <config> <tasks_dir> [now] → 0
             esac
         fi
     done
+    # P6-06（ADR D52/D53）：链引擎 pass——每 tick 固定层序 advance ▶ **链 pass** ▶
+    # retry-arm ▶ catch-up ▶ 主循环 的插入点（scheduler_tick 本体零重写）。managed
+    # 门与快速返回在函数内；单遍、无第二循环/线程；任何异常只记审计（错误隔离）。
+    scheduler_dag_pass "$base" "$config" "$tasks" "$now"
     # P4-07：FAILED>WAITING 重试退避接线——FAILED 任务（action_failure 执行失败 /
     # gate_fail 依赖失败传播）按 retry 策略进入 WAITING 退避（retry.until 计时）。
     # 退避期间 advance 通道保持 WAITING（不执行）；到点 + 依赖满足 + 触发匹配 →
@@ -4277,8 +4288,13 @@ scheduler_boot() {   # <base> <config> <tasks_dir> → 0
         tf=$(registry_task_file "$id" 2>/dev/null) || continue
         trig=$(sched_task_field "$tf" trigger)
         [ "$trig" = "boot" ] || continue
-        TRIGGER_BOOT_CONTEXT=1 sched_execute_one "$base" "$config" "$tasks" "$id" "$(date +%H%M)" 1 >/dev/null 2>&1 \
-            && n=$((n + 1))
+        if TRIGGER_BOOT_CONTEXT=1 sched_execute_one "$base" "$config" "$tasks" "$id" "$(date +%H%M)" 1 >/dev/null 2>&1; then
+            n=$((n + 1))
+            # P6-06（D48 登记观察=执行标记回读）：boot 通道的根成功即 mark cycle，
+            # 使链引擎 pass 的 cycle-<token> 扫描能观察到根本轮执行（boot 触发仅
+            # boot 上下文命中，tick 主循环恒 due=N，mark 对既有窗口去重零影响）。
+            sched_cycle_mark "$base" "$id" "$(sched_cycle_token)" >/dev/null 2>&1
+        fi
     done
     sched_audit "$base" "op=boot|mode=$(sched_source_mode "$base")|exec=$n"
     return 0
@@ -4618,6 +4634,17 @@ ipc_op_create() {   # <base> <config> <req_id> <params>
         ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: $ipcv_rsn" "task invalid"
         return 0
     fi
+    # P6-06（D55 写路径接线）：create 同样过图校验（覆盖协议注入新节点）——
+    # trigger=chain 经 CREATE 必为孤儿/环/超限即拒，坏配置不落盘。
+    ipcv_gf="$ipcv_base/ipc/.valerr.$$_c"
+    mkdir -p "$ipcv_base/ipc" 2>/dev/null
+    if ! dep_validate_graph "$(tcfg_dir)" "$ipcv_id" "$(cat "$ipcv_sandbox/$ipcv_id.task" 2>/dev/null)" "[ipc] ERROR:" 2>"$ipcv_gf"; then
+        ipcv_rsn=$(head -1 "$ipcv_gf" 2>/dev/null)
+        rm -rf "$ipcv_sandbox" "$ipcv_gf" 2>/dev/null
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: $ipcv_rsn" "task invalid"
+        return 0
+    fi
+    rm -f "$ipcv_gf" 2>/dev/null
     ipcv_target=$(tcfg_task_file "$ipcv_id")
     if cp "$ipcv_sandbox/$ipcv_id.task" "$ipcv_target.tmp.$$" 2>/dev/null \
         && mv "$ipcv_target.tmp.$$" "$ipcv_target" 2>/dev/null; then
@@ -5252,6 +5279,7 @@ tcfg_editor_trigger_ok() {   # <trigger> → 0=已实现合法触发器（拒绝
     case "$1" in
         boot) return 0 ;;
         boot_completed) return 0 ;;                              # P5-04 D41
+        chain) return 0 ;;                                       # P6-06 D47（仅 managed；B16 先例）
         [0-9][0-9]:[0-9][0-9]) return 0 ;;
         [0-9][0-9][0-9][0-9]) return 0 ;;
         oneshot:[0-9][0-9][0-9][0-9]) ;;                        # P5-04 D41（range 在 helper 校验）
@@ -5895,6 +5923,10 @@ secv_sweep_tmp() {
             [ -e "$secv_f" ] && rm -f "$secv_f" 2>/dev/null
         done
     fi
+    # P6-06（D49）：链 run.txt 原子写 tmp 残留兜底 sweep
+    for secv_f in "$secv_base/dag"/*/runs/*/run.txt.tmp.*; do
+        [ -e "$secv_f" ] && rm -f "$secv_f" 2>/dev/null
+    done
     return 0
 }
 # 权限强制：<base> <tasks> → ipc 0700 / task-config 600 / 运行目录 700 / 文件 600
@@ -5915,6 +5947,14 @@ secv_fix_perms() {
     done
     chmod 700 "$secv_base/snapshots" "$secv_base/scheduler" "$secv_base/audit" 2>/dev/null
     chmod 600 "$secv_base/current" 2>/dev/null
+    # P6-06（D49/§4）：链运行态目录树 0700 / run.txt 0600（root-only）
+    if [ -d "$secv_base/dag" ]; then
+        chmod 700 "$secv_base/dag" 2>/dev/null
+        for secv_d in "$secv_base"/dag "$secv_base"/dag/* "$secv_base"/dag/*/runs "$secv_base"/dag/*/runs/*; do
+            [ -d "$secv_d" ] && chmod 700 "$secv_d" 2>/dev/null
+        done
+        chmod 600 "$secv_base"/dag/*/runs/*/run.txt 2>/dev/null
+    fi
     return 0
 }
 # 每个 Action 的有效超时：<task_file> → echo 秒数（advanced.timeout>0 且 ≤ 全局
@@ -6289,6 +6329,7 @@ dep_validate_graph() {   # <dir> [<id>] [<content>] [<prefix>]
     [ -d "$depg_dir" ] || { echo "${depg_prefix} dependency graph: directory not found: $depg_dir" >&2; return 1; }
     depg_nodes=""
     depg_adj=""
+    depg_tmap=""   # P6-06（D55）：节点触发器映射（"node|trigger" 换行分隔），链段校验用
     depg_ofile=""
     if [ -n "$depg_ocontent" ]; then
         depg_ofile=$(mktemp "/tmp/depg.XXXXXX" 2>/dev/null) || { echo "${depg_prefix} dependency graph: temp file failed" >&2; return 1; }
@@ -6331,6 +6372,8 @@ dep_validate_graph() {   # <dir> [<id>] [<content>] [<prefix>]
             done
         fi
         depg_nodes="$depg_nodes $depg_node"
+        depg_tmap="$depg_tmap
+$depg_node|$depg_tr"
         depg_adj="$depg_adj
 $depg_node|$depg_edges"
     done
@@ -6361,6 +6404,8 @@ $depg_node|$depg_edges"
                 done
             fi
             depg_nodes="$depg_nodes $depg_oid"
+            depg_tmap="$depg_tmap
+$depg_oid|$depg_tr"
             depg_adj="$depg_adj
 $depg_oid|$depg_edges"
         fi
@@ -6396,7 +6441,11 @@ $depg_oid|$depg_edges"
         depg_dfs "$depg_start" "->$depg_start"
     done
     [ "$depg_ok" -eq 0 ] && return 1
-    return 0
+    # P6-06（D55）：既有未知/自依赖/环检查通过后，追加链段校验（孤儿/深度/节点/
+    # 边超限）。非链组合恒快速放行——既有消息/rc/行为逐字节不变（p6-dag 套件
+    # IN-01..03 + p4 golden 双侧守卫）；违规 → 同前缀 stderr 消息 + rc 1。
+    dag_validate_chains
+    return $?
 }
 
 # DFS 助手（dep_validate_graph 内部）：<node> <curpath>；全局 depg_* 复用
@@ -6443,6 +6492,745 @@ dep_graph_read() {   # <dir> [<skip_id>] → stdout 逐条错误消息；无错�
     return 0
 }
 # ────────────────────────────────────────────────────────────────────────
+# §27 DAG / 链式调度执行引擎（P6-06）——唯一权威 = docs/architecture/dag-schema-v1.md
+# （D46–D58，ACCEPTED 2026-09-08）。本块为其实施接线：
+#   D46 边=dependency=（复用 dep_validate/dep_normalize，零第二语法）
+#   D47 trigger=chain（managed-only；trigger_decide 恒 due=N；释放走本引擎 frontier）
+#   D48 run=cycle token：根每轮执行（execute/advance/catch-up/boot 通道均落
+#       cycle-<token> 执行标记）→ 引擎回读标记登记 run（U-1 裁决=执行标记文件回读，
+#       零改 execute_task/action_run 签名与路径，C2）；手动 tctl start/restart 不
+#       mark cycle → 不点火；目录名=token 天然同窗去重
+#   D49 $base/dag/<chain>/runs/<token>/run.txt：tmp+mv 原子整写单遍重写；sweep 兜底；
+#       每链保留 DAG_RUNS_KEEP 史（token 字典序=时间序）；不可解析→dag=corrupt→FAILED
+#   D50 链五态 = run.txt 文件记录（PENDING→RUNNING→SUCCESS|FAILED；CANCELLED 预留
+#       不产出）；183 迁移零接触；新事件令牌仅 dag_register/dag_dispatch
+#   D51 失败传播 = D15/D16 逐行映射（Required 终态不匹配→立即 FAILED 级联，经
+#       gate_wait/gate_fail 既有令牌 + gate.fail 标记（不接重试退避，D25/D53）；
+#       Optional=opt-unsat 不阻断；:FAILED=故障分支；run=无 FAILED 则 SUCCESS）
+#   D52 frontier 每 tick 单遍、按现图重算（D56 成员冻结+边现图）；释放叠加
+#       sched_cond_check（假→cond-unmet 顺延）；在途 ≤ DAG_PARALLEL_MAX 顺延不丢弃
+#   D53 tick 层序：advance ▶ 本 pass ▶ retry-arm ▶ catch-up ▶ 主循环（scheduler_tick
+#       最小插入）；重试仅节点级；链永不自动重放
+#   D55 配置期链段 = dag_validate_chains（dep_validate_graph 尾部挂载；既有消息/rc
+#       逐字节继承；非链组合恒快速放行）
+#   D57 超限不对称：结构超限配置期拒（错误消息含超限值与常量名）；活跃 run ≥
+#       DAG_RUNS_MAX → 不启动新 run（audit action=limit），根照常执行、在途不杀；
+#       run 超时 → FAILED(action=timeout) 停止释放，不强杀在途进程
+#   安全边界（ADR §4）：chain/node id 全过 secv_id_ok、run 目录名仅 [0-9]{12}；
+#   run.txt 解析=纯字段切分（awk/cut，mksh NF-7/D34 惯例，零 eval/零 sh -c）；
+#   $base/dag 0700/run.txt 0600（secv_fix_perms/sweep 扩展）
+#   错误隔离：任何节点/run 异常仅记审计，恒 return 0，绝不中止 daemon 主循环。
+# 命名空间：函数 dag_/scheduler_dag_ 前缀，内部全局 dgv_/dge_/dgp_/dgs_/dgrm_ 前缀。
+# ────────────────────────────────────────────────────────────────────────
+DAG_CHAIN_NODES_MAX=${DAG_CHAIN_NODES_MAX:-32}
+DAG_CHAIN_EDGES_MAX=${DAG_CHAIN_EDGES_MAX:-128}
+DAG_CHAIN_DEPTH_MAX=${DAG_CHAIN_DEPTH_MAX:-16}
+DAG_RUNS_MAX=${DAG_RUNS_MAX:-8}
+DAG_PARALLEL_MAX=${DAG_PARALLEL_MAX:-4}
+DAG_RUN_TIMEOUT=${DAG_RUN_TIMEOUT:-86400}
+DAG_RUNS_KEEP=${DAG_RUNS_KEEP:-8}
+
+dag_runs_root()  { echo "$1/dag"; }
+dag_chain_dir()  { echo "$1/dag/$2"; }
+dag_runs_dir()   { echo "$1/dag/$2/runs"; }
+dag_run_dir()    { echo "$1/dag/$2/runs/$3"; }
+dag_run_file()   { echo "$1/dag/$2/runs/$3/run.txt"; }
+
+# run 目录名 = cycle token：仅 12 位数字（D49 安全边界；路径拼接前强制）
+dag_token_ok() {
+    case "$1" in
+        [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# 图字符串精确查值（避免 grep 正则 `.` 误配；id 无 `|`）：<multiline k=v 表> <id> <字段号>
+dag_map_get() {   # <lines> <id> <field 1-based>
+    printf '%s\n' "$1" | awk -F'|' -v k="$2" -v f="$3" '$1==k {print $f; exit}'
+}
+
+# ── D55 配置期链段校验（dep_validate_graph 尾部挂载）────────────────────────
+# 输入 = dep_validate_graph 的 depg_nodes/depg_adj/depg_tmap/depg_prefix 全局。
+# 无 trigger=chain → 直接放行（非链组合行为逐字节不变）。violation → stderr
+# （depg_prefix 前缀）+ rc 1（与既有检查同构）。消息含超限值与常量名（D58 映射）。
+dag_validate_chains() {
+    printf '%s\n' "$depg_tmap" | grep -q '|chain$' || return 0
+    dgv_vio=$( { printf '%s\n' "$depg_tmap" | sed 's/^/T|/'
+                 printf '%s\n' "$depg_adj" | sed 's/^/A|/'; } | awk -F'|' \
+        -v lim_n="$DAG_CHAIN_NODES_MAX" -v lim_e="$DAG_CHAIN_EDGES_MAX" -v lim_d="$DAG_CHAIN_DEPTH_MAX" '
+        $1=="T" && $2!="" { trig[$2]=$3 }
+        $1=="A" && $2!="" {
+            nodes[$2]=1
+            m=split($3,t," ")
+            for (i=1; i<=m; i++) if (t[i]!="") { dep[$2]=dep[$2] " " t[i]; haspred[$2]=1 }
+        }
+        END {
+            # 孤儿（D55/D-08）= trigger=chain 且自身 dependency 无有效入边
+            # （缺省 :STOPPED 永不满足 → 永不被派发）
+            for (v in nodes) if (trig[v]=="chain" && !(v in haspred)) print "orphan " v
+            for (v in nodes) if (trig[v]=="chain") {
+                m=split(dep[v],t," ")
+                for (i=1; i<=m; i++) if (t[i]!="" && trig[t[i]]!="chain") cand[t[i]]=1
+            }
+            for (root in cand) {
+                split("",closure); closure[root]=1
+                waves=1
+                while (waves) {
+                    waves=0
+                    for (v in nodes) if (trig[v]=="chain" && !(v in closure)) {
+                        m=split(dep[v],t," "); hit=0
+                        for (i=1; i<=m; i++) if (t[i] in closure) hit=1
+                        if (hit) { closure[v]=1; waves=1 }
+                    }
+                }
+                nn=0; for (v in closure) nn++
+                if (nn<=1) continue
+                split("",seen); ne=0
+                for (v in closure) {
+                    m=split(dep[v],t," ")
+                    for (i=1; i<=m; i++) if (t[i] in closure && !((t[i] SUBSEP v) in seen)) { seen[t[i] SUBSEP v]=1; ne++ }
+                }
+                split("",depth); for (v in closure) depth[v]=1
+                it=0
+                while (it <= nn) {
+                    ch=0
+                    for (v in closure) {
+                        m=split(dep[v],t," ")
+                        for (i=1; i<=m; i++) if (t[i] in closure && depth[t[i]]+1>depth[v]) { depth[v]=depth[t[i]]+1; ch=1 }
+                    }
+                    it++
+                    if (ch==0) break
+                }
+                md=0; for (v in closure) if (depth[v]>md) md=depth[v]
+                if (nn>lim_n || ne>lim_e || md>lim_d) printf "lim %d %d %d %s\n", md, nn, ne, root
+            }
+        }' 2>/dev/null | sort )
+    [ -n "$dgv_vio" ] || return 0
+    dgv_rc=0
+    while IFS=' ' read -r dgv_k dgv_a dgv_b dgv_c dgv_d; do
+        case "$dgv_k" in
+            orphan)
+                echo "${depg_prefix} chain node without incoming edge '$dgv_a'" >&2
+                dgv_rc=1 ;;
+            lim)
+                if [ "$dgv_a" -gt "$DAG_CHAIN_DEPTH_MAX" ] 2>/dev/null; then
+                    echo "${depg_prefix} chain depth $dgv_a exceeds DAG_CHAIN_DEPTH_MAX=$DAG_CHAIN_DEPTH_MAX" >&2
+                    dgv_rc=1
+                fi
+                if [ "$dgv_b" -gt "$DAG_CHAIN_NODES_MAX" ] 2>/dev/null; then
+                    echo "${depg_prefix} chain nodes $dgv_b exceeds DAG_CHAIN_NODES_MAX=$DAG_CHAIN_NODES_MAX" >&2
+                    dgv_rc=1
+                fi
+                if [ "$dgv_c" -gt "$DAG_CHAIN_EDGES_MAX" ] 2>/dev/null; then
+                    echo "${depg_prefix} chain edges $dgv_c exceeds DAG_CHAIN_EDGES_MAX=$DAG_CHAIN_EDGES_MAX" >&2
+                    dgv_rc=1
+                fi ;;
+        esac
+    done <<EOF
+$dgv_vio
+EOF
+    [ "$dgv_rc" -eq 0 ] || return 1
+    return 0
+}
+
+# ── run.txt 读写（D49：tmp+mv 原子整写；0600；目录 0700）────────────────────
+dag_run_write() {   # <base> <chain> <token> ← stdin 全量内容
+    dgv_d=$(dag_run_dir "$1" "$2" "$3")
+    mkdir -p "$dgv_d" 2>/dev/null || return 2
+    chmod 700 "$dgv_d" 2>/dev/null
+    dgv_t="$dgv_d/run.txt.tmp.$$"
+    cat > "$dgv_t" 2>/dev/null || { rm -f "$dgv_t" 2>/dev/null; return 2; }
+    mv "$dgv_t" "$dgv_d/run.txt" 2>/dev/null || { rm -f "$dgv_t" 2>/dev/null; return 2; }
+    chmod 600 "$dgv_d/run.txt" 2>/dev/null
+    return 0
+}
+
+# 解析 run.txt → 全局 dgv_chain/dgv_run/dgv_rstate/dgv_created/dgv_rootline/
+# dgv_lines（"id|trigger|state|note" 换行表，首行空占位）。rc 1=不可解析（D49：
+# 不猜态；调用方按 corrupt→FAILED 路径收敛）。<file> <期望chain> <期望token>
+dag_run_parse() {
+    dgv_chain=""; dgv_run=""; dgv_rstate=""; dgv_created=""; dgv_rootline=""
+    dgv_lines=""; dgv_bad=""
+    [ -f "$1" ] || return 1
+    while IFS= read -r dgv_l || [ -n "$dgv_l" ]; do
+        case "$dgv_l" in
+            chain=*) dgv_chain=${dgv_l#chain=} ;;
+            run=*)   dgv_run=${dgv_l#run=} ;;
+            state=*) dgv_rstate=${dgv_l#state=} ;;
+            created=*) dgv_created=${dgv_l#created=} ;;
+            root=*)  dgv_rootline=${dgv_l#root=} ;;
+            ''|[#]*) : ;;
+            *=*) dgv_bad=1 ;;   # 未知键值行（头键已在上面匹配）→ corrupt
+            *)   dgv_lines="$dgv_lines
+$dgv_l" ;;                      # 无 = 行 = 成员行候选（mksh 安全：不用 `|`-in-pattern；
+                                # 字段完整性由下方逐行校验兜底）
+        esac
+    done < "$1"
+    [ -z "$dgv_bad" ] || return 1
+    [ -n "$dgv_chain" ] && [ "$dgv_chain" = "$2" ] || return 1
+    [ "$dgv_run" = "$3" ] || return 1
+    secv_id_ok "$dgv_chain" || return 1
+    case "$dgv_rstate" in PENDING|RUNNING|SUCCESS|FAILED) ;; *) return 1 ;; esac
+    case "$dgv_created" in ''|*[!0-9]*) return 1 ;; esac
+    [ -n "$dgv_rootline" ] || return 1
+    dgv_rid=$(printf '%s' "$dgv_rootline" | cut -d'|' -f1)
+    secv_id_ok "$dgv_rid" || return 1
+    dgv_nid=""
+    while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
+        [ -n "$dgv_nid" ] || continue
+        secv_id_ok "$dgv_nid" || return 1
+        [ "$dgv_ntrig" = chain ] || return 1   # 成员 trigger 恒 chain（字段完整性校验）
+        [ -n "$dgv_nst" ] || return 1
+    done <<EOF
+$dgv_lines
+EOF
+    return 0
+}
+
+dag_run_emit() {   # stdout = run.txt 全量内容（dgv_* 全局）
+    printf 'chain=%s\nrun=%s\nstate=%s\ncreated=%s\nroot=%s\n' \
+        "$dgv_chain" "$dgv_run" "$dgv_rstate" "$dgv_created" "$dgv_rootline"
+    printf '%s\n' "$dgv_lines" | awk 'NF'
+    return 0
+}
+
+# 账本查态：<lines> <id> → 记录态（root 行由调用方先行处理；无记录→空）
+dag_book_state() {   # <lines> <id>
+    dag_map_get "$1" "$2" 3
+}
+dag_book_note() {   # <lines> <id>
+    dag_map_get "$1" "$2" 4
+}
+# 行改写：替换/追加 "id|trigger|state|note"（id 精确匹配，首现生效）
+dag_lines_set() {   # <lines> <id> <trigger> <state> <note> → stdout 新 lines
+    printf '%s\n' "$1" | awk -F'|' -v OFS='|' -v k="$2" -v tr="$3" -v st="$4" -v no="$5" '
+        BEGIN { done=0 }
+        NF == 0 { next }
+        $1==k && !done { print k, tr, st, no; done=1; next }
+        { print }
+        END { if (!done) print k, tr, st, no }'
+}
+
+# 活跃 run 计数（state ∈ PENDING/RUNNING；DAG_RUNS_MAX 运行期闸，D57）
+dag_active_runs() {   # <base> → int
+    dgv_c=0
+    for dgv_f in "$1"/dag/*/runs/*/run.txt; do
+        [ -f "$dgv_f" ] || continue
+        dgv_s=$(grep '^state=' "$dgv_f" 2>/dev/null | head -1 | cut -d= -f2-)
+        case "$dgv_s" in
+            PENDING|RUNNING) dgv_c=$((dgv_c + 1)) ;;
+        esac
+    done
+    echo "$dgv_c"
+}
+
+# ── 现图根映射（引擎用；snapshot 目录）：stdout "root|m1 m2 ..."（成员 id 升序）──
+dag_root_map() {   # <sdir> <chain-id-set 空格> → "root|members" 行
+    dgrm_in=""
+    dgrm_taken=""
+    for dgrm_c in $2; do
+        dgrm_tf="$1/$dgrm_c.task"
+        [ -f "$dgrm_tf" ] || continue
+        dgrm_dep=$(grep '^dependency=' "$dgrm_tf" 2>/dev/null | head -1 | cut -d= -f2-)
+        dgrm_norm=$(dep_normalize "$dgrm_dep")
+        dgrm_edges=""
+        for dgrm_e in $(printf '%s' "$dgrm_norm" | sed 's/,/ /g'); do
+            dgrm_t=$dgrm_e
+            case "$dgrm_t" in '?'*) dgrm_t=${dgrm_t#\?} ;; esac
+            case "$dgrm_t" in *:*) dgrm_t=${dgrm_t%%:*} ;; esac
+            [ "$dgrm_t" = "$dgrm_c" ] && continue
+            secv_id_ok "$dgrm_t" || continue
+            case " $dgrm_edges " in *" $dgrm_t "*) continue ;; esac
+            dgrm_edges="$dgrm_edges $dgrm_t"
+            case " $dgrm_taken " in *" $dgrm_t "*) continue ;; esac
+            dgrm_taken="$dgrm_taken $dgrm_t"
+            if [ -f "$1/$dgrm_t.task" ]; then
+                dgrm_tt=$(grep '^trigger=' "$1/$dgrm_t.task" 2>/dev/null | head -1 | cut -d= -f2-)
+            else
+                dgrm_tt=gone
+            fi
+            dgrm_in="$dgrm_in
+T|$dgrm_t|$dgrm_tt"
+        done
+        dgrm_tr=$(grep '^trigger=' "$dgrm_tf" 2>/dev/null | head -1 | cut -d= -f2-)
+        dgrm_in="$dgrm_in
+T|$dgrm_c|$dgrm_tr
+A|$dgrm_c|$dgrm_edges"
+    done
+    printf '%s\n' "$dgrm_in" | awk -F'|' '
+        $1=="T" && $2!="" { trig[$2]=$3 }
+        $1=="A" && $2!="" { nodes[$2]=1; dep[$2]=$3 }
+        END {
+            for (v in nodes) {
+                m=split(dep[v],t," ")
+                for (i=1; i<=m; i++) if (t[i]!="" && trig[t[i]]!="chain" && !(t[i] in isroot)) { isroot[t[i]]=1 }
+            }
+            for (root in isroot) {
+                split("",closure); closure[root]=1
+                waves=1
+                while (waves) {
+                    waves=0
+                    for (v in nodes) if (trig[v]=="chain" && !(v in closure)) {
+                        m=split(dep[v],t," "); hit=0
+                        for (i=1; i<=m; i++) if (t[i] in closure) hit=1
+                        if (hit) { closure[v]=1; waves=1 }
+                    }
+                }
+                out=""
+                for (v in closure) if (v != root) out = out " " v
+                if (out != "") { sub(/^ /, "", out); print root "|" out }
+            }
+        }' | sort
+}
+
+# ── 入边求值（D51 × D56 现图重算；账本态判定）：<sdir> <id> →
+#   0=满足（stdout ok[ opt-unsat:...]） 1=等待（stdout 原因） 2=Required 终态不匹配
+#   依赖 dgv_chain/dgv_rootline/dgv_lines（当前 run 上下文）。
+dag_edges_eval() {
+    dge_sdir=$1; dge_id=$2
+    dge_tf="$dge_sdir/$dge_id.task"
+    [ -f "$dge_tf" ] || { echo "waiting: self-missing:$dge_id"; return 1; }
+    dge_dep=$(grep '^dependency=' "$dge_tf" 2>/dev/null | head -1 | cut -d= -f2-)
+    [ -n "$dge_dep" ] || { echo "ok"; return 0; }
+    dge_norm=$(dep_normalize "$dge_dep")
+    [ -n "$dge_norm" ] || { echo "ok"; return 0; }
+    dge_optunsat=""
+    dge_wait=""
+    dge_mismatch=""
+    for dge_e in $(printf '%s' "$dge_norm" | sed 's/,/ /g'); do
+        dge_opt=0
+        case "$dge_e" in '?'*) dge_opt=1; dge_e=${dge_e#\?} ;; esac
+        dge_up=$dge_e; dge_want=STOPPED
+        case "$dge_e" in *:*) dge_up=${dge_e%%:*}; dge_want=${dge_e#*:} ;; esac
+        if [ "$dge_up" = "$dgv_chain" ]; then
+            dge_st=$(printf '%s' "$dgv_rootline" | cut -d'|' -f2)
+        else
+            dge_st=$(dag_book_state "$dgv_lines" "$dge_up")
+        fi
+        if [ "$dge_st" = "$dge_want" ]; then continue; fi
+        if [ "$dge_opt" -eq 1 ]; then
+            dge_optunsat="$dge_optunsat $dge_up"
+            continue
+        fi
+        if [ -z "$dge_st" ]; then
+            [ -z "$dge_wait" ] && dge_wait="missing:$dge_up"
+            continue
+        fi
+        case "$dge_st" in
+            STOPPED|FAILED)
+                if [ "$dge_st" = FAILED ] && dag_retry_open FAILED "$dgv_tasks" "$dge_up" "$dge_sdir"; then
+                    # 上游 FAILED 但节点级重试未完 → 下游等待（D-06 重试推进 frontier）
+                    [ -z "$dge_wait" ] && dge_wait="retry:$dge_up"
+                else
+                    [ -z "$dge_mismatch" ] && dge_mismatch="$dge_up($dge_st want $dge_want)"
+                fi ;;
+            *)  [ -z "$dge_wait" ] && dge_wait="$dge_st:$dge_up" ;;
+        esac
+    done
+    if [ -n "$dge_mismatch" ]; then echo "dep failed: $dge_mismatch"; return 2; fi
+    if [ -n "$dge_wait" ]; then
+        echo "waiting: $dge_wait${dge_optunsat:+ opt-unsat:$dge_optunsat}"
+        return 1
+    fi
+    [ -z "$dge_optunsat" ] && { echo "ok"; return 0; }
+    echo "ok opt-unsat:$dge_optunsat"
+    return 0
+}
+
+# 态镜像（STOPPED 粘性；FAILED 仅在新终态出现时翻正——节点级重试成功推进 frontier，
+# D53/D-06；其余跟随实况）
+dag_mirror_state() {   # <recorded> <live> → echo 新记录态
+    case "$1" in
+        STOPPED) echo STOPPED; return 0 ;;
+        FAILED)
+            case "$2" in
+                STOPPED) echo STOPPED ;;
+                *) echo FAILED ;;
+            esac
+            return 0 ;;
+    esac
+    echo "$2"
+    return 0
+}
+
+# 上游是否仍有节点级重试预算（D-06「重试成功→终态更新入 run.txt→frontier 前进」）：
+# 记录 FAILED 且非 gate-fail 且 retry.count<retry.max → 仍在途（下游须等待，run 不收敛）。
+dag_retry_open() {   # <tasks> <sdir> <id> → 0=仍可重试（视为非终态） 1=终局
+    dro_rec=$1
+    [ "$dro_rec" = FAILED ] || return 1
+    dro_rd="$2/$3"
+    [ -f "$dro_rd/gate.fail" ] && return 1        # gate-fail 传播不接退避（D25/D53）
+    dro_tf="$4/$3.task"
+    dro_max=$(sched_task_field "$dro_tf" retry.max 2>/dev/null)
+    case "$dro_max" in ''|*[!0-9]*) dro_max=0 ;; esac
+    [ "$dro_max" -gt 0 ] 2>/dev/null || return 1
+    dro_cnt=$(cat "$dro_rd/retry.count" 2>/dev/null); [ -n "$dro_cnt" ] || dro_cnt=0
+    [ "$dro_cnt" -lt "$dro_max" ] 2>/dev/null && return 0
+    [ -f "$dro_rd/retry.until" ] && return 0      # 退避计时中，尚未终局
+    return 1
+}
+
+# 传播失败（D51 行2；借道 P4 WAITING 通道 = gate_wait→gate_fail 既有令牌；
+# gate.fail 标记 → P4-07 不接退避；183 迁移零接触）
+dag_fail_propagate() {   # <base> <tasks> <id> <reason>
+    dgv_rd="$2/$3"
+    mkdir -p "$dgv_rd" 2>/dev/null
+    printf '%s\n' "$4" > "$dgv_rd/gate.fail" 2>/dev/null
+    state_log_event "$dgv_rd" "$3" gate_wait WAITING "" "" "$4" >/dev/null 2>&1
+    state_log_event "$dgv_rd" "$3" gate_fail FAILED "" "" "$4" >/dev/null 2>&1
+    sched_audit "$1" "op=dag|action=fail-propagate|chain=$dgv_chain|run=$dgv_run|task=$3|reason=$4|mode=managed"
+    return 0
+}
+
+# 节点释放执行（D52：复用既有 action_run 路径；错误隔离）。<base> <tasks> <sdir> <id> <now>
+# → 0=已启动 非0=启动失败（调用方记 FAILED）
+dag_dispatch_node() {   # <base> <tasks> <sdir> <id>
+    dgv_tf="$3/$4.task"
+    [ -f "$dgv_tf" ] || return 1
+    dgv_rd="$2/$4"
+    mkdir -p "$dgv_rd" 2>/dev/null
+    state_log_event "$dgv_rd" "$4" dag_dispatch RUNNING "" "" "chain dispatch (chain=$dgv_chain run=$dgv_run)" >/dev/null 2>&1
+    dgv_cmd=$(sched_task_field "$dgv_tf" action.command)
+    dgv_tmx=$(sched_task_field "$dgv_tf" action.termux);  [ -z "$dgv_tmx" ] && dgv_tmx=0
+    dgv_itr=$(sched_task_field "$dgv_tf" action.interactive); [ -z "$dgv_itr" ] && dgv_itr=0
+    dgv_ns=$(sched_task_field "$dgv_tf" action.notify_start); [ -z "$dgv_ns" ] && dgv_ns=0
+    dgv_ne=$(sched_task_field "$dgv_tf" action.notify_end);   [ -z "$dgv_ne" ] && dgv_ne=0
+    dgv_msg=$(sched_task_field "$dgv_tf" action.msg)
+    action_run "$4" "$dgv_cmd" "$dgv_tmx" "$dgv_itr" "$dgv_ns" "$dgv_ne" "$dgv_msg" >/dev/null 2>&1 </dev/null
+    dgv_arc=$?
+    [ -d "$dgv_rd" ] && cp "$dgv_tf" "$dgv_rd/task.v2" 2>/dev/null
+    sched_audit "$1" "op=dag|action=dispatch|chain=$dgv_chain|run=$dgv_run|task=$4|rc=$dgv_arc|mode=managed"
+    return "$dgv_arc"
+}
+
+# 单 run 评估更新（frontier/传播/释放/汇总/超时/corrupt；tmp+mv 整写）。
+# 输入 = dag_run_parse 已填充的 dgv_* 全局 + <base> <config> <tasks> <sdir> <now>
+dag_run_update() {
+    dgv_base=$1; dgv_config=$2; dgv_tasks=$3; dgv_sdir=$4; dgv_now=$5
+    case "$dgv_rstate" in
+        SUCCESS|FAILED) return 0 ;;
+    esac
+    # ① 超时（D57：停止释放、run=FAILED，不强杀在途进程）
+    dgv_nowsec=$(sched_gate_epoch)
+    dgv_el=$((dgv_nowsec - dgv_created))
+    if [ "$DAG_RUN_TIMEOUT" -gt 0 ] 2>/dev/null && [ "$dgv_el" -gt "$DAG_RUN_TIMEOUT" ] 2>/dev/null; then
+        dgv_rstate=FAILED
+        sched_audit "$dgv_base" "op=dag|action=timeout|chain=$dgv_chain|run=$dgv_run|elapsed=$dgv_el|limit=$DAG_RUN_TIMEOUT|mode=managed"
+        dag_run_emit | dag_run_write "$dgv_base" "$dgv_chain" "$dgv_run" >/dev/null 2>&1
+        return 0
+    fi
+    # ② 态镜像（root 行 + 成员行；live = tasks/<id>/state.txt 优先）
+    dgv_rid=$(printf '%s' "$dgv_rootline" | cut -d'|' -f1)
+    dgv_ratt=$(printf '%s' "$dgv_rootline" | cut -d'|' -f3)
+    [ -n "$dgv_ratt" ] || dgv_ratt=1
+    dgv_rst=$(printf '%s' "$dgv_rootline" | cut -d'|' -f2)
+    dgv_live=$(runtime_current_state "$dgv_tasks/$dgv_rid" 2>/dev/null)
+    dgv_rst=$(dag_mirror_state "$dgv_rst" "$dgv_live")
+    dgv_rootline="$dgv_rid|$dgv_rst|$dgv_ratt"
+    dgv_newlines=""
+    while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
+        [ -n "$dgv_nid" ] || continue
+        dgv_live=$(runtime_current_state "$dgv_tasks/$dgv_nid" 2>/dev/null)
+        dgv_nst=$(dag_mirror_state "$dgv_nst" "$dgv_live")
+        dgv_newlines="$dgv_newlines
+$dgv_nid|$dgv_ntrig|$dgv_nst|$dgv_nnote"
+    done <<EOF
+$dgv_lines
+EOF
+    dgv_lines="$dgv_newlines"
+    # ③ 在途计数（D52 并行闸分母：disp 或镜像运行族且未见终态的节点进程）
+    dgv_inflight=0
+    while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
+        [ -n "$dgv_nid" ] || continue
+        dgv_isdisp=0
+        case " $dgv_nnote " in *" disp "*) dgv_isdisp=1 ;; esac
+        if [ "$dgv_isdisp" -eq 1 ]; then
+            case "$dgv_nst" in
+                STOPPED|FAILED) : ;;
+                *) dgv_inflight=$((dgv_inflight + 1)) ;;
+            esac
+        else
+            case "$dgv_nst" in
+                STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|STOPPING) dgv_inflight=$((dgv_inflight + 1)) ;;
+            esac
+        fi
+    done <<EOF
+$dgv_lines
+EOF
+    # ④ frontier 单遍：传播（rc2 立即 FAILED）/等待（rc1 记录原因）/释放（rc0，
+    #    cond 叠加 + 并行闸；文件序=成员 id 升序 → 同层确定序）
+    dgv_newlines=""
+    while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
+        [ -n "$dgv_nid" ] || continue
+        dgv_act=""
+        case " $dgv_nnote " in *" disp "*) dgv_act=dispatched ;; esac
+        if [ -z "$dgv_act" ]; then
+            case "$dgv_nst" in
+                ''|PENDING)
+                    # 节点 DISABLED（enabled=0）：不释放（D54 中断路语义）
+                    dgv_ntf="$dgv_sdir/$dgv_nid.task"
+                    dgv_ndis=""
+                    [ -f "$dgv_ntf" ] && [ "$(sched_task_field "$dgv_ntf" enabled)" = "0" ] && dgv_ndis=1
+                    if [ -n "$dgv_ndis" ]; then
+                        dgv_nnote="disabled"
+                        dgv_act=disabled
+                    else
+                        dgv_res=$(dag_edges_eval "$dgv_sdir" "$dgv_nid")
+                        dgv_erc=$?
+                        if [ "$dgv_erc" -eq 2 ]; then
+                            dag_fail_propagate "$dgv_base" "$dgv_tasks" "$dgv_nid" "$dgv_res"
+                            dgv_nst=FAILED
+                            dgv_nnote="gate-fail"
+                            dgv_act=failed
+                        elif [ "$dgv_erc" -eq 1 ]; then
+                            dgv_nnote="waiting"
+                            case "$dgv_res" in
+                                *missing:*) dgv_nnote="waiting-missing" ;;
+                            esac
+                            # Optional 不满足仅记录（D51 行4）
+                            case "$dgv_res" in
+                                *"opt-unsat:"*) dgv_nnote="waiting opt-unsat" ;;
+                            esac
+                            dgv_act=wait
+                        else
+                            # 依赖满足 → cond 叠加（D52）+ 并行闸（D52/D57 顺延不丢弃）
+                            if [ "$dgv_inflight" -ge "$DAG_PARALLEL_MAX" ] 2>/dev/null; then
+                                dgv_nnote="defer"
+                                dgv_act=defer
+                            else
+                                dgv_cres=$(sched_cond_check "$dgv_tasks" "$dgv_nid" "$dgv_now" "$(date +%w)")
+                                dgv_crc=$?
+                                if [ "$dgv_crc" -ne 0 ]; then
+                                    dgv_nnote="cond-unmet"
+                                    sched_audit "$dgv_base" "op=dag|action=cond-unmet|chain=$dgv_chain|run=$dgv_run|task=$dgv_nid|reason=$dgv_cres|mode=managed"
+                                    dgv_act=cond
+                                else
+                                    if dag_dispatch_node "$dgv_base" "$dgv_tasks" "$dgv_sdir" "$dgv_nid"; then
+                                        dgv_nst=RUNNING
+                                        dgv_nnote="disp"
+                                        case "$dgv_res" in *"opt-unsat:"*) dgv_nnote="disp opt-unsat" ;; esac
+                                        dgv_inflight=$((dgv_inflight + 1))
+                                        dgv_act=dispatch
+                                    else
+                                        state_log_event "$dgv_tasks/$dgv_nid" "$dgv_nid" action_failure FAILED "" "" "chain dispatch start failed" >/dev/null 2>&1
+                                        dgv_nst=FAILED
+                                        dgv_nnote="disp start-fail"
+                                        dgv_act=failed
+                                    fi
+                                fi
+                            fi
+                        fi
+                    fi ;;
+            esac
+        fi
+        dgv_newlines="$dgv_newlines
+$dgv_nid|$dgv_ntrig|$dgv_nst|$dgv_nnote"
+    done <<EOF
+$dgv_lines
+EOF
+    dgv_lines="$dgv_newlines"
+    # ⑤ run 态汇总：终态=全成员+root **记录**终态且**实况**也已落终态（节点级重试
+    #    在途/WAITING 退避中 → 不收敛——D53「重试成功→终态更新入 run.txt→frontier
+    #    前进」优先；重试耗尽/中断路由 DAG_RUN_TIMEOUT 有界收敛，D51 行5）；
+    #    在途>0 → RUNNING；否则 PENDING
+    dgv_allterm=1
+    dgv_anyfail=0
+    dgv_rst=$(printf '%s' "$dgv_rootline" | cut -d'|' -f2)
+    case "$dgv_rst" in
+        STOPPED|FAILED)
+            dgv_rlive=$(runtime_current_state "$dgv_tasks/$dgv_rid" 2>/dev/null)
+            case "$dgv_rlive" in
+                STOPPED|FAILED)
+                    if dag_retry_open "$dgv_rst" "$dgv_tasks" "$dgv_rid" "$dgv_sdir"; then
+                        dgv_allterm=0
+                    else
+                        [ "$dgv_rst" = FAILED ] && dgv_anyfail=1
+                    fi ;;
+                *) dgv_allterm=0 ;;
+            esac ;;
+        *) dgv_allterm=0 ;;
+    esac
+    while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
+        [ -n "$dgv_nid" ] || continue
+        case "$dgv_nst" in
+            STOPPED|FAILED)
+                dgv_nlive=$(runtime_current_state "$dgv_tasks/$dgv_nid" 2>/dev/null)
+                case "$dgv_nlive" in
+                    STOPPED|FAILED)
+                        if dag_retry_open "$dgv_nst" "$dgv_tasks" "$dgv_nid" "$dgv_sdir"; then
+                            dgv_allterm=0
+                        else
+                            [ "$dgv_nst" = FAILED ] && dgv_anyfail=1
+                        fi ;;
+                    *) dgv_allterm=0 ;;
+                esac ;;
+            *) dgv_allterm=0 ;;
+        esac
+    done <<EOF
+$dgv_lines
+EOF
+    if [ "$dgv_allterm" -eq 1 ]; then
+        if [ "$dgv_anyfail" -eq 1 ]; then dgv_rstate=FAILED; else dgv_rstate=SUCCESS; fi
+    elif [ "$dgv_inflight" -gt 0 ]; then
+        dgv_rstate=RUNNING
+    else
+        dgv_rstate=PENDING
+    fi
+    # ⑥ 整写（tmp+mv；无变化也幂等重写——单文件成本有界 ≤32 行）
+    dag_run_emit | dag_run_write "$dgv_base" "$dgv_chain" "$dgv_run" >/dev/null 2>&1
+    return 0
+}
+
+# 登记一次 run（D48/D49；同 token 目录名天然去重；活跃数闸 D57）。
+# <base> <tasks> <root> <token> <members 空格> → 0=创建 1=跳过（已存在/达上限）
+dag_try_register() {
+    dgv_b=$1; dgv_tasks=$2; dgv_root=$3; dgv_token=$4; dgv_members=$5
+    secv_id_ok "$dgv_root" || return 1
+    dag_token_ok "$dgv_token" || return 1
+    dgv_rd=$(dag_run_dir "$dgv_b" "$dgv_root" "$dgv_token")
+    [ -d "$dgv_rd" ] && return 1
+    dgv_active=$(dag_active_runs "$dgv_b")
+    if [ "$dgv_active" -ge "$DAG_RUNS_MAX" ] 2>/dev/null; then
+        # D57：不启动新 run（根照常执行、在途不受影响）；后续 tick 扫描重试
+        sched_audit "$dgv_b" "op=dag|action=limit|chain=$dgv_root|run=$dgv_token|active=$dgv_active|limit=$DAG_RUNS_MAX|mode=managed"
+        return 1
+    fi
+    mkdir -p "$dgv_rd" 2>/dev/null || return 1
+    chmod 700 "$dgv_b/dag" "$(dag_chain_dir "$dgv_b" "$dgv_root")" "$(dag_runs_dir "$dgv_b" "$dgv_root")" "$dgv_rd" 2>/dev/null
+    dgv_rst=$(runtime_current_state "$dgv_tasks/$dgv_root" 2>/dev/null)
+    {
+        printf 'chain=%s\n' "$dgv_root"
+        printf 'run=%s\n' "$dgv_token"
+        printf 'state=PENDING\n'
+        printf 'created=%s\n' "$(sched_gate_epoch)"
+        printf 'root=%s|%s|1\n' "$dgv_root" "$dgv_rst"
+        for dgv_m in $(printf '%s\n' $dgv_members | sort); do
+            printf '%s|chain|PENDING|\n' "$dgv_m"
+        done
+    } | dag_run_write "$dgv_b" "$dgv_root" "$dgv_token" >/dev/null 2>&1 || {
+        rmdir "$dgv_rd" 2>/dev/null
+        return 1
+    }
+    state_log_event "$dgv_tasks/$dgv_root" "$dgv_root" dag_register "$dgv_rst" "" "" "chain run $dgv_token registered" >/dev/null 2>&1
+    sched_audit "$dgv_b" "op=dag|action=register|chain=$dgv_root|run=$dgv_token|task=$dgv_root|nodes=$dgv_members|mode=managed"
+    return 0
+}
+
+# 根终态观察 → 登记扫描（U-1=执行标记回读；覆盖 execute/advance/catch-up/boot
+# 四条 mark 通道；手动 tctl 不 mark → 天然不点火，D48/D54）。
+# <base> <tasks> <rootmap "root|members"> <token>
+dag_scan_registrations() {
+    dgv_b=$1; dgv_tasks=$2; dgv_roots=$3; dgv_cur=$4
+    [ -n "$dgv_roots" ] || return 0
+    while IFS='|' read -r dgv_r dgv_m; do
+        [ -n "$dgv_r" ] || continue
+        secv_id_ok "$dgv_r" || continue
+        dgv_last=""
+        if [ -d "$(dag_runs_dir "$dgv_b" "$dgv_r")" ]; then
+            for dgv_tk in $(ls "$(dag_runs_dir "$dgv_b" "$dgv_r")" 2>/dev/null | sort); do
+                dag_token_ok "$dgv_tk" && dgv_last=$dgv_tk
+            done
+        fi
+        dgv_cand=""
+        for dgv_cf in "$dgv_b"/scheduler/cycle-*; do
+            [ -f "$dgv_cf" ] || continue
+            dgv_t=${dgv_cf##*cycle-}
+            dag_token_ok "$dgv_t" || continue
+            if [ -n "$dgv_last" ]; then
+                [ "$dgv_t" \> "$dgv_last" ] || continue
+            fi
+            grep -qx "$dgv_r" "$dgv_cf" 2>/dev/null || continue
+            dgv_cand=$dgv_t   # 只登记最近一轮（历史缺口不重放，D53 链不重放）
+        done
+        [ -n "$dgv_cand" ] || continue
+        dag_try_register "$dgv_b" "$dgv_tasks" "$dgv_r" "$dgv_cand" "$dgv_m" >/dev/null 2>&1
+    done <<EOF
+$dgv_roots
+EOF
+    return 0
+}
+
+# 全树扫描：评估活跃 run + corrupt 收敛 + prune（D49/D56/D57）。<base> <config> <tasks> <sdir> <now>
+dag_sweep_runs() {
+    dgv_b=$1; dgv_config=$2; dgv_tasks=$3; dgv_sdir=$4; dgv_now=$5
+    [ -d "$(dag_runs_root "$dgv_b")" ] || return 0
+    for dgv_cd in "$(dag_runs_root "$dgv_b")"/*; do
+        [ -d "$dgv_cd" ] || continue
+        dgv_c=${dgv_cd##*/}
+        secv_id_ok "$dgv_c" || continue     # 非本引擎目录：不读不动（id 门）
+        for dgv_rd in "$dgv_cd"/runs/*; do
+            [ -d "$dgv_rd" ] || continue
+            dgv_tk=${dgv_rd##*/}
+            if ! dag_token_ok "$dgv_tk"; then
+                rm -rf "$dgv_rd" 2>/dev/null   # 篡改/残留目录（本树 0700 root-only）
+                continue
+            fi
+            dgv_rf="$dgv_rd/run.txt"
+            if [ ! -f "$dgv_rf" ]; then
+                rm -rf "$dgv_rd" 2>/dev/null
+                continue
+            fi
+            if ! dag_run_parse "$dgv_rf" "$dgv_c" "$dgv_tk"; then
+                # D49：不可解析 → 审计 corrupt → 按超时路径置 FAILED（不猜态）→ 正常 prune
+                sched_audit "$dgv_b" "op=dag|action=corrupt|chain=$dgv_c|run=$dgv_tk|mode=managed"
+                {
+                    printf 'chain=%s\n' "$dgv_c"
+                    printf 'run=%s\n' "$dgv_tk"
+                    printf 'state=FAILED\n'
+                    printf 'created=%s\n' "$(sched_gate_epoch)"
+                    printf 'root=%s|FAILED|0\n' "$dgv_c"
+                } | dag_run_write "$dgv_b" "$dgv_c" "$dgv_tk" >/dev/null 2>&1
+                continue
+            fi
+            dag_run_update "$dgv_b" "$dgv_config" "$dgv_tasks" "$dgv_sdir" "$dgv_now"
+        done
+        # prune：token 字典序=时间序，保留最近 DAG_RUNS_KEEP（D49/D57）
+        if [ -d "$dgv_cd/runs" ]; then
+            dgv_tot=0
+            for dgv_rd in "$dgv_cd"/runs/*; do [ -d "$dgv_rd" ] && dgv_tot=$((dgv_tot + 1)); done
+            dgv_drop=$((dgv_tot - DAG_RUNS_KEEP))
+            [ "$dgv_drop" -gt 0 ] 2>/dev/null || continue
+            dgv_i=0
+            for dgv_rd in $(ls "$dgv_cd/runs" 2>/dev/null | sort); do
+                dgv_i=$((dgv_i + 1))
+                [ "$dgv_i" -le "$dgv_drop" ] || break
+                rm -rf "$dgv_cd/runs/$dgv_rd" 2>/dev/null
+                sched_audit "$dgv_b" "op=dag|action=prune|chain=$dgv_c|run=$dgv_rd|keep=$DAG_RUNS_KEEP|mode=managed"
+            done
+        fi
+    done
+    return 0
+}
+
+# ── 链引擎 pass（scheduler_tick 内单遍；D52/D53）────────────────────────────
+scheduler_dag_pass() {   # <base> <config> <tasks_dir> [now] → 0（恒非致命）
+    dgp_base=$1; dgp_config=$2; dgp_tasks=$3
+    dgp_now=${4:-$(date +%H%M)}
+    # D12/B16：仅 managed（legacy 模式引擎 pass 不运行，存量 $base/dag 闲置不读）
+    tcfg_is_managed 2>/dev/null || return 0
+    dgp_sdir=$(registry_snapshot_dir 2>/dev/null) || return 0
+    [ -n "$dgp_sdir" ] && [ -d "$dgp_sdir" ] || return 0
+    # 快速路径：无链节点且无存量链运行树 → 近零开销（P6-01 §perf 护栏；单 grep）
+    dgp_cfiles=$(grep -l '^trigger=chain$' "$dgp_sdir"/*.task 2>/dev/null)
+    if [ -z "$dgp_cfiles" ] && [ ! -d "$(dag_runs_root "$dgp_base")" ]; then
+        return 0
+    fi
+    dgp_chain=""
+    for dgp_f in $dgp_cfiles; do
+        dgp_i=${dgp_f##*/}
+        dgp_i=${dgp_i%.task}
+        secv_id_ok "$dgp_i" || continue
+        dgp_chain="$dgp_chain $dgp_i"
+    done
+    # 现图根映射（成员闭包）→ 登记扫描（D48 观察）
+    dgp_roots=""
+    [ -n "$dgp_chain" ] && dgp_roots=$(dag_root_map "$dgp_sdir" "$dgp_chain")
+    dag_scan_registrations "$dgp_base" "$dgp_tasks" "$dgp_roots" "$(sched_cycle_token)"
+    # 活跃 run 评估 + corrupt/prune（成员集内自登记冻结行；边按现图，D56）
+    dag_sweep_runs "$dgp_base" "$dgp_config" "$dgp_tasks" "$dgp_sdir" "$dgp_now"
+    return 0
+}
+# ────────────────────────────────────────────────────────────────────────
 runtime_lib_selfcheck() {
     [ -n "${RUNTIME_LIB_VERSION:-}" ] || return 1
     for fn in task_state_transition legacy_adapter_parse provider_dispatch \
@@ -6486,7 +7274,11 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
                cond_grammar_ok cond_eval \
                sched_retry_count_file sched_retry_until_file sched_retry_gatefail_file \
                rty_policy sched_retry_arm sched_retry_pending \
-               dep_validate_graph dep_graph_read; do
+                dep_validate_graph dep_graph_read \
+                scheduler_dag_pass dag_validate_chains dag_run_parse dag_run_write \
+                dag_run_emit dag_token_ok dag_active_runs dag_root_map \
+                dag_edges_eval dag_mirror_state dag_retry_open dag_run_update \
+                dag_try_register dag_scan_registrations dag_sweep_runs; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0
