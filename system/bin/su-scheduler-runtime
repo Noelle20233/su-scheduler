@@ -3207,6 +3207,31 @@ tcfg_validate_task() {   # <file> → 0 合法 / 1 非法（绝不清空、绝�
     return 0
 }
 
+# P6-04：只读诊断（不改变 tcfg_validate_task 任何判定/行为）：按 tcfg_validate_task
+# 相同顺序返回**首个失败点的字段级原因**（stdout；合法任务 → "task file valid"）。
+# 仅供 ipc_op_validate/create/update 在失败分支构造 configuration_invalid 的
+# ERROR 字段；输出最终仍经 ipc_err_sanitize 净化（去 `|`/换行/限长/脱敏）。
+tcfg_validate_reason() {   # <file> → 原因文本（stdout）
+    tcfgv_f=$1
+    [ -f "$tcfgv_f" ] || { echo "task file missing"; return 0; }
+    tcfgv_sv=$(tcfg_get "$tcfgv_f" schema_version)
+    [ "$tcfgv_sv" = "2" ] || { echo "schema_version must be 2 (got '$tcfgv_sv' or missing)"; return 0; }
+    tcfgv_id=$(tcfg_get "$tcfgv_f" id)
+    tcfgv_base=$(basename "$tcfgv_f" .task)
+    if [ -z "$tcfgv_id" ]; then
+        echo "id field missing (filename base '$tcfgv_base')"
+        return 0
+    fi
+    [ "$tcfgv_id" = "$tcfgv_base" ] || { echo "id '$tcfgv_id' does not match file name '$tcfgv_base'"; return 0; }
+    [ -n "$(tcfg_get "$tcfgv_f" trigger)" ] || { echo "trigger field missing/empty"; return 0; }
+    dep_validate "$(tcfg_get "$tcfgv_f" dependency)" || { echo "dependency syntax invalid"; return 0; }
+    tcfgv_cond=$(tcfg_get "$tcfgv_f" condition)
+    cond_validate "$tcfgv_cond" || { echo "condition invalid"; return 0; }
+    [ -z "$tcfgv_cond" ] || cond_grammar_ok "$tcfgv_cond" || { echo "condition expression illegal (whitelisted predicates only)"; return 0; }
+    echo "task file valid"
+    return 0
+}
+
 # 写入一个任务文件（内容 stdin；managed 语义下由调用方保证权威性）
 tcfg_write_task() {   # <id>
     id=$1
@@ -4300,6 +4325,7 @@ ipc_log() { [ "${IPC_LOG:-1}" = "1" ] && echo "[ipc] $1" >&2; }
 IPC_WHITELIST="GET_TASKS GET_TASK_STATUS GET_TASK_LOG VALIDATE_TASK CREATE_TASK UPDATE_TASK DELETE_TASK ENABLE_TASK DISABLE_TASK START_TASK STOP_TASK RESTART_TASK CHECK_TASK GET_SUMMARY GET_TASK_DETAIL GET_TASK_EVENTS GET_DAEMON_LOG GET_TASK_EDIT EDIT_TASK"
 IPC_REQ_MAX=4096
 IPC_POLL_MAX=64
+IPC_ERR_MAX=256   # P6-04：响应 ERROR 字段（第 4 段）长度上限（字符）
 ipc_dir() { echo "$1/ipc"; }
 ipc_req_dir() { echo "$1/ipc/requests"; }
 ipc_resp_dir() { echo "$1/ipc/responses"; }
@@ -4311,6 +4337,53 @@ ipc_b64dec() { printf '%s' "$1" | base64 -d 2>/dev/null; }
 # P3-08：改为 END 汇总式判定（NR>1 → 含换行 → 0）——`NR>1{exit 0}END{exit 1}`
 # 在部分 awk（gawk）下 END 会覆盖 exit，导致恒判无换行（多行注入漏检）。
 ipc_has_newline() { printf '%s' "$1" | awk 'END { exit (NR>1 ? 0 : 1) }' 2>/dev/null; }
+# P6-04：ERROR 字段净化（协议完整性 + 脱敏 + 限长，ipc_respond 唯一写入通道）：
+#   取诊断**首个非空行**（多行 stderr 不产生伪响应行）→ 仅保留可打印 ASCII
+#   （控制字符/换行→空格）→ `|` 归一为 `/`（防破坏 REQ_ID|OP|RC|ERROR 四段）→
+#   剔除 `[editor] ERROR:` 类前缀 → 脱敏（daemon base、TCFG_DIR 具体值、
+#   /data/adb 字面量 → `<path>`）→ 去尾部空白/冒号 → 超 IPC_ERR_MAX 截断并
+#   追加 `...(truncated)`。路径脱敏用 index() 字面匹配（不依赖正则转义）。
+ipc_err_sanitize() {   # <text> [<base>] → 净化后的单行 ERROR（stdout）
+    printf '%s' "${1:-}" | awk -v base="${2:-}" \
+        -v td="${TCFG_DIR:-/data/adb/su-scheduler/task-config}" -v max="$IPC_ERR_MAX" '
+        function printable(s,   i, c, r) {
+            r = ""
+            for (i = 1; i <= length(s); i++) {
+                c = substr(s, i, 1)
+                if (c >= " " && c <= "~") r = r c
+                else r = r " "
+            }
+            gsub(/\|/, "/", r)
+            return r
+        }
+        function redactlit(s, pat,   p, o) {
+            if (pat == "") return s
+            o = s
+            while ((p = index(o, pat)) > 0)
+                o = substr(o, 1, p - 1) "<path>" substr(o, p + length(pat))
+            return o
+        }
+        {
+            if (buf == "") {
+                line = $0
+                sub(/\r$/, "", line)
+                if (line !~ /^[ \t]*$/) buf = printable(line)
+            }
+        }
+        END {
+            if (buf == "") exit
+            gsub(/\[(editor|task-config|ipc|legacy)\] ERROR: /, "", buf)
+            gsub(/  +/, " ", buf)
+            sub(/^ +/, "", buf)
+            buf = redactlit(buf, base)
+            buf = redactlit(buf, td)
+            gsub(/\/data\/adb[A-Za-z0-9._\/-]*/, "<path>", buf)
+            sub(/[ :]+$/, "", buf)
+            if (length(buf) > max) buf = substr(buf, 1, max - 14) "...(truncated)"
+            printf "%s", buf
+        }
+    ' 2>/dev/null
+}
 # 服务端初始化：建 0700 目录 + daemon.pid 存活标记
 ipc_server_init() {   # <base> → 0
     ipcv_base=$1
@@ -4369,6 +4442,8 @@ ipc_param() {   # 用 sed 抽取而非管道 while（子 shell return 不可靠�
 # 原子响应写回：<base> <req_id> <op> <rc> <error> [payload]
 ipc_respond() {   # 载荷为空则不写载荷行；tmp+mv 原子
     ipcv_base=$1; ipcv_rid=$2; ipcv_op=$3; ipcv_rc=$4; ipcv_err=$5; ipcv_payload=${6:-}
+    # P6-04：ERROR 字段经净化后再写（单行/无|/限长/脱敏），协议结构恒为四段
+    ipcv_err=$(ipc_err_sanitize "$ipcv_err" "$ipcv_base")
     ipcv_rdir=$(ipc_resp_dir "$ipcv_base")
     mkdir -p "$ipcv_rdir" 2>/dev/null
     ipcv_t="$ipcv_rdir/$ipcv_rid.resp.tmp"
@@ -4465,21 +4540,25 @@ $(tail -n "$ipcv_returned" "$ipcv_rd/output.log" 2>/dev/null)"
 ipc_op_validate() {   # <base> <req_id> <params>
     ipcv_base=$1; ipcv_rid=$2; ipcv_params=$3
     # P3-06：payload 参数 = 完整 Task v2 内容（编辑器预览/校验）→ 全字段校验
+    # P6-04：校验器 stderr 诊断捕获到临时文件，首个字段级原因透传进 ERROR 字段
     ipcv_pl=$(ipc_param "$ipcv_params" payload)
     if [ -n "$ipcv_pl" ]; then
-        if tcfg_editor_validate_payload "$ipcv_pl"; then
+        mkdir -p "$ipcv_base/ipc" 2>/dev/null
+        ipcv_ef="$ipcv_base/ipc/.valerr.$$_p"
+        if tcfg_editor_validate_payload "$ipcv_pl" 2>"$ipcv_ef"; then
             ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 0 ok "valid"
         else
-            ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "task invalid"
+            ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 "configuration_invalid: $(cat "$ipcv_ef" 2>/dev/null)" "task invalid"
         fi
+        rm -f "$ipcv_ef" 2>/dev/null
         return 0
     fi
     ipcv_trig=$(ipc_param "$ipcv_params" trigger)
     ipcv_cmd=$(ipc_param "$ipcv_params" command)
     [ -n "$ipcv_trig" ] && [ -n "$ipcv_cmd" ] || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "trigger+command required"; return 0; }
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 "configuration_invalid: trigger+command required" "trigger+command required"; return 0; }
     if ipc_has_newline "$ipcv_cmd"; then
-        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "command must be single-line"; return 0; fi
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 "configuration_invalid: command must be single-line" "command must be single-line"; return 0; fi
     ipcv_sandbox="$ipcv_base/ipc/.validate.$$"
     mkdir -p "$ipcv_sandbox" 2>/dev/null
     ipcv_vid="validate_$$"
@@ -4495,7 +4574,7 @@ ipc_op_validate() {   # <base> <req_id> <params>
     if tcfg_validate_task "$ipcv_sandbox/$ipcv_vid.task"; then
         ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 0 ok "valid"
     else
-        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 configuration_invalid "task invalid"
+        ipc_respond "$ipcv_base" "$ipcv_rid" VALIDATE_TASK 4 "configuration_invalid: $(tcfg_validate_reason "$ipcv_sandbox/$ipcv_vid.task")" "task invalid"
     fi
     rm -rf "$ipcv_sandbox" 2>/dev/null
     return 0
@@ -4504,13 +4583,13 @@ ipc_op_validate() {   # <base> <req_id> <params>
 ipc_op_create() {   # <base> <config> <req_id> <params>
     ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_params=$4
     tcfg_is_managed || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: write ops require managed task-config (run: su-scheduler task-config import)" "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
     ipcv_trig=$(ipc_param "$ipcv_params" trigger)
     ipcv_cmd=$(ipc_param "$ipcv_params" command)
     [ -n "$ipcv_trig" ] && [ -n "$ipcv_cmd" ] || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "trigger+command required"; return 0; }
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: trigger+command required" "trigger+command required"; return 0; }
     if ipc_has_newline "$ipcv_cmd"; then
-        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "command must be single-line"; return 0; fi
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: command must be single-line" "command must be single-line"; return 0; fi
     ipcv_id=$(ipc_param "$ipcv_params" id)
     [ -n "$ipcv_id" ] || ipcv_id=$(tcfg_new_id "$ipcv_trig")
     ipcv_sandbox="$ipcv_base/ipc/.create.$$"
@@ -4534,8 +4613,9 @@ ipc_op_create() {   # <base> <config> <req_id> <params>
         echo "retry.interval=60"
     } > "$ipcv_sandbox/$ipcv_id.task" 2>/dev/null
     if ! tcfg_validate_task "$ipcv_sandbox/$ipcv_id.task"; then
+        ipcv_rsn=$(tcfg_validate_reason "$ipcv_sandbox/$ipcv_id.task")
         rm -rf "$ipcv_sandbox" 2>/dev/null
-        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "task invalid"
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: $ipcv_rsn" "task invalid"
         return 0
     fi
     ipcv_target=$(tcfg_task_file "$ipcv_id")
@@ -4547,7 +4627,7 @@ ipc_op_create() {   # <base> <config> <req_id> <params>
     else
         rm -f "$ipcv_target.tmp.$$" 2>/dev/null
         rm -rf "$ipcv_sandbox" 2>/dev/null
-        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 configuration_invalid "write failed"
+        ipc_respond "$ipcv_base" "$ipcv_rid" CREATE_TASK 4 "configuration_invalid: write failed" "write failed"
     fi
     return 0
 }
@@ -4555,15 +4635,15 @@ ipc_op_create() {   # <base> <config> <req_id> <params>
 ipc_op_update() {   # <base> <config> <req_id> <params>
     ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_params=$4
     tcfg_is_managed || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 "configuration_invalid: write ops require managed task-config (run: su-scheduler task-config import)" "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
     ipcv_id=$(ipc_param "$ipcv_params" id)
-    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 1 invalid_request "missing id"; return 0; }
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 1 "invalid_request: missing id" "missing id"; return 0; }
     [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 3 task_not_found "$ipcv_id"; return 0; }
     for ipcv_fld in name enabled trigger command termux interactive notify_start notify_end msg; do
         ipcv_v=$(ipc_param "$ipcv_params" "$ipcv_fld")
         [ -n "$ipcv_v" ] || continue
         if [ "$ipcv_fld" = "command" ] && ipc_has_newline "$ipcv_v"; then
-            ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 configuration_invalid "command must be single-line"; return 0; fi
+            ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 "configuration_invalid: command must be single-line" "command must be single-line"; return 0; fi
         case "$ipcv_fld" in
             command) ipcv_key=action.command ;;
             termux) ipcv_key=action.termux ;;
@@ -4579,15 +4659,15 @@ ipc_op_update() {   # <base> <config> <req_id> <params>
         sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
         ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 0 ok "updated $ipcv_id"
     else
-        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 configuration_invalid "invalid after update"
+        ipc_respond "$ipcv_base" "$ipcv_rid" UPDATE_TASK 4 "configuration_invalid: invalid after update: $(tcfg_validate_reason "$(tcfg_task_file "$ipcv_id")")" "invalid after update"
     fi
     return 0
 }
 ipc_op_delete() {   # <base> <config> <req_id> <id>
     ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_id=$4
     tcfg_is_managed || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
-    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 1 invalid_request "missing id"; return 0; }
+        ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 4 "configuration_invalid: write ops require managed task-config (run: su-scheduler task-config import)" "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+    [ -n "$ipcv_id" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 1 "invalid_request: missing id" "missing id"; return 0; }
     [ -f "$(tcfg_task_file "$ipcv_id")" ] || { ipc_respond "$ipcv_base" "$ipcv_rid" DELETE_TASK 3 task_not_found "$ipcv_id"; return 0; }
     tcfg_remove_task "$ipcv_id" >/dev/null 2>&1
     sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
@@ -4692,7 +4772,7 @@ ipc_dispatch() {
             case " $ipcv_allow " in
                 *" $ipcv_k "*) ;;
                 *) IFS=$ipcv_oldifs
-                   ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 1 invalid_request "unknown param key: $ipcv_k"
+                   ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 1 "invalid_request: unknown param key: $ipcv_k" "unknown param key: $ipcv_k"
                    return 0 ;;
             esac
         done
@@ -4704,7 +4784,7 @@ ipc_dispatch() {
         *" id "*)
             ipcv_qid=$(ipc_param "$ipcv_params" id)
             if [ -n "$ipcv_qid" ] && ! secv_id_ok "$ipcv_qid"; then
-                ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 1 invalid_request "invalid id (charset/path-traversal)"
+                ipc_respond "$ipcv_base" "$ipcv_rid" "$ipcv_op" 1 "invalid_request: invalid id (charset/path-traversal)" "invalid id (charset/path-traversal)"
                 return 0
             fi
             ;;
@@ -4753,7 +4833,7 @@ ipc_server_poll() {   # <base> <config> <tasks_dir> → 0
         fi
         ipcv_sz=$(wc -c < "$ipcv_rf" 2>/dev/null || echo 0)
         if [ "$ipcv_sz" -gt "$IPC_REQ_MAX" ]; then
-            ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 invalid_request "request too large"
+            ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 "invalid_request: request too large" "request too large"
             rm -f "$ipcv_rf" 2>/dev/null
             continue
         fi
@@ -4767,7 +4847,7 @@ ipc_server_poll() {   # <base> <config> <tasks_dir> → 0
             fi
             ipc_dispatch "$ipcv_base" "$ipcv_config" "$ipcv_tasks" "$ipcv_rid" "$ipcv_op" "$ipcv_params"
         else
-            ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 invalid_request "malformed request"
+            ipc_respond "$ipcv_base" "$ipcv_rid" "" 1 "invalid_request: malformed request" "malformed request"
         fi
     done
     return 0
@@ -5424,17 +5504,25 @@ ipc_op_get_task_edit() {   # <base> <req_id> <id>
 ipc_op_edit_task() {   # <base> <config> <req_id> <id> <payload>
     ipcv_base=$1; ipcv_config=$2; ipcv_rid=$3; ipcv_id=$4; ipcv_payload=$5
     tcfg_is_managed || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 configuration_invalid "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
+        ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 "configuration_invalid: write ops require managed task-config (run: su-scheduler task-config import)" "write ops require managed task-config (run: su-scheduler task-config import)"; return 0; }
     [ -n "$ipcv_id" ] && [ -n "$ipcv_payload" ] || {
-        ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 1 invalid_request "missing id/payload"; return 0; }
-    tcfg_apply_task "$ipcv_id" "$ipcv_payload"
+        ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 1 "invalid_request: missing id/payload" "missing id/payload"; return 0; }
+    # P6-04：捕获校验器 stderr 首个字段级原因，透传进 configuration_invalid
+    mkdir -p "$ipcv_base/ipc" 2>/dev/null
+    ipcv_ef="$ipcv_base/ipc/.valerr.$$_e"
+    tcfg_apply_task "$ipcv_id" "$ipcv_payload" 2>"$ipcv_ef"
     ipcv_arc=$?
     case "$ipcv_arc" in
         0)
+            rm -f "$ipcv_ef" 2>/dev/null
             sched_reload "$ipcv_base" "$ipcv_config" >/dev/null 2>&1
             ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 0 ok "saved $ipcv_id" ;;
-        1) ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 configuration_invalid "task invalid (config unchanged)" ;;
-        *) ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 configuration_invalid "write failed" ;;
+        1)
+            ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 "configuration_invalid: $(cat "$ipcv_ef" 2>/dev/null)" "task invalid (config unchanged)"
+            rm -f "$ipcv_ef" 2>/dev/null ;;
+        *)
+            rm -f "$ipcv_ef" 2>/dev/null
+            ipc_respond "$ipcv_base" "$ipcv_rid" EDIT_TASK 4 "configuration_invalid: write failed" "write failed" ;;
     esac
     return 0
 }
@@ -5798,8 +5886,9 @@ secv_sweep_tmp() {
         [ -e "$secv_f" ] && rm -f "$secv_f" 2>/dev/null
     done
     for secv_d in "$(ipc_dir "$secv_base")"/.validate.* \
-                  "$(ipc_dir "$secv_base")"/.create.*; do
-        [ -d "$secv_d" ] && rm -rf "$secv_d" 2>/dev/null
+                  "$(ipc_dir "$secv_base")"/.create.* \
+                  "$(ipc_dir "$secv_base")"/.valerr.*; do   # P6-04：校验诊断捕获文件兜底
+        [ -e "$secv_d" ] && rm -rf "$secv_d" 2>/dev/null
     done
     if tcfg_is_managed 2>/dev/null; then
         for secv_f in "$(tcfg_dir)"/*.tmp.*; do

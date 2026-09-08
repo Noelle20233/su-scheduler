@@ -4,8 +4,8 @@
 # ═══════════════════════════════════════════════════════════════════════════
 # 判定（AGENTS §4）：每项 [PASS]/[FAIL]；出现 [FAIL] → exit 非 0。
 # 本套件为 **P6-01 复现套件**：O-2/O-3/O-4 三个断言在 P6-01 基线代码上
-# 应当 [FAIL]（证明缺陷存在、可复现）。P6-02 已修复 O-2、P6-03 已修复 O-3
-# （对应断言转 [PASS]）；O-4 仍应为 [FAIL]（P6-04 范畴）。
+# 应当 [FAIL]（证明缺陷存在、可复现）。P6-02 已修复 O-2、P6-03 已修复 O-3、
+# P6-04 已修复 O-4（对应断言均已转 [PASS]）。
 # 套件不修改任何生产文件，只读 source Runtime 库（`. ./$RTLIB`，TCFG_DIR /
 # TR_BASE 均以临时目录隔离）。
 #
@@ -27,6 +27,8 @@
 #   §P6-02  主循环跳拍补偿（P6-02 修复）新增覆盖（P6-02-1..5）。
 #   §P6-03  Cron Task ID 稳定派生（P6-03 修复 tcfg_new_id sanitize）新增覆盖
 #          （P6-03-1..5：cron 字符集/确定性/旧 ID golden/穿越防御/端到端）。
+#   §P6-04  IPC 错误原因透传（P6-04 修复 ipc_err_sanitize/字段级 reason）新增
+#          覆盖（P6-04-1..6：字段区分/协议完整性/长度限制/脱敏/编码层级/错误码兼容）。
 #   §posix  dash -n system/bin/su-scheduler-runtime。
 # ═══════════════════════════════════════════════════════════════════════════
 set -u
@@ -518,6 +520,233 @@ else
     bad "P6-03-5: 端到端 cron 任务创建失败 $(grep 'P63_5=' "$P63_5/out.txt" | head -1)"
 fi
 
+# ═══════════════════════════════════════════════════════════════════════════
+# §P6-04 IPC 错误原因透传（捕获→字段化→去 `|`/换行→截断→脱敏）新增覆盖
+# 修复（P6-04）：ipc_* 处理函数 configuration_invalid/invalid_request 的响应
+# 首行第 4 段（ERROR 字段）由笼统符号升级为「符号: 字段级原因」（校验器 stderr
+# 捕获），并经 ipc_err_sanitize 净化：单行、无 `|`、≤256 字符（超长
+# `...(truncated)`）、daemon base / TCFG_DIR 具体值 / `/data/adb` → `<path>`。
+# 每项独立子 shell，写 out 后父层断言。P6-04-5/6 为守卫性（编码层级/错误码
+# 兼容，修复前后均 PASS 亦可）。
+# ═══════════════════════════════════════════════════════════════════════════
+P64_D="$T/p64"; mkdir -p "$P64_D"
+
+# ── P6-04-1 字段区分：5 类非法输入返回互不相同的字段级 reason（错误码恒 4）──
+# 修复前：5 者第 4 段全部 = 笼统 "configuration_invalid" → BAD（复现 O-4）
+P64_1="$P64_D/fields"; mkdir -p "$P64_1"
+(
+    export TCFG_DIR="$P64_1/tsks"; mkdir -p "$TCFG_DIR"
+    B="$P64_1/base"; mkdir -p "$B"
+    . "$PWD/$RTLIB"
+    ipc_server_init "$B" >/dev/null 2>&1
+    f4() { head -1 "$B/ipc/responses/$1.resp" 2>/dev/null | cut -d'|' -f4; }
+    f3() { head -1 "$B/ipc/responses/$1.resp" 2>/dev/null | cut -d'|' -f3; }
+    # ① 缺 command（trigger+command 通道）
+    ipc_op_validate "$B" "f_a" "trigger=$(ipc_b64enc '09:00')"
+    # ② command 多行
+    ipc_op_validate "$B" "f_b" "trigger=$(ipc_b64enc '09:00')&command=$(ipc_b64enc "$(printf 'echo a\necho b')")"
+    # ③ trigger 非法（payload 通道）④ recovery 字段非法 ⑤ dependency 字段非法
+    ipc_op_validate "$B" "f_c" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=f_c\ntrigger=oneshot:2460\naction.command=echo x\n')")"
+    ipc_op_validate "$B" "f_d" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=f_d\ntrigger=08:30\naction.command=echo x\nrecovery.type=script\n')")"
+    ipc_op_validate "$B" "f_e" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=f_e\ntrigger=08:30\naction.command=echo x\ndependency=!!!\n')")"
+    ra=$(f4 f_a); rb=$(f4 f_b); rc=$(f4 f_c); rd=$(f4 f_d); re=$(f4 f_e)
+    fails=0
+    for r in f_a f_b f_c f_d f_e; do [ "$(f3 "$r")" = "4" ] || fails=$((fails + 1)); done
+    for e in "$ra" "$rb" "$rc" "$rd" "$re"; do
+        case "$e" in "task invalid"|"configuration_invalid"|"") fails=$((fails + 1)) ;; esac
+    done
+    [ "$ra" != "$rb" ] || fails=$((fails + 1))
+    [ "$ra" != "$rc" ] || fails=$((fails + 1))
+    [ "$ra" != "$rd" ] || fails=$((fails + 1))
+    [ "$ra" != "$re" ] || fails=$((fails + 1))
+    [ "$rb" != "$rc" ] || fails=$((fails + 1))
+    [ "$rb" != "$rd" ] || fails=$((fails + 1))
+    [ "$rb" != "$re" ] || fails=$((fails + 1))
+    [ "$rc" != "$rd" ] || fails=$((fails + 1))
+    [ "$rc" != "$re" ] || fails=$((fails + 1))
+    [ "$rd" != "$re" ] || fails=$((fails + 1))
+    case "$ra" in *"trigger+command required"*) ;; *) fails=$((fails + 1)) ;; esac
+    case "$rb" in *single-line*) ;; *) fails=$((fails + 1)) ;; esac
+    case "$rc" in *trigger*) ;; *) fails=$((fails + 1)) ;; esac
+    case "$rd" in *recovery*) ;; *) fails=$((fails + 1)) ;; esac
+    case "$re" in *dependency*) ;; *) fails=$((fails + 1)) ;; esac
+    if [ "$fails" -eq 0 ]; then echo "P64_1=OK"; else
+        echo "P64_1=BAD fails=$fails"
+        echo "  ra=[$ra]"; echo "  rb=[$rb]"; echo "  rc=[$rc]"; echo "  rd=[$rd]"; echo "  re=[$re]"
+    fi
+) > "$P64_1/out.txt" 2>&1
+if grep -q '^P64_1=OK' "$P64_1/out.txt"; then
+    ok "P6-04-1: 缺command/command多行/trigger非法/recovery非法/dependency非法 五类 reason 互不相同且含字段关键词（rc 恒 4）"
+else
+    bad "P6-04-1: 字段级 reason 区分不足 $(grep -o 'fails=[0-9]*' "$P64_1/out.txt" | head -1)"
+fi
+
+# ── P6-04-2 协议完整性：reason 无换行/无 `|`，响应恒为四段单行首行 ─────────
+# 特殊字符字段值（`|`）与多行 stderr（未知键+非法 trigger 两错）均不得产生
+# 第二行伪响应/破坏 REQ_ID|OP|RC|ERROR 四段。修复前 f4=configuration_invalid
+# 不含净化后的字段值（aa/bb / unknown key）→ BAD。
+P64_2="$P64_D/proto"; mkdir -p "$P64_2"
+(
+    export TCFG_DIR="$P64_2/tsks"; mkdir -p "$TCFG_DIR"
+    B="$P64_2/base"; mkdir -p "$B"
+    . "$PWD/$RTLIB"
+    ipc_server_init "$B" >/dev/null 2>&1
+    ipc_op_validate "$B" "g_pipe" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=g_pipe\ntrigger=08:30\naction.command=echo x\ndependency=aa|bb\n')")"
+    ipc_op_validate "$B" "g_multi" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=g_multi\nbogus.key=1\ntrigger=oneshot:9999\naction.command=echo x\n')")"
+    fails=0
+    for r in g_pipe g_multi; do
+        nf=$(head -1 "$B/ipc/responses/$r.resp" 2>/dev/null | awk -F"|" "{print NF}")
+        [ "$nf" = "4" ] || fails=$((fails + 1))
+        ln=$(wc -l < "$B/ipc/responses/$r.resp" 2>/dev/null)
+        [ "$ln" = "2" ] || fails=$((fails + 1))     # 首行 + 载荷行，无伪响应行
+        ridlines=$(grep -c "^$r|" "$B/ipc/responses/$r.resp" 2>/dev/null)
+        [ "$ridlines" = "1" ] || fails=$((fails + 1))
+    done
+    e1=$(head -1 "$B/ipc/responses/g_pipe.resp" | cut -d'|' -f4)
+    case "$e1" in *"aa/bb"*) ;; *) fails=$((fails + 1)) ;; esac     # `|`→`/` 净化
+    e2=$(head -1 "$B/ipc/responses/g_multi.resp" | cut -d'|' -f4)
+    case "$e2" in *"unknown key"*) ;; *) fails=$((fails + 1)) ;; esac  # 多行 stderr 取首行诊断
+    if [ "$fails" -eq 0 ]; then echo "P64_2=OK"; else
+        echo "P64_2=BAD fails=$fails"; echo "  e1=[$e1]"; echo "  e2=[$e2]"
+    fi
+) > "$P64_2/out.txt" 2>&1
+if grep -q '^P64_2=OK' "$P64_2/out.txt"; then
+    ok "P6-04-2: 含 |/多行诊断的 reason 不破协议（首行四段、无伪响应行、| 归一）"
+else
+    bad "P6-04-2: 协议完整性异常 $(grep 'P64_2=' "$P64_2/out.txt" | head -1)"
+fi
+
+# ── P6-04-3 长度限制：超长非法输入 → reason ≤256 且含截断标记 ──────────────
+P64_3="$P64_D/length"; mkdir -p "$P64_3"
+(
+    export TCFG_DIR="$P64_3/tsks"; mkdir -p "$TCFG_DIR"
+    B="$P64_3/base"; mkdir -p "$B"
+    . "$PWD/$RTLIB"
+    ipc_server_init "$B" >/dev/null 2>&1
+    BIG=$(printf 'x%.0s' $(seq 1 1000))
+    ipc_op_validate "$B" "g_len" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=g_len\ntrigger=%s\naction.command=echo x\n' "$BIG")")"
+    e=$(head -1 "$B/ipc/responses/g_len.resp" 2>/dev/null | cut -d'|' -f4)
+    len=${#e}
+    oklen=0; [ "$len" -le "$IPC_ERR_MAX" ] && oklen=1
+    case "$e" in *"(truncated)"*) trunc=yes ;; *) trunc=no ;; esac
+    [ "$trunc" = "yes" ] || oklen=0
+    rc=$(head -1 "$B/ipc/responses/g_len.resp" | cut -d'|' -f3)
+    if [ "$oklen" = "1" ] && [ "$rc" = "4" ]; then
+        echo "P64_3=OK len=$len"
+    else
+        echo "P64_3=BAD len=$len trunc=$trunc rc=$rc"
+    fi
+) > "$P64_3/out.txt" 2>&1
+if grep -q '^P64_3=OK' "$P64_3/out.txt"; then
+    ok "P6-04-3: 1000 字符非法 trigger → reason ≤256 且带 ...\(truncated\) 标记 ($(grep -o 'len=[0-9]*' "$P64_3/out.txt" | head -1))"
+else
+    bad "P6-04-3: 长度限制异常 $(grep 'P64_3=' "$P64_3/out.txt" | head -1)"
+fi
+
+# ── P6-04-4 脱敏：reason 不含 /data/adb 字面量、TCFG_DIR/base 具体值 ───────
+# 修复前 f4=configuration_invalid 不含字段关键词无法判定诊断来源 → BAD。
+P64_4="$P64_D/redact"; mkdir -p "$P64_4"
+(
+    export TCFG_DIR="$P64_4/tsks"; mkdir -p "$TCFG_DIR"
+    B="$P64_4/base"; mkdir -p "$B"
+    . "$PWD/$RTLIB"
+    ipc_server_init "$B" >/dev/null 2>&1
+    # ① recovery.script 指向 /data/adb（存在即泄露字面量）② condition 含 TCFG_DIR 值
+    ipc_op_validate "$B" "h_db" "payload=$(ipc_b64enc "$(printf 'schema_version=2\nid=h_db\ntrigger=08:30\naction.command=echo x\nrecovery.type=script\nrecovery.script=/data/adb/su-scheduler/secret.sh\n')")"
+    ipc_op_validate "$B" "h_td" "payload=$(ipc_b64enc "$(printf "schema_version=2\nid=h_td\ntrigger=08:30\naction.command=echo x\ncondition=file.exists(%s/nope) junk\n" "$TCFG_DIR")")"
+    e1=$(head -1 "$B/ipc/responses/h_db.resp" 2>/dev/null | cut -d'|' -f4)
+    e2=$(head -1 "$B/ipc/responses/h_td.resp" 2>/dev/null | cut -d'|' -f4)
+    fails=0
+    case "$e1" in *recovery*) ;; *) fails=$((fails + 1)) ;; esac
+    case "$e1" in *"/data/adb"*|*"<path>"*) ;; *) fails=$((fails + 1)) ;; esac
+    [ "${e1#*/data/adb}" = "$e1" ] || fails=$((fails + 1))
+    case "$e2" in *condition*) ;; *) fails=$((fails + 1)) ;; esac
+    [ "${e2#*$TCFG_DIR}" = "$e2" ] || fails=$((fails + 1))
+    [ "${e1#*$B}" = "$e1" ] || fails=$((fails + 1)); [ "${e2#*$B}" = "$e2" ] || fails=$((fails + 1))
+    if [ "$fails" -eq 0 ]; then echo "P64_4=OK"; else echo "P64_4=BAD fails=$fails"; echo "  e1=[$e1]"; echo "  e2=[$e2]"; fi
+) > "$P64_4/out.txt" 2>&1
+if grep -q '^P64_4=OK' "$P64_4/out.txt"; then
+    ok "P6-04-4: reason 脱敏（无 /data/adb 字面量、无 TCFG_DIR/base 具体值，内部路径→<path>）"
+else
+    bad "P6-04-4: 脱敏异常 $(grep 'P64_4=' "$P64_4/out.txt" | head -1)"
+fi
+
+# ── P6-04-5 单编码层级（守卫）：ERROR 明文非 base64 壳；请求单层 b64 不变 ──
+P64_5="$P64_D/encoding"; mkdir -p "$P64_5"
+(
+    export TCFG_DIR="$P64_5/tsks"; mkdir -p "$TCFG_DIR"; echo managed > "$TCFG_DIR/MANAGED"
+    B="$P64_5/base"; mkdir -p "$B"
+    . "$PWD/$RTLIB"
+    ipc_server_init "$B" >/dev/null 2>&1
+    fails=0
+    ipc_op_validate "$B" "k_err" "trigger=$(ipc_b64enc '09:00')"
+    e=$(head -1 "$B/ipc/responses/k_err.resp" 2>/dev/null | cut -d'|' -f4)
+    case "$e" in "configuration_invalid: "*) ;; *) fails=$((fails + 1)) ;; esac   # 明文可读
+    b64only=$(printf '%s' "$e" | tr -d 'A-Za-z0-9+/=' | wc -c | tr -d ' ')
+    [ "$b64only" -gt 0 ] || fails=$((fails + 1))    # 含空格/冒号 → 非纯 base64 壳
+    # 请求参数单层 b64（解码一次即明文）——既有编码链不变
+    v=$(ipc_param "trigger=$(ipc_b64enc '09:00')" trigger)
+    [ "$v" = "09:00" ] || fails=$((fails + 1))
+    # GET_TASK_EDIT 载荷仍为单层 b64（载荷通道编码不变，ERROR 通道不走 b64）
+    tcfg_new_task k_t1 08:30 "echo x" >/dev/null 2>&1
+    ipc_op_get_task_edit "$B" "k_edit" k_t1
+    p2=$(sed -n '2p' "$B/ipc/responses/k_edit.resp" 2>/dev/null)
+    printf '%s\n' "$(ipc_b64dec "$p2")" | grep -q '^id=k_t1$' || fails=$((fails + 1))
+    if [ "$fails" -eq 0 ]; then echo "P64_5=OK"; else echo "P64_5=BAD fails=$fails e=[$e]"; fi
+) > "$P64_5/out.txt" 2>&1
+if grep -q '^P64_5=OK' "$P64_5/out.txt"; then
+    ok "P6-04-5: ERROR 字段明文直读（非 base64 壳）；请求单层 b64 / EDIT 载荷单层 b64 不变（零双编码）"
+else
+    bad "P6-04-5: 编码层级守卫异常 $(grep 'P64_5=' "$P64_5/out.txt" | head -1)"
+fi
+
+# ── P6-04-6 错误码兼容（守卫）：既有关键字符串/6 错误码触发路径不变 ───────
+# 修复前后均应 PASS：载荷行（响应第 2 行）保留锁定字符串；2/3/5/6 触发路径未动。
+P64_6="$P64_D/compat"; mkdir -p "$P64_6"
+(
+    export TCFG_DIR="$P64_6/tsks"; mkdir -p "$TCFG_DIR"     # 无 MANAGED → legacy
+    B="$P64_6/base"; mkdir -p "$B"
+    CFG="$P64_6/config.txt"; TASKS="$P64_6/tasks"; mkdir -p "$TASKS"
+    . "$PWD/$RTLIB"
+    ipc_server_init "$B" >/dev/null 2>&1
+    fails=0
+    ipc_op_validate "$B" "m_a" "trigger=$(ipc_b64enc '09:00')"
+    [ "$(sed -n '2p' "$B/ipc/responses/m_a.resp")" = "trigger+command required" ] || fails=$((fails + 1))
+    ipc_op_validate "$B" "m_b" "trigger=$(ipc_b64enc '09:00')&command=$(ipc_b64enc "$(printf 'echo a\necho b')")"
+    [ "$(sed -n '2p' "$B/ipc/responses/m_b.resp")" = "command must be single-line" ] || fails=$((fails + 1))
+    ipc_op_create "$B" "$CFG" "m_c" "trigger=$(ipc_b64enc '09:00')&command=$(ipc_b64enc 'echo x')"
+    [ "$(head -1 "$B/ipc/responses/m_c.resp" | cut -d'|' -f3)" = "4" ] \
+        && [ "$(sed -n '2p' "$B/ipc/responses/m_c.resp")" = "write ops require managed task-config (run: su-scheduler task-config import)" ] \
+        || fails=$((fails + 1))
+    ipc_op_get_status "$B" "$TASKS" "m_d" ghost
+    line=$(head -1 "$B/ipc/responses/m_d.resp")
+    [ "$(printf '%s' "$line" | cut -d'|' -f3)" = "3" ] && [ "$(printf '%s' "$line" | cut -d'|' -f4)" = "task_not_found" ] || fails=$((fails + 1))
+    # dispatch 层：未知键 → rc1 且 invalid_request 前缀仍在
+    printf '%s\n' "m_e|START_TASK|command=$(ipc_b64enc 'echo x')" > "$B/ipc/requests/m_e.req"
+    ipc_server_poll "$B" "$CFG" "$TASKS" >/dev/null 2>&1
+    head -1 "$B/ipc/responses/m_e.resp" | grep -q invalid_request || fails=$((fails + 1))
+    # daemon_unavailable（rc6）：无 daemon.pid
+    rm -f "$B/ipc/daemon.pid"
+    out=$(ipc_client_send "$B" GET_TASKS "" 1 2>/dev/null); rc=$?
+    [ "$rc" -eq 6 ] && printf '%s' "$out" | grep -q daemon_unavailable || fails=$((fails + 1))
+    # permission_denied（rc2）：requests 目录不可写（非 root）
+    echo "$$" > "$B/ipc/daemon.pid"
+    chmod 500 "$B/ipc/requests"
+    out=$(ipc_client_send "$B" GET_TASKS "" 1 2>/dev/null); rc=$?
+    chmod 700 "$B/ipc/requests"
+    [ "$rc" -eq 2 ] && printf '%s' "$out" | grep -q permission_denied || fails=$((fails + 1))
+    # operation_timeout（rc5）：pid 存活但无轮询者
+    out=$(ipc_client_send "$B" GET_TASKS "" 1 2>/dev/null); rc=$?
+    [ "$rc" -eq 5 ] && printf '%s' "$out" | grep -q operation_timeout || fails=$((fails + 1))
+    rm -f "$B/ipc/requests"/*.req 2>/dev/null
+    if [ "$fails" -eq 0 ]; then echo "P64_6=OK"; else echo "P64_6=BAD fails=$fails"; fi
+) > "$P64_6/out.txt" 2>&1
+if grep -q '^P64_6=OK' "$P64_6/out.txt"; then
+    ok "P6-04-6: 锁定字符串仍在载荷行；invalid_request/task_not_found/permission_denied/operation_timeout/daemon_unavailable 路径不变"
+else
+    bad "P6-04-6: 错误码兼容守卫异常 $(grep 'P64_6=' "$P64_6/out.txt" | head -1)"
+fi
+
 # ── §posix dash -n ────────────────────────────────────────────────────────
 if command -v dash >/dev/null 2>&1; then
     dash -n "$PWD/$RTLIB" 2>/dev/null && ok "P6-01 POSIX: dash -n ok (runtime)" || bad "P6-01 POSIX: dash -n failed"
@@ -527,5 +756,5 @@ fi
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
-echo "p6-reliability tests: PASS=$PASS FAIL=$FAIL  (O-3 已由 P6-03 修复转 PASS；O-4 FAIL 属预期复现，P6-04 范畴)"
+echo "p6-reliability tests: PASS=$PASS FAIL=$FAIL  (O-2/O-3/O-4 已由 P6-02/03/04 修复转 PASS；§P6-04 错误原因透传覆盖)"
 [ "$FAIL" -eq 0 ] && exit 0 || exit 1

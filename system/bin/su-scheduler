@@ -1477,7 +1477,9 @@ cmd_webui() {
     if [ "$rc" -ne 0 ]; then
         err=$(printf '%s\n' "$resp" | head -1 | cut -d'|' -f4)
         [ -n "$err" ] || err="operation_failed"
-        printf '{"ok":false,"rc":%s,"error":"%s"}\n' "$rc" "$err"
+        # P6-04：ERROR 字段经 web_json_str 转义后入 JSON（引号/反斜杠/控制符/
+        # < > &）；纯 ASCII 符号错误输出与旧版逐字节一致。
+        printf '{"ok":false,"rc":%s,"error":%s}\n' "$rc" "$(web_json_str "$err")"
         return "$rc"
     fi
     # rc 0：去掉响应首行（REQ_ID|OP|RC|ERROR），保留 payload
