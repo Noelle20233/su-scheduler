@@ -5035,6 +5035,250 @@ obs_cond_state() {
     esac
     return 0
 }
+# ── P6-08（D58/B8）DAG/链可观测只读聚合 ────────────────────────────────────
+# 只增键：GET_SUMMARY.dag / GET_TASK_DETAIL.dag；零新 IPC op（B7）；零 exec、
+# 零写盘。数据源 = §27 账本（$base/dag/<chain>/runs/<token>/run.txt），解析复用
+# 引擎 dag_run_parse（同一套 corrupt/id/token 门；不猜态）。有界性：链目录 ×
+# DAG_RUNS_KEEP 由引擎 prune 保证；聚合侧另有 WEBUI_DAG_CHAINS_MAX 展示钳。
+# 注入面（恶意 run.txt 字段）：id 已由 dag_run_parse 过 secv_id_ok（字面输出安全）；
+# 状态值经枚举白名单归一（白名单外 → UNKNOWN）；note/created 之外的任意串一律经
+# web_json_str 转义（展示是数据不是执行）。
+WEBUI_DAG_CHAINS_MAX=${WEBUI_DAG_CHAINS_MAX:-64}
+web_dag_state_norm() {   # <raw> → TSM 11 态 ∪ {PENDING} 白名单原样；其余 UNKNOWN
+    case "$1" in
+        DISABLED|PENDING|WAITING|STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|FAILED|STOPPING|STOPPED) echo "$1" ;;
+        *) echo UNKNOWN ;;
+    esac
+}
+# 链展示 run 选择：state ∈ {PENDING,RUNNING} 的最新 run 优先（进行中），否则最新
+# token（RUNS 史最近一轮）。结果置全局 webv_dagr_*（token/state/created/rootline/
+# lines）；无有效 run（含全部 corrupt/非法目录）→ rc 1。
+# 性能：候选态一次 grep -m1 批量预读（arg 序=glob 字典序），按优先级（进行中最新
+# → 全 token 降序）逐个 dag_run_parse（引擎同门），首个通过者即展示 run——正常
+# 情形 1 次解析；外部伪造最新目录只多试一跳。
+web_dag_pick_run() {   # <base> <chain>
+    webv_dagpr=$(dag_runs_dir "$1" "$2")
+    [ -d "$webv_dagpr" ] || return 1
+    webv_dagptoks=""; webv_dagpact=""
+    webv_dagpst_all=$(grep -H -m1 '^state=' "$webv_dagpr"/*/run.txt 2>/dev/null)
+    while IFS= read -r webv_dagpl; do
+        [ -n "$webv_dagpl" ] || continue
+        webv_dagptk=${webv_dagpl%%:*}
+        webv_dagptk=${webv_dagptk%/run.txt}
+        webv_dagptk=${webv_dagptk##*/}
+        dag_token_ok "$webv_dagptk" || continue
+        webv_dagptoks="$webv_dagptoks $webv_dagptk"
+        case "$webv_dagpl" in *'=PENDING'|*'=RUNNING') webv_dagpact="$webv_dagptk" ;; esac
+    done <<EOF
+$webv_dagpst_all
+EOF
+    # dash/mksh：`while IFS= read` 的前缀赋值随特殊内建**持续生效**（bash 不），
+    # 显式恢复空格 IFS 再进入分词循环（否则 $webv_dagptoks 不分词）。
+    IFS=" 	
+"
+    [ -n "$webv_dagptoks" ] || return 1
+    webv_dagprev=""
+    for webv_dagpt in $webv_dagptoks; do
+        webv_dagprev="$webv_dagpt $webv_dagprev"
+    done
+    webv_dagpcands=""
+    [ -n "$webv_dagpact" ] && webv_dagpcands="$webv_dagpact"
+    for webv_dagpt in $webv_dagprev; do
+        [ "$webv_dagpt" = "$webv_dagpact" ] && continue
+        webv_dagpcands="$webv_dagpcands $webv_dagpt"
+    done
+    for webv_dagpc in $webv_dagpcands; do
+        if dag_run_parse "$(dag_run_dir "$1" "$2" "$webv_dagpc")/run.txt" "$2" "$webv_dagpc"; then
+            webv_dagr_token="$webv_dagpc"
+            webv_dagr_state="$dgv_rstate"
+            webv_dagr_created="$dgv_created"
+            webv_dagr_rootline="$dgv_rootline"
+            webv_dagr_lines="$dgv_lines"
+            return 0
+        fi
+    done
+    return 1
+}
+# 已选 run（webv_dagr_*）的节点账本 → 结果全局 webv_dagj_nodes / webv_dagj_frontier /
+#   webv_dagj_done / webv_dagj_total。进度口径 done/total = 账本行（root 行 +
+#   成员行）中记录态 ∈ {STOPPED,FAILED} 者 / 全部行；frontier = note 含 disp
+#   且未落终态（已派发未落地=在途）的成员 id。
+# 零 fork 快路径（GET_SUMMARY 每 5s 轮询 × 链数 × ≤32 行）：id 已过 secv_id_ok
+#   字面安全；态经枚举白名单内联归一（白名单外 → UNKNOWN）；note 仅含安全字符集
+#   （字母数字 . _ : + -）时字面输出，其余（含空格/引号/尖括号/&/控制符）一律
+#   web_json_escape（→ \"、\u003c…）。
+web_dag_run_json() {
+    webv_dagj_nodes=""; webv_dagj_frontier=""; webv_dagj_done=0; webv_dagj_total=0
+    webv_dagr_rid=""; webv_dagr_rst=""; webv_dagr_rat=""
+    # 单次 read（重定向组）：while 会在 EOF 第二次 read 清空变量（bash/dash 同行为）
+    { IFS='|' read -r webv_dagr_rid webv_dagr_rst webv_dagr_rat || :; } <<EOF
+$webv_dagr_rootline
+EOF
+    secv_id_ok "$webv_dagr_rid" || return 1
+    case "$webv_dagr_rat" in ''|*[!0-9]*) webv_dagr_rat=0 ;; esac
+    webv_dagj_total=1
+    webv_dagr_rn=UNKNOWN
+    case "$webv_dagr_rst" in DISABLED|PENDING|WAITING|STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|FAILED|STOPPING|STOPPED) webv_dagr_rn=$webv_dagr_rst ;; esac
+    case "$webv_dagr_rn" in STOPPED|FAILED) webv_dagj_done=1 ;; esac
+    webv_dagj_nodes="{\"id\":\"$webv_dagr_rid\",\"role\":\"root\",\"state\":\"$webv_dagr_rn\",\"note\":\"$webv_dagr_rat\"}"
+    while IFS='|' read -r webv_dagm_id webv_dagm_trig webv_dagm_st webv_dagm_note; do
+        [ -n "$webv_dagm_id" ] || continue
+        secv_id_ok "$webv_dagm_id" || continue   # 防御：账本已门，双保险
+        webv_dagj_total=$((webv_dagj_total + 1))
+        webv_dagm_nst=UNKNOWN
+        case "$webv_dagm_st" in DISABLED|PENDING|WAITING|STARTING|RUNNING|HEALTHY|UNHEALTHY|RECOVERING|FAILED|STOPPING|STOPPED) webv_dagm_nst=$webv_dagm_st ;; esac
+        case "$webv_dagm_nst" in STOPPED|FAILED) webv_dagj_done=$((webv_dagj_done + 1)) ;; esac
+        webv_dagm_json=$webv_dagm_note
+        case "$webv_dagm_note" in
+            *[!A-Za-z0-9._:+-]*) webv_dagm_json=$(web_json_escape "$webv_dagm_note") ;;
+        esac
+        webv_dagj_nodes="$webv_dagj_nodes,{\"id\":\"$webv_dagm_id\",\"role\":\"node\",\"state\":\"$webv_dagm_nst\",\"note\":\"$webv_dagm_json\"}"
+        case " $webv_dagm_note " in *" disp "*)
+            case "$webv_dagm_nst" in STOPPED|FAILED) : ;;
+                *) webv_dagj_frontier="$webv_dagj_frontier${webv_dagj_frontier:+,}\"$webv_dagm_id\"" ;;
+            esac ;;
+        esac
+    done <<EOF
+$webv_dagr_lines
+EOF
+    return 0
+}
+# GET_SUMMARY.dag（D58 只增键 + 链进度投影）：
+#   { active, limit, recent_failed, chains:[ {root, run, run_state, created,
+#     done, total, frontier[], nodes[]} ], audit[] }
+#   active = 全局 PENDING/RUNNING run 数（复用引擎 dag_active_runs 同一口径）；
+#   limit = DAG_RUNS_MAX；recent_failed = 保留史（RUNS_KEEP 窗口）中 state=FAILED
+#   的 run 数（按 run.txt 文件计）；chains 按目录名字典序，≤ WEBUI_DAG_CHAINS_MAX。
+web_dag_summary_json() {   # <base> → stdout 单对象 JSON
+    webv_dags_active=$(dag_active_runs "$1")
+    webv_dags_failed=$(grep -lE '^state=FAILED$' "$1"/dag/*/runs/*/run.txt 2>/dev/null | wc -l | tr -d ' ')
+    case "$webv_dags_failed" in ''|*[!0-9]*) webv_dags_failed=0 ;; esac
+    webv_dags_arr=""; webv_dags_sep=""; webv_dags_n=0
+    for webv_dags_cd in "$1"/dag/*/; do
+        [ -d "$webv_dags_cd" ] || continue
+        webv_dags_c=${webv_dags_cd%/}
+        webv_dags_c=${webv_dags_c##*/}
+        secv_id_ok "$webv_dags_c" || continue     # 非法链目录：不读不出（id 门）
+        [ "$webv_dags_n" -lt "$WEBUI_DAG_CHAINS_MAX" ] 2>/dev/null || break
+        web_dag_pick_run "$1" "$webv_dags_c" || continue
+        web_dag_run_json || continue
+        webv_dags_n=$((webv_dags_n + 1))
+        webv_dags_created="$webv_dagr_created"
+        case "$webv_dags_created" in ''|*[!0-9]*) webv_dags_created="" ;; esac
+        webv_dags_arr="$webv_dags_arr$webv_dags_sep{\"root\":\"$webv_dags_c\",\"run\":\"$webv_dagr_token\",\"run_state\":\"$webv_dagr_state\",\"created\":\"$webv_dags_created\",\"done\":$webv_dagj_done,\"total\":$webv_dagj_total,\"frontier\":[$webv_dagj_frontier],\"nodes\":[$webv_dagj_nodes]}"
+        webv_dags_sep=","
+    done
+    # 链审计尾读（§27 审计落 $base/scheduler/audit.log，非 daemon 主日志）：
+    # 最近 ≤10 行 op=dag（tail 有界预筛 200 行；逐行 web_json_str 转义）。
+    webv_dagaud="[]"
+    webv_dagau=$(tail -n 200 "$1/scheduler/audit.log" 2>/dev/null | grep 'op=dag|' | tail -n 10)
+    if [ -n "$webv_dagau" ]; then
+        webv_daga_sep=""
+        webv_dagarr=""
+        while IFS= read -r webv_dagl; do
+            [ -n "$webv_dagl" ] || continue
+            webv_dagarr="$webv_dagarr$webv_daga_sep$(web_json_str "$webv_dagl")"
+            webv_daga_sep=","
+        done <<EOF
+$webv_dagau
+EOF
+        webv_dagaud="[$webv_dagarr]"
+    fi
+    printf '{"active":%s,"limit":%s,"recent_failed":%s,"chains":[%s],"audit":%s}' \
+        "$webv_dags_active" "$DAG_RUNS_MAX" "$webv_dags_failed" "$webv_dags_arr" "$webv_dagaud"
+    return 0
+}
+# 链 run 历史（GET_TASK_DETAIL.dag.runs，最新在前，≤DAG_RUNS_KEEP）：
+#   [{run, run_state, created, done, total}]
+web_dag_history_json() {   # <base> <chain> → stdout 数组 JSON
+    webv_dagh_dir=$(dag_runs_dir "$1" "$2")
+    [ -d "$webv_dagh_dir" ] || { echo "[]"; return 0; }
+    webv_dagh_all=""
+    for webv_dagh_d in "$webv_dagh_dir"/*/; do
+        [ -d "$webv_dagh_d" ] || continue
+        webv_dagh_tk=${webv_dagh_d%/}
+        webv_dagh_tk=${webv_dagh_tk##*/}
+        webv_dagh_all="$webv_dagh_all
+$webv_dagh_tk"
+    done
+    webv_dagh_arr=""; webv_dagh_n=0
+    # 字典序=时间序：awk 单遍保序反转（最新在前），钳至 DAG_RUNS_KEEP
+    while IFS= read -r webv_dagh_tk; do
+        [ -n "$webv_dagh_tk" ] || continue
+        [ "$webv_dagh_n" -lt "$DAG_RUNS_KEEP" ] 2>/dev/null || break
+        dag_token_ok "$webv_dagh_tk" || continue
+        dag_run_parse "$(dag_run_dir "$1" "$2" "$webv_dagh_tk")/run.txt" "$2" "$webv_dagh_tk" || continue
+        webv_dagr_state="$dgv_rstate"; webv_dagr_created="$dgv_created"
+        webv_dagr_rootline="$dgv_rootline"; webv_dagr_lines="$dgv_lines"
+        web_dag_run_json || continue
+        case "$webv_dagr_created" in ''|*[!0-9]*) webv_dagr_created="" ;; esac
+        webv_dagh_n=$((webv_dagh_n + 1))
+        webv_dagh_arr="$webv_dagh_arr{\"run\":\"$webv_dagh_tk\",\"run_state\":\"$webv_dagr_state\",\"created\":\"$webv_dagr_created\",\"done\":$webv_dagj_done,\"total\":$webv_dagj_total},"
+    done <<EOF
+$(printf '%s\n' "$webv_dagh_all" | awk 'NF {a[++n]=$0} END {for (i=n; i>=1; i--) print a[i]}')
+EOF
+    printf '[%s]' "${webv_dagh_arr%,}"
+    return 0
+}
+# GET_TASK_DETAIL.dag（D58 只增键 + 节点/历史投影）：
+#   { chain_root, role(root|node|''), run, run_state, node_state, note, reason,
+#     runs[] }
+# 归属判定以**账本**为事实源（链目录名=根 id，D47）：root=存在本链目录；
+# node=出现在某链展示 run 账本成员行；trigger=chain 但尚无账本 → role=node、
+# chain_root=''（未点火，运行态无从可观测）。多根共享节点取字典序首个链（v1 口径）。
+# reason：note 含 gate-fail 时读节点 gate.fail 首行（D51 传播原因，只读）。
+web_dag_detail_json() {   # <base> <tasks> <id> <trigger> → stdout 对象 JSON
+    webv_dd_root=""; webv_dd_role=""; webv_dd_run=""; webv_dd_rstate=""
+    webv_dd_nst=""; webv_dd_note=""; webv_dd_reason=""; webv_dd_hist="[]"
+    webv_dd_base=${1:-}
+    webv_dd_id=$3
+    if [ -n "$webv_dd_base" ] && secv_id_ok "$webv_dd_id" && [ -d "$(dag_runs_root "$webv_dd_base")" ]; then
+        if [ -d "$(dag_chain_dir "$webv_dd_base" "$webv_dd_id")" ]; then
+            webv_dd_role=root
+            webv_dd_root="$webv_dd_id"
+            webv_dd_hist=$(web_dag_history_json "$webv_dd_base" "$webv_dd_id")
+            if web_dag_pick_run "$webv_dd_base" "$webv_dd_id"; then
+                webv_dd_run="$webv_dagr_token"
+                webv_dd_rstate="$webv_dagr_state"
+                webv_dd_rid=$(printf '%s' "$webv_dagr_rootline" | cut -d'|' -f2)
+                webv_dd_note=$(printf '%s' "$webv_dagr_rootline" | cut -d'|' -f3)
+                case "$webv_dd_note" in ''|*[!0-9]*) webv_dd_note="" ;; esac
+                webv_dd_nst=$(web_dag_state_norm "$webv_dd_rid")
+            fi
+        else
+            for webv_dd_cd in "$webv_dd_base"/dag/*/; do
+                [ -d "$webv_dd_cd" ] || continue
+                webv_dd_c=${webv_dd_cd%/}
+                webv_dd_c=${webv_dd_c##*/}
+                [ "$webv_dd_c" = "$webv_dd_id" ] && continue
+                secv_id_ok "$webv_dd_c" || continue
+                web_dag_pick_run "$webv_dd_base" "$webv_dd_c" || continue
+                webv_dd_ms=$(dag_book_state "$webv_dagr_lines" "$webv_dd_id")
+                [ -n "$webv_dd_ms" ] || continue
+                webv_dd_root="$webv_dd_c"
+                webv_dd_role=node
+                webv_dd_run="$webv_dagr_token"
+                webv_dd_rstate="$webv_dagr_state"
+                webv_dd_nst=$(web_dag_state_norm "$webv_dd_ms")
+                webv_dd_note=$(dag_book_note "$webv_dagr_lines" "$webv_dd_id")
+                webv_dd_hist=$(web_dag_history_json "$webv_dd_base" "$webv_dd_c")
+                break
+            done
+        fi
+    fi
+    if [ -z "$webv_dd_role" ] && [ "$4" = "chain" ]; then
+        webv_dd_role=node
+    fi
+    case "$webv_dd_note" in *gate-fail*)
+        webv_dd_reason=$(head -1 "$2/$webv_dd_id/gate.fail" 2>/dev/null) ;;
+    esac
+    printf '{"chain_root":%s,"role":%s,"run":%s,"run_state":%s,"node_state":%s,"note":%s,"reason":%s,"runs":%s}' \
+        "$(web_json_str "$webv_dd_root")" "$(web_json_str "$webv_dd_role")" \
+        "$(web_json_str "$webv_dd_run")" "$(web_json_str "$webv_dd_rstate")" \
+        "$(web_json_str "$webv_dd_nst")" "$(web_json_str "$webv_dd_note")" \
+        "$(web_json_str "$webv_dd_reason")" "$webv_dd_hist"
+    return 0
+}
 # 任务紧凑行（GET_SUMMARY.tasks 元素）
 web_task_row() {   # <tasks_dir> <task_file> <id>
     webv_tasks=$1; webv_f=$2; webv_id=$3
@@ -5102,14 +5346,17 @@ web_agg_summary() {   # <base> <tasks> → 单行 JSON
             webv_deperr="[$webv_darr]"
         fi
     fi
-    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s,"recovering":%s},"tasks":[%s],"dep_errors":%s}' \
+    # P6-08（D58）：只增 `dag` 键（B8）——链可观测聚合（active/limit/recent_failed +
+    # chains 进度投影）；无链运行树时为全零空数组（模式恒在，schema 稳定）。
+    webv_dag=$(web_dag_summary_json "$webv_base")
+    printf '{"ok":true,"daemon":"online","mode":%s,"counts":{"total":%s,"running":%s,"healthy":%s,"failed":%s,"disabled":%s,"unhealthy":%s,"unknown":%s,"waiting":%s,"recovering":%s},"tasks":[%s],"dep_errors":%s,"dag":%s}' \
         "$(web_json_str "$webv_mode")" \
         "$webv_total" "$webv_running" "$webv_healthy" "$webv_failed" "$webv_disabled" "$webv_unhealthy" "$webv_unknown" "$webv_waiting" "$webv_recovering" \
-        "$webv_rows" "$webv_deperr"
+        "$webv_rows" "$webv_deperr" "$webv_dag"
 }
 # ── GET_TASK_DETAIL：完整任务详情（Task Detail 页）─────────────────────────
-web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
-    webv_tasks=$1; webv_f=$2; webv_id=$3
+web_task_detail() {   # <tasks_dir> <task_file> <id> [base] → 单行 JSON
+    webv_tasks=$1; webv_f=$2; webv_id=$3; webv_dbase=${4:-}
     webv_st=$(ipc_task_state "$webv_tasks" "$webv_id")
     webv_rd="$webv_tasks/$webv_id"
     webv_pid=$(web_run_or_task "$webv_tasks" "$webv_id" pid.txt "$webv_f" runtime.pid)
@@ -5153,7 +5400,9 @@ web_task_detail() {   # <tasks_dir> <task_file> <id> → 单行 JSON
     printf '"condition_state":%s,"last_event":%s,' \
         "$(web_json_str "$(obs_cond_state "$webv_tasks" "$webv_id")")" \
         "$(web_json_str "$webv_ev")"
-    printf '"has_run_dir":%s}}' "$webv_hasrun"
+    # P6-08（D58）：只增 `dag` 键（B8；base 缺省时全空字段，schema 稳定）
+    printf '"has_run_dir":%s,"dag":%s}}' "$webv_hasrun" \
+        "$(web_dag_detail_json "$webv_dbase" "$webv_tasks" "$webv_id" "$(sched_task_field "$webv_f" trigger)")"
 }
 # ── 日志聚合（GET_TASK_EVENTS / GET_DAEMON_LOG / GET_TASK_LOG）──────────────
 web_log_payload() {   # <file> <max> <label> → {"ok":true,<label>...,"total":..,"returned":..,"truncated":..,"lines":[...]}
@@ -5180,7 +5429,7 @@ ipc_op_get_task_detail() {   # <base> <tasks> <req_id> <id>
     [ -n "$webv_id" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_DETAIL 1 invalid_request "missing id"; return 0; }
     webv_f=$(registry_task_file "$webv_id" 2>/dev/null)
     [ -n "$webv_f" ] || { ipc_respond "$webv_base" "$webv_rid" GET_TASK_DETAIL 3 task_not_found "$webv_id"; return 0; }
-    webv_payload=$(web_task_detail "$webv_tasks" "$webv_f" "$webv_id")
+    webv_payload=$(web_task_detail "$webv_tasks" "$webv_f" "$webv_id" "$webv_base")
     ipc_respond "$webv_base" "$webv_rid" GET_TASK_DETAIL 0 ok "$webv_payload"
     return 0
 }
@@ -7407,8 +7656,10 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
               ipc_parse ipc_params_valid ipc_param ipc_respond ipc_dispatch \
               ipc_allowed_keys ipc_op_get_tasks ipc_op_get_status ipc_op_get_log ipc_op_validate \
               ipc_op_get_summary ipc_op_get_task_detail ipc_op_get_task_events ipc_op_get_daemon_log \
-              web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
-              web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
+               web_json_escape web_json_str web_run_or_task web_log_lines_json web_task_row \
+               web_agg_summary web_task_detail web_log_payload web_task_log_to_json \
+               web_dag_state_norm web_dag_pick_run web_dag_run_json web_dag_summary_json \
+               web_dag_history_json web_dag_detail_json \
               obs_gate_state obs_dep_state obs_cond_state \
               task_cli_base task_cli_audit_file task_cli_trigger_kind task_cli_next_due task_cli_last_cause \
               tcfg_editor_num tcfg_editor_bool tcfg_editor_id_ok tcfg_editor_trigger_ok tcfg_editor_action_ok \

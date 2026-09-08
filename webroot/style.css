@@ -144,3 +144,43 @@ a { color: #60a5fa; }
 .batch-sum { margin: 0.35rem 0 0; }
 .batch-sum.ok { color: var(--ok); }
 .batch-sum.fail { color: var(--bad); }
+/* P6-08 DAG 链视图（run.txt 账本态徽标 + 链进度 + 批量节点操作） */
+.dag-summary { display: flex; gap: 0.5rem; flex-wrap: wrap; margin-bottom: 0.75rem; }
+.dag-chip { background: var(--panel); border: 1px solid var(--line); border-radius: 999px; padding: 0.2rem 0.7rem; font-size: 0.8rem; }
+.dag-chip.bad { color: var(--bad); border-color: var(--bad); }
+.dag-chain { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.75rem; margin-bottom: 0.75rem; }
+.dag-chain-static { opacity: 0.85; }
+.dag-head { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin-bottom: 0.4rem; }
+.dag-head a { color: #60a5fa; font-weight: 600; font-family: var(--mono); }
+.dag-run { color: var(--muted); font-family: var(--mono); font-size: 0.8rem; }
+.dag-runstate { border-radius: 999px; padding: 0.1rem 0.6rem; font-size: 0.75rem; border: 1px solid var(--line); }
+.dag-runstate.rs-RUNNING, .dag-runstate.rs-PENDING { color: #60a5fa; border-color: rgba(96,165,250,0.4); }
+.dag-runstate.rs-SUCCESS { color: var(--ok); border-color: var(--ok); }
+.dag-runstate.rs-FAILED, .dag-runstate.rs-CANCELLED { color: var(--bad); border-color: var(--bad); }
+.dag-runstate.rs-NOTRUN { color: var(--muted); }
+.dag-prog { position: relative; width: 10rem; height: 0.7rem; background: rgba(148,163,184,0.15); border-radius: 999px; overflow: hidden; }
+.dag-prog-fill { height: 100%; background: var(--ok); width: 0; }
+.dag-prog-text { position: absolute; inset: 0; text-align: center; font-size: 0.62rem; line-height: 0.7rem; color: var(--fg); }
+.dag-frontier { margin: 0.1rem 0 0.4rem; color: #60a5fa; font-size: 0.8rem; font-family: var(--mono); }
+.dag-table { margin-bottom: 0.5rem; }
+.dag-role { color: var(--muted); font-size: 0.8rem; }
+.dag-badge { border-radius: 999px; padding: 0.1rem 0.5rem; font-size: 0.75rem; border: 1px solid var(--line); white-space: nowrap; }
+.dag-n-done { color: var(--ok); border-color: var(--ok); }
+.dag-n-run { color: #60a5fa; border-color: rgba(96,165,250,0.4); }
+.dag-n-wait { color: var(--warn); border-color: rgba(245,158,11,0.4); }
+.dag-n-fail { color: var(--bad); border-color: var(--bad); }
+.dag-n-int { color: var(--muted); border-style: dashed; }
+.dag-n-unknown { color: var(--muted); }
+.dag-state { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); }
+.dag-note { font-family: var(--mono); font-size: 0.78rem; color: var(--fg); }
+.dag-ctlbar { display: flex; flex-wrap: wrap; gap: 0.4rem; align-items: center; }
+.dag-ctl-note { width: 100%; color: var(--muted); font-size: 0.75rem; }
+.dag-batch-btn { font-size: 0.8rem; padding: 0.25rem 0.6rem; }
+.dag-jump { display: inline-block; margin: 0.25rem 0; color: #60a5fa; font-size: 0.85rem; }
+.dag-history { margin-top: 0.5rem; }
+.dag-history h3 { color: var(--muted); font-size: 0.85rem; }
+.dag-hist-row { font-family: var(--mono); font-size: 0.8rem; padding: 0.15rem 0; border-bottom: 1px dashed var(--line); }
+.dag-filter-label { display: inline-flex; align-items: center; gap: 0.3rem; color: var(--muted); font-size: 0.8rem; margin-bottom: 0.35rem; }
+.dag-audit { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 0.75rem; margin-top: 0.75rem; }
+.dag-audit h3 { margin: 0 0 0.4rem; color: var(--muted); font-size: 0.85rem; }
+.dag-audit-row { font-family: var(--mono); font-size: 0.75rem; padding: 0.12rem 0; border-bottom: 1px dashed var(--line); word-break: break-all; }

@@ -244,3 +244,74 @@ CLI Reader 经 `web_task_log_to_json` 归一为与 §3.4 相同 JSON Schema
 - Runtime 库版本 `RUNTIME_LIB_VERSION=1.29.0`（P5-06 递增；只增键不删字段，B8 契约重申：本文档各 op Schema 均为**向下兼容追加**，既有字段名/类型/顺序永不删改）。P5-07 继续只增：GET_SUMMARY `tasks[].dependency` + 顶层 `dep_errors`（版本号不变，纯后端只读增量）。
 - 新 IPC op 白名单计数：12（P3-04）+ 4（P3-05 只读）= **16**。
 - 函数前缀：`web_`（函数）/ `webv_`（内部全局）；注册进 `runtime_lib_selfcheck`。
+
+---
+
+## 7. P6-08 DAG 可观测只增键（B8；纯 append，不改动上文）
+
+> 权威：`docs/architecture/dag-schema-v1.md` D58（可观测只增键）/D49（run.txt 账本）/D50（五态）/D51（传播）/D54（节点级 only）。
+> 执行记录：`docs/P6-08.md`。**零新 op**（19 恒定）、零新参数键；数据全部来自 §27 引擎账本（`$base/dag/<chain>/runs/<token>/run.txt`）与 `scheduler/audit.log` 尾读；解析复用 `dag_run_parse` 门（corrupt/非法 token/非法链目录名一律不展示）。
+
+### 7.1 GET_SUMMARY 增 `dag` 键（末尾追加）
+
+```json
+"dag": {
+  "active": 1,
+  "limit": 8,
+  "recent_failed": 0,
+  "chains": [
+    {
+      "root": "demo_build",
+      "run": "202609080830",
+      "run_state": "RUNNING",
+      "created": "1789192860",
+      "done": 1, "total": 3,
+      "frontier": ["demo_deploy"],
+      "nodes": [
+        {"id": "demo_build", "role": "root", "state": "STOPPED", "note": "1"},
+        {"id": "demo_deploy", "role": "node", "state": "RUNNING", "note": "disp"},
+        {"id": "demo_cleanup", "role": "node", "state": "PENDING", "note": "waiting"}
+      ]
+    }
+  ],
+  "audit": ["2026-09-08 08:31:02|op=dag|action=register|chain=demo_build|run=202609080830|task=demo_build|nodes=demo_deploy demo_cleanup|mode=managed"]
+}
+```
+
+| 字段 | 类型 | 说明 |
+| :--- | :--- | :--- |
+| `dag.active` | int | 活跃 run 数（`run.txt.state ∈ {PENDING,RUNNING}`；与引擎 `dag_active_runs` 同口径） |
+| `dag.limit` | int | `DAG_RUNS_MAX`（D57 运行期闸） |
+| `dag.recent_failed` | int | 保留史（每链 `DAG_RUNS_KEEP`）内 `state=FAILED` 的 run 数（按 run.txt 文件计） |
+| `dag.chains[]` | obj[] | 每链**展示 run**（进行中最新优先，否则最新 token）投影，链目录字典序，≤`WEBUI_DAG_CHAINS_MAX=64`；无 run（未点火/全 corrupt）的链不出现（前端以 `tasks[].dependency` 静态拓扑兜底） |
+| `chains[].root` | str | 链 id = 根任务 id（D47；secv_id_ok 门后字面输出） |
+| `chains[].run` / `run_state` | str | 展示 run token（12 位数字）/ 五态 `PENDING\|RUNNING\|SUCCESS\|FAILED`（`CANCELLED` 预留 v1 不产出，D50） |
+| `chains[].created` | str | run.txt `created`（epoch 秒；非法=空串） |
+| `chains[].done/total` | int | 进度：账本行（root 行+成员行）终态（STOPPED/FAILED）数 / 总行数（「3/5」口径） |
+| `chains[].frontier[]` | str[] | 在途节点（note 含 `disp` 且未落终态） |
+| `chains[].nodes[]` | obj[] | 账本逐行 `{id, role(root\|node), state, note}`：root 行 note=attempt 记账位；成员行 state=账本记录态（TSM 11 态∪`PENDING` 白名单，白名单外归一 `UNKNOWN`）、note=账本第 4 字段（`disp`/`waiting`/`waiting-missing`/`waiting opt-unsat`/`cond-unmet`/`defer`/`disabled`/`gate-fail`/`disp start-fail`…；非安全字符集经 `web_json_escape`） |
+| `dag.audit[]` | str[] | `scheduler/audit.log` 中 `op=dag` 审计行尾读（tail 200 预筛→最近 ≤10 行；`register/dispatch/limit/timeout/corrupt/prune/fail-propagate/cond-unmet`；逐行 JSON 转义） |
+
+### 7.2 GET_TASK_DETAIL 增 `task.dag` 键（task 对象末尾追加）
+
+```json
+"dag": {
+  "chain_root": "demo_build", "role": "node",
+  "run": "202609080830", "run_state": "RUNNING",
+  "node_state": "RUNNING", "note": "disp", "reason": "",
+  "runs": [ {"run": "202609080830", "run_state": "RUNNING", "created": "1789192860", "done": 1, "total": 3} ]
+}
+```
+
+| 字段 | 说明 |
+| :--- | :--- |
+| `dag.chain_root` / `role` / `run` / `run_state` | **D58 冻结四键**。归属以账本为事实源（链目录名=根 id）：`role=root`（存在本链目录）/`node`（出现在某链展示 run 成员行，或 `trigger=chain` 尚无账本）/`""`（非链）；多根共享节点取字典序首个链（v1 口径） |
+| `dag.node_state` / `note` | 本任务在展示 run 账本中的记录态（同 7.1 归一规则）/ note（root=attempt；非链成员=空串） |
+| `dag.reason` | `note` 含 `gate-fail` 时 `<tasks>/<id>/gate.fail` 首行（D51 传播原因，如 `dep failed: demo_deploy(FAILED want STOPPED)`）；否则空串 |
+| `dag.runs[]` | 所属链历史 run（最新在前，≤`DAG_RUNS_KEEP`）：`{run,run_state,created,done,total}`；非链=空数组 |
+
+### 7.3 安全与契约重申
+
+- 恶意 run.txt 字段（note/id 含 `<script>"&;$(…)` 等）经解析门 + 枚举归一 + `web_json_escape` 后**只作为文本**呈现；前端一律 `textContent`（§2 编码规则不变）；展示聚合零 exec、零写盘（测试 `tests/p6-webui` §inject/§keys 固化）。
+- 链级「停止/重启」在 UI 上=对链成员**批量节点级** op（既有 `START/STOP/RESTART/…` op，B19 逐任务结果）；**v1 无链级取消 API**（D54），后端零新 op/新参数键。
+- Runtime 库版本 `RUNTIME_LIB_VERSION=1.31.0` 不变（P6-08 纯只增键；IPC 白名单恒 19）。

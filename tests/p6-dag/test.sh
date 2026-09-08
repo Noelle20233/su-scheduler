@@ -918,7 +918,24 @@ else
     bad "DAG-EX-16b 权限异常 dag=$m_dag run=$m_run"
 fi
 
-skip "DAG-EX-17 GET_SUMMARY.dag / GET_TASK_DETAIL.dag 只增键（B8）+ CLI Chain Root:/Run: 行 — reason: 按 P6-06 任务书范围切分，WebUI JSON 键归 P6-08、CLI 展示归 P6-09；本任务已落引擎侧数据面（run.txt/op=dag 审计/dag_* 事件令牌）供其消费"
+# EX-17 拆分（P6-08 出口条件；测试自更新，非掩盖）：WebUI JSON 键面已由 P6-08 落地
+# → 17a/17b 转真验证 PASS；CLI `task status/info` 展示行归 P6-09，保持 SKIP。
+ws17=$(web_agg_summary "$E_BASE" "$E_TASKS")
+if printf '%s' "$ws17" | grep -q '"dag":{"active":0,"limit":8,"recent_failed":0,"chains":\[' \
+   && printf '%s' "$ws17" | grep -q '"root":"rt0","run":"202609080830","run_state":"SUCCESS"' \
+   && printf '%s' "$ws17" | grep -q '"counts":' && printf '%s' "$ws17" | grep -q '"dep_errors":'; then
+    ok "DAG-EX-17a GET_SUMMARY.dag 只增键（D58/B8）真验证：active/limit/recent_failed/chains 与账本一致（P6-08 落地）"
+else
+    bad "DAG-EX-17a GET_SUMMARY.dag 异常: $(printf '%s' "$ws17" | sed -n 's/.*\("dag":.*\)/\1/p' | cut -c1-160)"
+fi
+wd17=$(web_task_detail "$E_TASKS" "$E_TCFG/b.task" b "$E_BASE")
+if printf '%s' "$wd17" | grep -q '"dag":{"chain_root":"rt0","role":"node","run":"202609080830","run_state":"SUCCESS"' \
+   && printf '%s' "$wd17" | grep -q '"id":"b"' && printf '%s' "$wd17" | grep -q '"status":"STOPPED"'; then
+    ok "DAG-EX-17b GET_TASK_DETAIL.dag D58 四键（chain_root/role/run/run_state）真验证，既有键并存（P6-08 落地）"
+else
+    bad "DAG-EX-17b GET_TASK_DETAIL.dag 异常: $(printf '%s' "$wd17" | sed -n 's/.*\("dag":.*\)/\1/p' | cut -c1-160)"
+fi
+skip "DAG-EX-17c CLI task status/info 'Chain Root:'/'Run:'/'Run State:' 行 — reason: 归 P6-09 CLI 展示面（WebUI 键面已由 P6-08 以 17a/17b 转真验证；本行自原 EX-17 SKIP 拆分而来）"
 
 # ── DAG-EX-18：editor 枚举 / trigger_decide 恒 due=N / IPC 19 op 零新增
 if tcfg_editor_trigger_ok chain && ! tcfg_editor_trigger_ok 'chain:extra' && ! tcfg_editor_trigger_ok 'CHAIN'; then

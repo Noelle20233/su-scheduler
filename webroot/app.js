@@ -171,6 +171,9 @@
   function runBatch(op, label, box) {
     var ids = selectedIds();
     if (!ids.length) { box.textContent = "未选中任务"; return; }
+    runBatchIds(op, label, ids, box);
+  }
+  function runBatchIds(op, label, ids, box) {
     box.textContent = "";
     var pending = ids.length;
     var results = [];
@@ -203,6 +206,7 @@
   function renderDepView(data) {
     var block = el("div", { class: "depview" });
     block.appendChild(el("h2", { text: "依赖关系" }));
+    block.appendChild(el("a", { class: "dag-jump", href: "#dag", text: "运行态请见 DAG 链视图 →" }));
     var errs = data.dep_errors || [];
     var errBox = el("div", { class: "dep-errors" });
     if (errs.length) {
@@ -249,6 +253,215 @@
     cols.appendChild(fwd); cols.appendChild(rev);
     block.appendChild(cols);
     return block;
+  }
+
+  /* ── P6-08 DAG 链视图（D58 只增键 dag.chains/runs；账本态 + 现图边）────── */
+  function dagNodeBadge(node) {
+    var st = String((node && node.state) || "");
+    var note = String((node && node.note) || "");
+    var m = [["STOPPED", "已完成", "dag-n-done"],
+             ["FAILED", "失败", "dag-n-fail"],
+             ["RUNNING", "运行中", "dag-n-run"],
+             ["STARTING", "运行中", "dag-n-run"]];
+    var i;
+    if (st === "FAILED" && note.indexOf("gate-fail") >= 0) { return ["失败·传播", "dag-n-fail"]; }
+    if (st === "FAILED" && note.indexOf("start-fail") >= 0) { return ["失败·启动失败", "dag-n-fail"]; }
+    if (st === "PENDING") {
+      if (note.indexOf("disabled") >= 0) { return ["中断路", "dag-n-int"]; }
+      if (note.indexOf("cond-unmet") >= 0) { return ["等待·条件", "dag-n-wait"]; }
+      if (note.indexOf("defer") >= 0) { return ["顺延·并行", "dag-n-wait"]; }
+      if (note.indexOf("waiting") >= 0) { return ["等待", "dag-n-wait"]; }
+      return ["待调度", "dag-n-wait"];
+    }
+    for (i = 0; i < m.length; i++) { if (st === m[i][0]) { return [m[i][1], m[i][2]]; } }
+    if (st === "WAITING") { return ["等待·门控", "dag-n-wait"]; }
+    if (st === "UNKNOWN" || st === "") { return ["未知", "dag-n-unknown"]; }
+    return [st, "dag-n-run"];
+  }
+  function dagTaskMap(tasks) {
+    var map = {};
+    (tasks || []).forEach(function (t) { map[t.id] = t; });
+    return map;
+  }
+  /* 现图链拓扑（前端由 tasks[].dependency 聚合——与 P5-07 dep 视图同一数据源，
+     不新增 IPC op；闭包 = 非 chain 触发根 → trigger=chain 后代）。 */
+  function dagChainTopology(tasks) {
+    var byId = dagTaskMap(tasks);
+    var edges = {};        // up → [{down, entry}]
+    (tasks || []).forEach(function (t) {
+      depEntries(t.dependency).forEach(function (e) {
+        var up = e;
+        if (up.charAt(0) === "?") { up = up.slice(1); }
+        if (up.indexOf(":") >= 0) { up = up.slice(0, up.indexOf(":")); }
+        if (!edges[up]) { edges[up] = []; }
+        edges[up].push({ down: t.id, entry: e });
+      });
+    });
+    var chains = {};       // root → { nodes:[ids], edges:[{up,down,entry}] }
+    function walk(rootId, acc, seen) {
+      var list = edges[rootId] || [];
+      list.forEach(function (ed) {
+        var down = ed.down;
+        if (!byId[down] || byId[down].trigger !== "chain") { return; }
+        acc.edges.push({ up: rootId, down: down, entry: ed.entry });
+        if (!seen[down]) {
+          seen[down] = true; acc.nodes.push(down);
+          walk(down, acc, seen);
+        }
+      });
+    }
+    (tasks || []).forEach(function (t) {
+      if (t.trigger === "chain") { return; }
+      if (!edges[t.id]) { return; }
+      var acc = { nodes: [t.id], edges: [] };
+      walk(t.id, acc, {});
+      if (acc.edges.length) { chains[t.id] = acc; }
+    });
+    return chains;
+  }
+  function dagProgressBar(done, total) {
+    var wrap = el("div", { class: "dag-prog" });
+    var d = Number(done) || 0; var t = Number(total) || 0;
+    var pct = t > 0 ? Math.min(100, Math.round(d * 100 / t)) : 0;
+    var fill = el("div", { class: "dag-prog-fill" });
+    fill.style.width = pct + "%";
+    wrap.appendChild(fill);
+    wrap.appendChild(el("span", { class: "dag-prog-text", text: d + "/" + t }));
+    return wrap;
+  }
+  /* 链级「停止/重启」= 对链成员批量发起**节点级** op（D54：v1 无链级取消 API、
+     零新 IPC op；B19 逐任务结果，复用 P5-07 runBatchIds/write 通道）。 */
+  function dagChainCtlBar(rootId, memberIds) {
+    var bar = el("div", { class: "dag-ctlbar" });
+    bar.appendChild(el("span", { class: "dag-ctl-note",
+      text: "整链操作 = 批量节点操作（对链成员逐个发起节点级 op，逐任务返回结果；v1 无链级取消 API）" }));
+    var box = el("div", { class: "batch-results" });
+    [["停止链", "STOP_TASK"], ["重启链", "RESTART_TASK"], ["启用链", "ENABLE_TASK"], ["禁用链", "DISABLE_TASK"]].forEach(function (pair) {
+      var b = el("button", { class: "batch-btn dag-batch-btn", text: pair[0] + "（批量节点操作）", "data-op": pair[1] });
+      b.addEventListener("click", function () { runBatchIds(pair[1], pair[0], memberIds.slice(), box); });
+      bar.appendChild(b);
+    });
+    bar.appendChild(box);
+    return bar;
+  }
+  function dagNodeRow(node, taskMap, ledgerState) {
+    var tr = el("tr");
+    var badge = dagNodeBadge(node);
+    var a = el("a", { href: "#task/" + encodeURIComponent(node.id), text: escText(node.id) });
+    var tdId = el("td"); tdId.appendChild(a); tr.appendChild(tdId);
+    tr.appendChild(el("td", { class: "dag-role", text: node.role === "root" ? "根" : "节点" }));
+    tr.appendChild(el("td", { class: "dag-badge " + badge[1], text: badge[0] }));
+    tr.appendChild(el("td", { class: "dag-state", text: escText(node.state) }));
+    var reason = node.note || "";
+    if (String(node.note || "").indexOf("gate-fail") >= 0) {
+      var ups = [];
+      depEntries((taskMap[node.id] || {}).dependency).forEach(function (e) {
+        var up = e; if (up.charAt(0) === "?") { up = up.slice(1); }
+        if (up.indexOf(":") >= 0) { up = up.slice(0, up.indexOf(":")); }
+        if (ledgerState[up] === "FAILED") { ups.push(up); }
+      });
+      if (ups.length) { reason = reason + " ← dep-fail: " + ups.join(", "); }
+    }
+    tr.appendChild(el("td", { class: "dag-note", text: reason }));
+    var depTd = el("td", { class: "deps-cell" });
+    depTd.appendChild(depEntries((taskMap[node.id] || {}).dependency).length
+      ? depBadges((taskMap[node.id] || {}).dependency)
+      : el("span", { class: "dep-none", text: node.role === "root" ? "（链根）" : "-" }));
+    tr.appendChild(depTd);
+    return tr;
+  }
+  function dagLedgerStates(chain) {
+    var s = {};
+    (chain.nodes || []).forEach(function (n) { s[n.id] = n.state; });
+    return s;
+  }
+  function renderDagChainBlock(chain, taskMap) {
+    var block = el("div", { class: "dag-chain" });
+    var head = el("div", { class: "dag-head" });
+    var rootLink = el("a", { href: "#task/" + encodeURIComponent(chain.root), text: "链 " + escText(chain.root) });
+    head.appendChild(rootLink);
+    head.appendChild(el("span", { class: "dag-run", text: "run " + escText(chain.run) }));
+    head.appendChild(el("span", { class: "dag-runstate rs-" + escText(chain.run_state), text: escText(chain.run_state) }));
+    head.appendChild(dagProgressBar(chain.done, chain.total));
+    block.appendChild(head);
+    if ((chain.frontier || []).length) {
+      block.appendChild(el("p", { class: "dag-frontier", text: "在途节点：" + chain.frontier.join(", ") }));
+    }
+    var ledger = dagLedgerStates(chain);
+    var table = el("table", { class: "tbl dag-table" });
+    var thead = el("tr");
+    ["节点", "角色", "状态", "账本态", "note / 失败原因", "入边（Required/Optional/:STATE）"].forEach(function (h) {
+      thead.appendChild(el("th", { text: h }));
+    });
+    table.appendChild(thead);
+    var ids = [];
+    (chain.nodes || []).forEach(function (n) {
+      ids.push(n.id);
+      table.appendChild(dagNodeRow(n, taskMap, ledger));
+    });
+    block.appendChild(table);
+    block.appendChild(dagChainCtlBar(chain.root, ids));
+    return block;
+  }
+  function renderDagChainStatic(rootId, topo, taskMap) {
+    var block = el("div", { class: "dag-chain dag-chain-static" });
+    var head = el("div", { class: "dag-head" });
+    head.appendChild(el("a", { href: "#task/" + encodeURIComponent(rootId), text: "链 " + escText(rootId) }));
+    head.appendChild(el("span", { class: "dag-runstate rs-NOTRUN", text: "尚未触发（静态拓扑）" }));
+    block.appendChild(head);
+    var table = el("table", { class: "tbl dag-table" });
+    var thead = el("tr");
+    ["节点", "边"].forEach(function (h) { thead.appendChild(el("th", { text: h })); });
+    table.appendChild(thead);
+    (topo.nodes || []).forEach(function (id) {
+      var tr = el("tr");
+      var a = el("a", { href: "#task/" + encodeURIComponent(id), text: escText(id) });
+      var td = el("td"); td.appendChild(a); tr.appendChild(td);
+      var ins = (topo.edges || []).filter(function (e) { return e.down === id; })
+        .map(function (e) { return e.up + "→" + e.down; });
+      var cell = el("td");
+      cell.appendChild(ins.length ? depBadges(ins.map(function (s) { return s.split("→")[0]; }).join(",")) : el("span", { class: "dep-none", text: "（根）" }));
+      tr.appendChild(cell);
+      table.appendChild(tr);
+    });
+    block.appendChild(table);
+    return block;
+  }
+  function renderDagView(data) {
+    var view = document.getElementById("view");
+    if (!data.ok) { markRefreshErr(view, "dag", data); return; }
+    lastData.dag = data;
+    clearErrBanner();
+    view.textContent = "";
+    updateIndicator(view, "上次更新 " + lastUpdatedTime());
+    view.appendChild(el("h2", { text: "DAG 链视图" }));
+    var dag = data.dag || {};
+    var sum = el("div", { class: "dag-summary" });
+    sum.appendChild(el("span", { class: "dag-chip", text: "活跃链 run：" + escText(dag.active === undefined ? 0 : dag.active) + " / " + escText(dag.limit === undefined ? 0 : dag.limit) }));
+    sum.appendChild(el("span", { class: "dag-chip" + ((Number(dag.recent_failed) || 0) > 0 ? " bad" : ""), text: "保留史内失败 run：" + escText(dag.recent_failed === undefined ? 0 : dag.recent_failed) }));
+    view.appendChild(sum);
+    var taskMap = dagTaskMap(data.tasks);
+    var topo = dagChainTopology(data.tasks || []);
+    var chains = dag.chains || [];
+    var liveRoots = {};
+    chains.forEach(function (c) {
+      liveRoots[c.root] = true;
+      view.appendChild(renderDagChainBlock(c, taskMap));
+    });
+    Object.keys(topo).forEach(function (r) {
+      if (!liveRoots[r]) { view.appendChild(renderDagChainStatic(r, topo[r], taskMap)); }
+    });
+    /* 链路审计记录（dag.audit 只增键：op=dag 审计尾读，既有 GET_SUMMARY 通道） */
+    var aud = dag.audit || [];
+    if (aud.length) {
+      var audBox = el("div", { class: "dag-audit" });
+      audBox.appendChild(el("h3", { text: "链路审计记录（op=dag，最近 " + aud.length + " 条）" }));
+      aud.forEach(function (l) { audBox.appendChild(el("div", { class: "dag-audit-row", text: escText(l) })); });
+      view.appendChild(audBox);
+    }
+    if (!chains.length && !Object.keys(topo).length) {
+      view.appendChild(el("p", { class: "empty", text: "（暂无链：trigger=chain 节点或其 run 账本不存在）" }));
+    }
   }
 
   /* ── 视图：Dashboard ────────────────────────────────────────────────── */
@@ -403,6 +616,36 @@
     kv("last_event", t.last_event);
     view.appendChild(info);
 
+    /* P6-08（D58）：链可观测块（dag 只增键；旧 daemon 无该键 → 整块隐藏） */
+    var dg = t.dag;
+    if (dg && dg.role) {
+      var dagInfo = el("dl", { class: "kv" });
+      function dkv(k, v) {
+        dagInfo.appendChild(el("dt", { text: k }));
+        dagInfo.appendChild(el("dd", { class: "mono", text: escText(v) }));
+      }
+      dkv("dag.chain_root", dg.chain_root);
+      dkv("dag.role", dg.role === "root" ? "root（链根）" : dg.role === "node" ? "node（链节点）" : dg.role);
+      dkv("dag.run", dg.run);
+      dkv("dag.run_state", dg.run_state);
+      dkv("dag.node_state", dg.node_state);
+      dkv("dag.note", dg.note);
+      if (dg.reason) { dkv("dag.reason", dg.reason); }
+      view.appendChild(dagInfo);
+      var hist = dg.runs || [];
+      if (hist.length) {
+        var histBox = el("div", { class: "dag-history" });
+        histBox.appendChild(el("h3", { text: "链 run 历史（RUNS_KEEP 内，最新在前）" }));
+        hist.forEach(function (h) {
+          histBox.appendChild(el("div", { class: "dag-hist-row",
+            text: "run " + escText(h.run) + " [" + escText(h.run_state) + "] 进度 " + escText(h.done) + "/" + escText(h.total) + " created=" + escText(h.created) }));
+        });
+        view.appendChild(histBox);
+      }
+      var dagLink = el("a", { class: "dag-jump", href: "#dag", text: "打开 DAG 链视图" });
+      view.appendChild(dagLink);
+    }
+
     /* 运行历史（events） */
     var evBtn = el("button", { text: "加载运行历史 (events)" });
     evBtn.addEventListener("click", function () {
@@ -459,6 +702,20 @@
     container.appendChild(note);
     var pre = el("pre", { class: "log mono" });
     pre.textContent = (data.lines || []).join("\n");
+    /* P6-08：链事件过滤（dag_register/dag_dispatch 令牌；纯展示过滤，数据仍来自
+       既有 GET_TASK_EVENTS，无新 op） */
+    var allLines = data.lines || [];
+    pre.textContent = allLines.join("\n");
+    var dagOnly = el("input", { type: "checkbox", class: "dag-events-filter" });
+    dagOnly.addEventListener("change", function () {
+      pre.textContent = (dagOnly.checked
+        ? allLines.filter(function (l) { return l.indexOf("|dag_register|") >= 0 || l.indexOf("|dag_dispatch|") >= 0; })
+        : allLines).join("\n");
+    });
+    var filterWrap = el("label", { class: "dag-filter-label" });
+    filterWrap.appendChild(dagOnly);
+    filterWrap.appendChild(el("span", { text: " 只看链事件（dag_register / dag_dispatch）" }));
+    container.appendChild(filterWrap);
     container.appendChild(pre);
     document.getElementById("view").appendChild(container);
   }
@@ -493,7 +750,7 @@
         p.id = tid;
         read("GET_TASK_LOG", p).then(function (d) { renderLogBlock(d, "Task 日志 " + tid); });
       } else {
-        read("GET_DAEMON_LOG", p).then(function (d) { renderLogBlock(d, "Daemon 日志"); });
+        read("GET_DAEMON_LOG", p).then(function (d) { renderLogBlock(d, "Daemon 日志", true); });
       }
     });
     form.appendChild(el("span", { text: "类型: " })); form.appendChild(typeSel);
@@ -502,10 +759,10 @@
     form.appendChild(btn);
     view.appendChild(form);
     /* 默认加载 daemon 日志 */
-    read("GET_DAEMON_LOG", { lines: "100" }).then(function (d) { renderLogBlock(d, "Daemon 日志"); });
+    read("GET_DAEMON_LOG", { lines: "100" }).then(function (d) { renderLogBlock(d, "Daemon 日志", true); });
   }
 
-  function renderLogBlock(data, title) {
+  function renderLogBlock(data, title, allowDagFilter) {
     var view = document.getElementById("view");
     var block = el("div");
     var h = el("h3", { text: title });
@@ -520,7 +777,22 @@
       (data.truncated ? " — 日志已截断（仅显示最近 " + escText(data.returned) + " 行）" : "");
     block.appendChild(note);
     var pre = el("pre", { class: "log mono" });
-    pre.textContent = (data.lines || []).join("\n");
+    var allLines = data.lines || [];
+    pre.textContent = allLines.join("\n");
+    /* P6-08：审计入口过滤（op=dag 审计行走既有 GET_DAEMON_LOG 通道原样返回；
+       过滤仅影响展示，零新 op） */
+    if (allowDagFilter) {
+      var dagOnly = el("input", { type: "checkbox", class: "dag-log-filter" });
+      dagOnly.addEventListener("change", function () {
+        pre.textContent = (dagOnly.checked
+          ? allLines.filter(function (l) { return l.indexOf("op=dag|") >= 0; })
+          : allLines).join("\n");
+      });
+      var filterWrap = el("label", { class: "dag-filter-label" });
+      filterWrap.appendChild(dagOnly);
+      filterWrap.appendChild(el("span", { text: " 只看链审计（op=dag）" }));
+      block.appendChild(filterWrap);
+    }
     block.appendChild(pre);
     view.appendChild(block);
   }
@@ -970,6 +1242,11 @@
       startRefresh(function () {
         loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderTasks(d); });
       }, 10000);
+    } else if (r.view === "dag") {
+      loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderDagView(d); });
+      startRefresh(function () {
+        loadAndRender("GET_SUMMARY", {}, function (d) { setBadge(!!d.ok); renderDagView(d); });
+      }, 5000);
     } else if (r.view === "logs") {
       read("GET_DAEMON_LOG", { lines: "5" }).then(function (d) { setBadge(!!d.ok); });
       renderLogs();

@@ -211,6 +211,7 @@ else
         "tests/p5-condition/test.sh" \
         "tests/p5-trigger/test.sh" \
         "tests/p5-webui/test.sh" \
+        "tests/p6-webui/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
