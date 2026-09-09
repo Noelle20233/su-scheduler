@@ -84,8 +84,10 @@
 #       read-only/security 关键断言不回归）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
-# 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（真实 Android 冒烟；
-#   无 adb/设备时明示 DEVICE_SKIPPED 不计失败）。
+# 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（legacy 真机冒烟）、
+#   tests/p3-device/smoke.sh（P3 综合 18 项）与 tests/p6-device/smoke.sh
+#   （P6-10 九场景：跳拍补偿/CronID/IPC 错误透传/DAG 波次+kill-9/控制/WebUI dag 键/
+#   配置期拒绝/还原基线；真实 Android 冒烟；无 adb/设备时明示 DEVICE_SKIPPED 不计失败）。
 # 判定（AGENTS §4）：输出不得出现 [FAIL]；全部通过 → exit 0。
 # 可追溯（P2-01 出口）：完整逐层输出落盘
 #   tests/results/run_tests-<时间戳>.log（*.log 已被 .gitignore 忽略，
@@ -220,8 +222,12 @@ else
     if [ "$WITH_DEVICE" -eq 1 ]; then
         # D-P5-04：设备套件超时放大（p1-device 含 2×150s 睡眠、p3-device 多轮 daemon
         # 重启），默认 300s 组合跑必强杀 → 单独给足 900s。
+        # P6-10：p6-device 含分钟级真机等待（catch-up 2 拍 + DAG 波次 A ≈8 拍 + 守护
+        # 重启窗口 + 波 B（EX-12 无 kill 确定性窗）≈6 拍 + 负载沉降/重试预算；
+        # 安静设备实测 ~28 分钟，用户 App 负载期实测窗口膨胀 ≥20×）→ 5400s。
         run_suite "tests/p1-device/smoke.sh" 900
         run_suite "tests/p3-device/smoke.sh" 900
+        run_suite "tests/p6-device/smoke.sh" 5400
     fi
 fi
 
