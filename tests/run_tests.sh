@@ -82,6 +82,9 @@
 #       detail condition_state/last_event 后端只增键 B8、前端周期刷新/错误保留/
 #       WAITING/RECOVERING 渲染静态断言、只读零 exec、前端无 innerHTML/eval、
 #       read-only/security 关键断言不回归）
+#   L2  tests/p6-verify/test.sh P6-11 综合验证（tick 三档+IPC 延迟基线、并发拒新
+#       时延、dash/mksh/node 兼容扩展面、保存失败 I/O 原子性、双模式互切实弹、
+#       P5 基线↔当前 Runtime 旧→新→旧→新宿主演练；git 历史不可用时演练组 SKIP）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（legacy 真机冒烟）、
@@ -215,6 +218,7 @@ else
         "tests/p5-webui/test.sh" \
         "tests/p6-webui/test.sh" \
         "tests/p6-cli/test.sh" \
+        "tests/p6-verify/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
