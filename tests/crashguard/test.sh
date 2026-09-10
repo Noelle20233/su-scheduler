@@ -663,6 +663,81 @@ else
 fi
 unset CRASH_THRESHOLD CRASH_MIN_START_INTERVAL CRASH_COOLDOWN
 
+# ── 16) D-P6-10-03：kill×respawn 微窗 → retry 计数以 events.log 失败事件为准 ─────
+# 设备取证（docs/P6-10.md §4 / 矩阵 §5.1）：kill -9 落在「节点重试 respawn 已 start、
+#   子进程 retry.count 未落盘」的微窗 → 重启恢复把该次判为 daemon_restart 残留在途
+#   （非 action_failure）+ 清 retry 计数 → 旧 dag_retry_replenish 只数 action_failure
+#   → 少计一次 → sched_retry_arm 误判仍可重试 → retry.max=1 实跑 3 次（1+max+1），
+#   且发生在 run 已终局之后。修复：replenish 计 action_failure+daemon_restart+timeout
+#   全部失败事件；run 终局分支 exhaust（count:=max + 清 until），引擎侧拒绝终局后重放。
+# 宿主复现手法（G1 扩展）：cf retry.max=1 恒失败。正常推进至 attempt=1 退避接线后，
+#   令 respawn 那一轮「被杀」——execute_task 置 cf=RUNNING（无 exit→无 action_failure），
+#   随即 rm retry.count/retry.until（模拟 count 未落盘）+ state_rehydrate_residual（转
+#   daemon_restart|FAILED）。此后继续 tick：修复前 cf 第 3 次执行；修复后 ≤1+max=2。
+cg_new   # G4：微窗 kill 有界性 + 终局后零执行
+cg_task cg4r 0830 ""
+cg_task cg4f chain cg4r 1          # retry.max=1 → 合法上限 1+max=2 次执行
+touch "$CG_FAILDIR/cg4f"           # cf 每次真正跑完即 exit 1（action_failure）
+cgetick 0830                       # 根执行 + mark
+cgetick 0831                       # run 登记；cf dispatch（attempt1）→ 失败 action_failure（exec#1）
+cgetick 0832                       # 失败→退避：sched_retry_arm attempt=1（retry.count=1）
+CG_G4_RC=$(grep -c 'op=retry|task=cg4f|action=backoff|attempt=1|max=1' "$CG_BASE/scheduler/audit.log" | tr -d ' ')
+# —— 注入微窗 kill：attempt=1 respawn 已 start（exec#2）但子进程在「写 exit/落 count」前
+#    被 kill → 恢复判 daemon_restart 残留 + retry 计数未落盘 ——（确定性构造，非时序竞态）
+CG_CF="$CG_TASKS/cg4f"; mkdir -p "$CG_CF"
+echo "cg4f" >> "$CG_EXEC"                                   # respawn 子进程已 start = exec#2
+printf 'RUNNING\n' > "$CG_CF/status.txt"; printf 'RUNNING\n' > "$CG_CF/state.txt"
+rm -f "$CG_CF/exit_code.txt"                                # 未写 exit → 无 action_failure
+rm -f "$CG_CF/retry.count" "$CG_CF/retry.until"            # count 未落盘（被清）
+state_rehydrate_residual "$CG_TASKS" >/dev/null 2>&1        # 残留 RUNNING→FAILED + daemon_restart
+# 继续 tick：修复前 replenish 仅数 action_failure(=1)→retry.count=0→再 arm→exec#3；
+#            修复后数全失败事件(=2)→retry.count=1=max→拒 arm，且 run 终局 exhaust。
+CG_G4_SEQ=3
+while [ "$CG_G4_SEQ" -le 12 ]; do
+    cgetick "$(printf '08%02d' "$CG_G4_SEQ")"
+    CG_G4_SEQ=$((CG_G4_SEQ + 1))
+done
+CG_G4_EX=$(grep -c '^cg4f$' "$CG_EXEC" | tr -d ' ')
+CG_G4_A2=$(grep -c 'op=retry|task=cg4f|action=backoff|attempt=1|max=1' "$CG_BASE/scheduler/audit.log" | tr -d ' ')
+rf4="$CG_BASE/dag/cg4r/runs/202609080830/run.txt"
+CG_G4_DR=$(grep -c '|daemon_restart|FAILED|' "$CG_CF/events.log" 2>/dev/null); CG_G4_DR=${CG_G4_DR:-0}
+# 终局后零执行：记当前 exec 数，再多跑 4 tick，必须不变
+CG_G4_BEFORE=$CG_G4_EX
+cgetick 0815; cgetick 0816; cgetick 0817; cgetick 0818
+CG_G4_AFTER=$(grep -c '^cg4f$' "$CG_EXEC" | tr -d ' ')
+if [ "$CG_G4_DR" -ge 1 ] && [ "$CG_G4_RC" = "1" ] && [ "$CG_G4_EX" -le 2 ] \
+   && grep -q '^state=FAILED$' "$rf4"; then
+    ok "D-P6-10-03 G4: kill×respawn 微窗（daemon_restart 残留 + count 未落盘）→ cf 总执行 ≤ 1+max=2（got=$CG_G4_EX，backoff attempt=1×$CG_G4_A2），run 终局 FAILED（修复前复跑第 3 次=越钳）"
+else
+    bad "D-P6-10-03 G4 越钳未修 cf_ex=$CG_G4_EX(≤2) attempt1=$CG_G4_A2 dr=$CG_G4_DR st=$(grep '^state=' "$rf4" 2>/dev/null)"
+fi
+if [ "$CG_G4_BEFORE" = "$CG_G4_AFTER" ] && [ "$CG_G4_AFTER" -le 2 ]; then
+    ok "D-P6-10-03 G4b: run 终局后再跑 4 tick 零重放（$CG_G4_BEFORE→$CG_G4_AFTER，引擎侧拒绝终局后 arm）"
+else
+    bad "D-P6-10-03 G4b 终局后仍重放 $CG_G4_BEFORE→$CG_G4_AFTER"
+fi
+# 原语直测：replenish 计入 daemon_restart/timeout；terminate exhaust 到 max 并清 until
+G4P="$T/replenish"; mkdir -p "$G4P/cf"
+{ echo 'x|cf|action_failure|FAILED||1|exit=1'; echo 'x|cf|daemon_restart|FAILED|||residual'; echo 'x|cf|timeout|FAILED|||over'; } > "$G4P/cf/events.log"
+dag_retry_replenish "$G4P" cf
+[ "$(cat "$G4P/cf/retry.count")" = "2" ] \
+    && ok "D-P6-10-03 G4c: dag_retry_replenish 以 events.log 全失败事件计数（3 事件→retry.count=2；旧实现仅数 action_failure→0）" \
+    || bad "D-P6-10-03 G4c replenish 计数异常 count=$(cat "$G4P/cf/retry.count" 2>/dev/null)（期望 2）"
+G4Q="$T/term"; mkdir -p "$G4Q/cf" "$G4Q/sdir"
+echo "retry.max=3" > "$G4Q/sdir/cf.task"
+echo 0 > "$G4Q/cf/retry.count"; echo 9999999999 > "$G4Q/cf/retry.until"
+dag_retry_terminate "$G4Q" "$G4Q/sdir" cf
+[ "$(cat "$G4Q/cf/retry.count" 2>/dev/null)" = "3" ] && [ ! -f "$G4Q/cf/retry.until" ] \
+    && ok "D-P6-10-03 G4d: dag_retry_terminate 终局 exhaust（count:=max=3、清 retry.until）阻断终局后重放" \
+    || bad "D-P6-10-03 G4d terminate 异常 count=$(cat "$G4Q/cf/retry.count" 2>/dev/null) until=$([ -f "$G4Q/cf/retry.until" ] && echo present || echo gone)"
+# 接线静态守卫：终局分支调用 terminate（非旧 replenish-only），且 replenish 计 daemon_restart
+grep -q 'dag_retry_terminate "\$dgv_tasks" "\$dgv_sdir" "\$dgv_nid"' "$RTLIB" \
+    && ok "D-P6-10-03 G4e: run 终局分支接线 dag_retry_terminate（引擎侧拒绝终局后 arm）" \
+    || bad "D-P6-10-03 G4e 终局分支未接 terminate"
+grep -q 'daemon_restart' <(sed -n '/^dag_retry_replenish()/,/^}/p' "$RTLIB") \
+    && ok "D-P6-10-03 G4f: dag_retry_replenish 计入 daemon_restart/timeout 事件" \
+    || bad "D-P6-10-03 G4f replenish 仍只数 action_failure"
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "crashguard tests: PASS=$PASS FAIL=$FAIL"

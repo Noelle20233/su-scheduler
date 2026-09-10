@@ -735,6 +735,16 @@ LAST_MTIME=0
 
 # 🔄 Main Event Loop
 while true; do
+    # 🔒 锁主围栏（D-P6-10-02）：任何时刻仅锁持有者执行 tick。若 lock 内 PID ≠ 自身
+    #   且该 PID 存活且为 su-schedulerd → 本实例为被删锁/接管竞态后的非持有者孪生，
+    #   自退（不删锁——锁属现任持有者；记 clean exit 防 crash_seq 假累加）。service.sh
+    #   看护的 noclobber 拉起行为保持原样（由本围栏使接管安全，单常驻不变量兜底）。
+    if [ "$RUNTIME_LOADED" -eq 1 ] && [ "$(lifecycle_lock_owner_fence "$LOCK_FILE" "$$")" = "yield" ]; then
+        log_msg "WARNING" "🔒 Lock-owner fence: live daemon (PID $(cat "$LOCK_FILE" 2>/dev/null)) holds the lock; non-holder (PID $$) exiting (single-resident invariant, D-P6-10-02)"
+        crash_record_exit "$DATA_DIR" 0 >/dev/null 2>&1
+        exit 0
+    fi
+
     current_time=$(date "+%H%M")
 
     if [ "$RUNTIME_LOADED" -eq 1 ]; then

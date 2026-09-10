@@ -289,6 +289,68 @@ else
 fi
 rm -f "$R7LKA"
 
+# ── 8) D-P6-10-02：孪生 daemon 单常驻不变量（锁主唯一性围栏）────────────────
+# 设备取证：高负载 cmd_stop 6s 超时**删锁** → service.sh 看护（C5 禁动）noclobber
+#   拉起新实例接管成功 → **旧非持有者进程仍存活** → 双/三 daemon 同 tick（审计每分钟
+#   2–3 行）。修复：daemon 每 tick 顶置锁主围栏（lifecycle_lock_owner_fence：锁内 PID
+#   非自身且该 PID 存活且为 su-schedulerd → 非持有者让位）+ cmd_stop 仅在确认持有者
+#   死亡后才删锁。本块宿主复现（真机复验延后）。
+# (A) 围栏语义：hold/yield 逐判定（修复前 lifecycle_lock_owner_fence 未定义 → 断言 FAIL）
+D8T="$T/d02"; mkdir -p "$D8T/base"
+LKF8="$D8T/daemon.lock"; AUD8="$D8T/base/scheduler/audit.log"
+mkdir -p "$D8T/base/scheduler"; : > "$AUD8"
+mk_holder() {   # → stdout=存活 fake daemon pid（cmdline 含 su-schedulerd；exec -a 令 pid=该进程）
+    bash -c 'exec -a su-schedulerd sleep 300' >/dev/null 2>&1 &
+    echo "$!"
+}
+OLDP8=$(mk_holder); NEWP8=$(mk_holder)
+i=0; while [ "$i" -lt 40 ] && { [ ! -d "/proc/$OLDP8" ] || [ ! -d "/proc/$NEWP8" ]; }; do sleep 0.1; i=$((i + 1)); done
+printf '%s\n' "$NEWP8" > "$LKF8"           # 锁被接管：持有者=NEW，OLD 为残留非持有者
+fence_of() { lifecycle_lock_owner_fence "$LKF8" "$1" 2>/dev/null; }
+[ "$(fence_of "$NEWP8")" = "hold" ] && ok "D-P6-10-02 A1: lock holder (NEW) → hold (may tick)" || bad "D-P6-10-02 A1: holder fence not hold (got=[$(fence_of "$NEWP8")])"
+[ "$(fence_of "$OLDP8")" = "yield" ] && ok "D-P6-10-02 A2: live non-holder (OLD, lock=NEW daemon) → yield (must not tick)" || bad "D-P6-10-02 A2: non-holder fence not yield (got=[$(fence_of "$OLDP8")])"
+kill -9 "$OLDP8" 2>/dev/null; i=0; while [ "$i" -lt 40 ] && [ -d "/proc/$OLDP8" ]; do sleep 0.1; i=$((i + 1)); done
+[ "$(fence_of "$NEWP8")" = "hold" ] && ok "D-P6-10-02 A3: holder with dead rival → hold (no false yield)" || bad "D-P6-10-02 A3: after rival died holder not hold"
+printf '99999999\n' > "$LKF8"
+[ "$(fence_of "$NEWP8")" = "hold" ] && ok "D-P6-10-02 A4: stale lock (dead PID) → holder still hold" || bad "D-P6-10-02 A4: stale-lock fence wrong"
+: > "$LKF8"
+[ "$(lifecycle_lock_owner_fence "$LKF8" "$NEWP8" 2>/dev/null)" = "hold" ] && ok "D-P6-10-02 A5: empty lock (noclobber 未及写 PID) → hold (交回启动仲裁)" || bad "D-P6-10-02 A5: empty-lock fence wrong"
+printf '%s\n' "$$" > "$LKF8"           # 锁内=测试自身 pid（非 su-schedulerd 存活进程）→ 保守不判
+[ "$(lifecycle_lock_owner_fence "$LKF8" "888888" 2>/dev/null)" = "hold" ] && ok "D-P6-10-02 A6: live holder PID 非 su-schedulerd → hold (不误伤)" || bad "D-P6-10-02 A6: non-daemon holder fence wrong"
+# (B) 单 tick 单审计（端到端）：OLD+NEW 均存活、锁=NEW，各自按围栏裁决是否落 op=tick
+#   行（镜像 daemon 循环顶的围栏门）。修复前 helper 未定义 → 两者都落 → 2 行 → FAIL。
+printf '%s\n' "$NEWP8" > "$LKF8"
+OLDP8B=$(mk_holder)
+i=0; while [ "$i" -lt 40 ] && [ ! -d "/proc/$OLDP8B" ]; do sleep 0.1; i=$((i + 1)); done
+tick_round() {   # <self-pid> → 仅持有者落一行 op=tick（无围栏时默认落行=修复前行为）
+    if [ "$(lifecycle_lock_owner_fence "$LKF8" "$1" 2>/dev/null)" != "yield" ]; then
+        echo "op=tick|now=0830|pid=$1" >> "$AUD8"
+    fi
+}
+tick_round "$OLDP8B"; tick_round "$NEWP8"
+TK8=$(grep -c '^op=tick|now=0830' "$AUD8" | tr -d ' ')
+[ "$TK8" = "1" ] && ok "D-P6-10-02 B1: 双实例并存 → 同 token 恰 1 行 op=tick 审计（单常驻不变量；旧非持有者让位）" || bad "D-P6-10-02 B1: op=tick lines=$TK8 (expect 1 — twin ticking D-P6-10-02)"
+# (C) 接线静态守卫：daemon 每 tick 顶置围栏（早于 scheduler_tick）；cmd_stop 仅确认
+#   持有者死亡后才删锁；service.sh 零改动（不引入围栏，C5）。
+fence_ln=$(grep -n 'lifecycle_lock_owner_fence "\$LOCK_FILE"' "$DAEMON" | head -1 | cut -d: -f1)
+tick_ln=$(grep -n 'scheduler_tick "\$DATA_DIR"' "$DAEMON" | head -1 | cut -d: -f1)
+[ -n "$fence_ln" ] && [ -n "$tick_ln" ] && [ "$fence_ln" -lt "$tick_ln" ] \
+    && ok "D-P6-10-02 C1: daemon wires per-tick lock-owner fence (L$fence_ln) before scheduler_tick (L$tick_ln)" \
+    || bad "D-P6-10-02 C1: fence wiring missing/after tick (fence=$fence_ln tick=$tick_ln)"
+CLI_SCRIPT="$PWD/system/bin/su-scheduler"
+grep -q 'if \[ "${gone:-0}" -ne 1 \]' "$CLI_SCRIPT" && grep -q 'Stop incomplete' "$CLI_SCRIPT" \
+    && ok "D-P6-10-02 C2: cmd_stop gates lock removal on confirmed holder death (retains lock on timeout)" \
+    || bad "D-P6-10-02 C2: cmd_stop still removes lock unconditionally (twin trigger)"
+n=$(grep -c 'lifecycle_lock_owner_fence' "$SVC")
+[ "$n" -eq 0 ] && ok "D-P6-10-02 C3: service.sh untouched (no fence wiring; watchdog noclobber kept as-is, C5)" || bad "D-P6-10-02 C3: service.sh references fence (forbidden)"
+# 围栏恰 1 处定义 + selfcheck 注册
+n=$(grep -cE '^lifecycle_lock_owner_fence\(\)' "$RTLIB")
+[ "$n" -eq 1 ] && ok "D-P6-10-02 C4: lifecycle_lock_owner_fence defined exactly once" || bad "D-P6-10-02 C4: fence defs=$n"
+sel8=$(sed -n '/^runtime_lib_selfcheck()/,/^}/p' "$RTLIB")
+printf '%s\n' "$sel8" | grep -q 'lifecycle_lock_owner_fence' && ok "D-P6-10-02 C5: fence registered in runtime_lib_selfcheck" || bad "D-P6-10-02 C5: fence not in selfcheck"
+kill -9 "$OLDP8" "$NEWP8" "$OLDP8B" 2>/dev/null
+i=0; while [ "$i" -lt 40 ] && { [ -d "/proc/$NEWP8" ] || [ -d "/proc/$OLDP8B" ]; }; do sleep 0.1; i=$((i + 1)); done
+
 # ── 汇总 ────────────────────────────────────────────────────────────────────
 echo "──────────────────────────────────────────────────────────────────────"
 echo "lifecycle-prod tests: PASS=$PASS FAIL=$FAIL"

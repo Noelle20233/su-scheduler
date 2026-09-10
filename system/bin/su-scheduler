@@ -967,6 +967,14 @@ cmd_stop() {
             sleep 1
             i=$((i + 1))
         done
+        # D-P6-10-02：6s 超时后仍存活（高负载下 SIGTERM 处理被拖慢）→ **不删锁**、
+        #   报错返回。删锁会让 service.sh 看护 noclobber 接管成功 + 旧非持有者残留
+        #   → 双/三 daemon 同 tick。锁保留至持有者真正退出（其 lock 内 PID 变 stale
+        #   后由下一次 start/看护安全接管）；单常驻不变量由 daemon 侧锁主围栏兜底。
+        if [ "${gone:-0}" -ne 1 ]; then
+            echo -e "${RED}${BOLD}⚠️ Stop incomplete.${RESET} Daemon PID(s) still alive after 6s; lock kept (not removed) to avoid twin. Retry 'stop' or check load."
+            return 1
+        fi
         rm -f "$lock_file"
         echo -e "${RED}${BOLD}🛑 Halted.${RESET} The daemon has been stopped."
     else

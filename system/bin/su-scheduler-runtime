@@ -1446,6 +1446,25 @@ lifecycle_watchdog_tick() {
     return 1
 }
 
+# 锁主唯一性围栏（D-P6-10-02）：任何时刻仅"锁持有者"可执行 tick。
+#   锁内 PID 为**另一存活的 su-schedulerd** 时，本实例即非持有者（被 cmd_stop 删锁
+#   后残留、或重启风暴中 noclobber 接管的落败方）→ stdout=yield（调用方须自退/跳过
+#   tick）；锁缺失/空/非数字/自身持有/持锁者已死/持锁者非 daemon → stdout=hold。
+#   只判不写（不改锁文件本身，交由启动仲裁与 noclobber 接管处理）。
+#   <lock_file> <self_pid> → stdout: hold|yield
+lifecycle_lock_owner_fence() {   # D-P6-10-02 单常驻不变量围栏
+    lf_lock=$1; lf_self=$2
+    [ -f "$lf_lock" ] || { echo hold; return 0; }
+    lf_pid=$(cat "$lf_lock" 2>/dev/null | tr -d ' \t\r')
+    [ -n "$lf_pid" ] || { echo hold; return 0; }               # 空锁（noclobber 未及写 PID）→ 不判
+    case "$lf_pid" in *[!0-9]*) echo hold; return 0 ;; esac    # 垃圾 PID 锁 → 交回启动仲裁
+    [ "$lf_pid" = "$lf_self" ] && { echo hold; return 0; }     # 自己是持有者
+    [ -d "/proc/$lf_pid" ] || { echo hold; return 0; }         # 持锁者已死 → 本实例可为持有者
+    lf_cmd=$(tr '\0' ' ' < "/proc/$lf_pid/cmdline" 2>/dev/null)
+    case "$lf_cmd" in *su-schedulerd*) echo yield; return 0 ;; esac  # 另一活 daemon 持锁 → 让位
+    echo hold; return 0                                       # 持锁者存活但非 daemon（PID 复用）→ 保守不判
+}
+
 # ────────────────────────────────────────────────────────────────────────
 # §7 Task 只读 CLI（P1-11 验证原语 → P2-02 生产化）
 # ────────────────────────────────────────────────────────────────────────
@@ -7100,6 +7119,7 @@ DAG_RUNS_MAX=${DAG_RUNS_MAX:-8}
 DAG_PARALLEL_MAX=${DAG_PARALLEL_MAX:-4}
 DAG_RUN_TIMEOUT=${DAG_RUN_TIMEOUT:-86400}
 DAG_RUNS_KEEP=${DAG_RUNS_KEEP:-8}
+DAG_SCAN_MAX_AGE_MIN=${DAG_SCAN_MAX_AGE_MIN:-1440}   # D-P6-10-01：登记扫描年龄窗（分钟，默认 24h）
 
 dag_runs_root()  { echo "$1/dag"; }
 dag_chain_dir()  { echo "$1/dag/$2"; }
@@ -7113,6 +7133,36 @@ dag_token_ok() {
         [0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]) return 0 ;;
         *) return 1 ;;
     esac
+}
+
+# D-P6-10-01 登记扫描年龄钳制：<tok> <cur> <win_min> → 0=tok 距 cur 在 [0,win] 分钟内
+#   （近期，可登记）；1=陈旧残留/未来 token/任一不可解析（跳过，不登记、不回 pending）。
+#   纯 awk 历法差（days_from_civil），零外部依赖、零 wall-clock——cur/tok 皆为 12 位
+#   cycle token（YYYYMMDDHHMM），与 SCHED_CYCLE_NOW 冻结时钟一致，跨日/月/年精确。
+dag_token_age_le() {   # <tok> <cur> <win_min>
+    awk -v a="$1" -v b="$2" -v w="$3" '
+        function ok12(s,  i,c){ if(length(s)!=12) return 0
+            for(i=1;i<=12;i++){ c=substr(s,i,1); if(c<"0"||c>"9") return 0 } return 1 }
+        function dmin(t,  y,m,d,h,mi,e,ms,era,yoe,doy,doe,days){
+            y=substr(t,1,4)+0; m=substr(t,5,2)+0; d=substr(t,7,2)+0
+            h=substr(t,9,2)+0; mi=substr(t,11,2)+0
+            if(m<1||m>12||d<1||d>31||h>23||mi>59) return -1
+            e=(m<=2)?-1:0; y=y+e
+            ms=(m>2)?(m-3):(m+9)
+            era=(y>=0)?int(y/400):int((y-399)/400)
+            yoe=y-era*400
+            doy=int((153*ms+2)/5)+d-1
+            doe=yoe*365+int(yoe/4)-int(yoe/100)+doy
+            days=era*146097+doe-719468
+            return days*1440+h*60+mi }
+        BEGIN{
+            if(!ok12(a)||!ok12(b)) exit 1
+            ca=dmin(a); cb=dmin(b)
+            if(ca<0||cb<0) exit 1
+            diff=cb-ca
+            if(diff<0) exit 1
+            if(diff>(w+0)) exit 1
+            exit 0 }'
 }
 
 # 图字符串精确查值（避免 grep 正则 `.` 误配；id 无 `|`）：<multiline k=v 表> <id> <字段号>
@@ -7464,21 +7514,46 @@ dag_retry_open() {   # <tasks> <sdir> <id> → 0=仍可重试（视为非终态�
 }
 
 # P6-07（G1/G1b 复现）：链节点崩溃落回 FAILED 静息态时，终态对账（state_sync_one
-# P4-07 分支）清除 retry.count/retry.until——该清除是时间任务「新窗口=新生命
-# 周期」的重置语义；链节点无窗口，retry-arm 因此从 0 重复 attempt 1/max，P4-07
-# 钳制失效 → 无界崩溃循环、run 永不（或终态后节点仍）复跑。引擎从自身可见的
-# 失败事件账本重建「已消耗尝试数」（action_failure 次数 − 1），仅作用于账本内
-# FAILED+disp 成员且三工件皆缺（静息病态）时；时间任务路径零触碰（§27 边界）。
+#   P4-07 分支）清除 retry.count/retry.until——该清除是时间任务「新窗口=新生命
+#   周期」的重置语义；链节点无窗口，retry-arm 因此从 0 重复 attempt 1/max，P4-07
+#   钳制失效 → 无界崩溃循环、run 永不（或终态后节点仍）复跑。引擎从自身可见的
+#   失败事件账本重建「已消耗尝试数」（失败事件计数 − 1），仅作用于账本内
+#   FAILED+disp 成员且三工件皆缺（静息病态）时；时间任务路径零触碰（§27 边界）。
+# P6-10 D-P6-10-03：微窗 kill 使一次「已 respawn 但子进程未落 retry 计数」的尝试被
+#   恢复判为 daemon_restart 残留（非 action_failure）。故"已消耗尝试数"必须计入
+#   action_failure + daemon_restart + timeout **全部**失败事件（不信任残存/被清零的
+#   retry.count，以 events.log 为准），否则 kill-after-respawn 少计一次 → 多 arm 一次
+#   → retry.max=1 实跑 3 次（1+max+1）。
 dag_retry_replenish() {   # <tasks_dir> <id> → 0（恒非致命）
     drr_rd="$1/$2"
     [ -f "$drr_rd/retry.count" ] && return 0
     [ -f "$drr_rd/retry.until" ] && return 0
     [ -f "$drr_rd/gate.fail" ] && return 0
-    drr_f=$(grep -c '|action_failure|FAILED|' "$drr_rd/events.log" 2>/dev/null)
+    drr_f=$(grep -cE '\|(action_failure|daemon_restart|timeout)\|FAILED\|' "$drr_rd/events.log" 2>/dev/null)
     case "$drr_f" in ''|*[!0-9]*) drr_f=0 ;; esac
     [ "$drr_f" -gt 0 ] || return 0
     echo $((drr_f - 1)) > "$drr_rd/retry.count" 2>/dev/null
     chmod 600 "$drr_rd/retry.count" 2>/dev/null
+    return 0
+}
+
+# P6-10 D-P6-10-03：run 已终局（SUCCESS|FAILED）后，引擎侧拒绝再 arm 该 run 的节点。
+#   节点级重试仅在 run 未终局时合法（allterm 判定要求所有节点 retry 预算耗尽才终局）；
+#   一旦终局，任何残存/待补的 retry.until 都不得再触发重放（设备微窗 kill 后节点被
+#   误判可重试的兜底）。故对 disp+FAILED 成员：以 events.log 重建已消耗尝试后，一律
+#   将 retry.count 抬到 retry.max（若 >0）并清除 retry.until——sched_retry_arm 的
+#   `retry.count < retry.max` 判定恒假 → 终局后零重放。时间任务零触碰（§27 边界）。
+#   <tasks_dir> <sdir> <id> → 0（恒非致命）
+dag_retry_terminate() {   # D-P6-10-03 run 终局后拒绝再 arm 该 run 节点
+    drt_rd="$1/$3"; drt_tf="$2/$3.task"
+    [ -d "$drt_rd" ] || return 0
+    [ -f "$drt_rd/gate.fail" ] && return 0        # gate-fail 传播本就不接退避
+    drt_max=$(sched_task_field "$drt_tf" retry.max 2>/dev/null)
+    case "$drt_max" in ''|*[!0-9]*) drt_max=0 ;; esac
+    rm -f "$drt_rd/retry.until" 2>/dev/null       # 清残留退避计时（防 advance 通道重放）
+    [ "$drt_max" -gt 0 ] 2>/dev/null || return 0
+    echo "$drt_max" > "$drt_rd/retry.count" 2>/dev/null   # 计满 → arm 恒拒
+    chmod 600 "$drt_rd/retry.count" 2>/dev/null
     return 0
 }
 
@@ -7524,10 +7599,12 @@ dag_run_update() {
             # P6-07（G1b）：run 终态后不再评估，但崩溃节点若被 sync 清掉 retry.count
             # 仍会被 retry-arm 重新接回退避（run 外无界复跑）。终态 run 的 disp+FAILED
             # 成员在返回前做同样的钳制重建（账本只读不改写——零写放大）。
+            # P6-10 D-P6-10-03：终局后一律 exhaust（count:=max + 清 retry.until）——
+            #   引擎侧拒绝再 arm 该 run 节点，微窗 kill 的残留退避不得触发终局后重放。
             while IFS='|' read -r dgv_nid dgv_ntrig dgv_nst dgv_nnote; do
                 [ -n "$dgv_nid" ] || continue
                 [ "$dgv_nst" = FAILED ] || continue
-                case " $dgv_nnote " in *" disp "*) dag_retry_replenish "$dgv_tasks" "$dgv_nid" ;; esac
+                case " $dgv_nnote " in *" disp "*) dag_retry_terminate "$dgv_tasks" "$dgv_sdir" "$dgv_nid" ;; esac
             done <<EOF
 $dgv_lines
 EOF
@@ -7838,6 +7915,10 @@ dag_scan_registrations() {
             dgv_cand="$dgv_t"; dgv_frompend=0   # 只登记最近一轮（历史缺口不重放，D53 链不重放）
         done
         [ -n "$dgv_cand" ] || continue
+        # D-P6-10-01 年龄钳制：陈旧 cycle 标记（距当前 token > DAG_SCAN_MAX_AGE_MIN）
+        #   一律跳过、且不回 pending（历史残留/清 dag 后的旧 token 不得复活为 PENDING
+        #   僵尸 run 占满 DAG_RUNS_MAX 名额）；可解析性由 dag_token_age_le 前置校验。
+        dag_token_age_le "$dgv_cand" "$dgv_cur" "$DAG_SCAN_MAX_AGE_MIN" || continue
         if [ "$dgv_full" -eq 1 ]; then
             # P6-07：名额全满 → 不再逐个尝试登记（省 O(pending)×audit），一律后滚；
             # 新入 pending 者补记一次 limit 审计（首次阻塞可见，与逐根尝试版等价）
@@ -7972,9 +8053,10 @@ runtime_lib_selfcheck() {
               shadow_tick runtime_map_lookup trigger_decide action_run \
               state_log_event state_health_allowed state_sync_all \
               state_rehydrate_residual registry_attach task_cli_attach \
-              task_cli_resolve_id task_cli_status_id runtime_scan_stale \
-              lifecycle_startup_registry lifecycle_startup_recover \
-              tpr_action_app_validate tpr_action_app_start health_check \
+               task_cli_resolve_id task_cli_status_id runtime_scan_stale \
+               lifecycle_startup_registry lifecycle_startup_recover \
+               lifecycle_lock_owner_fence \
+               tpr_action_app_validate tpr_action_app_start health_check \
               tpr_health_process_check tpr_health_port_check supervisor_step \
               supervisor_tick supervisor_health_spec supervisor_recover \
               supervisor_stop_task crash_guard_enter crash_record_exit \
@@ -8016,9 +8098,10 @@ sched_task_field sched_audit sched_dep_satisfied sched_gate_check \
                 dep_validate_graph dep_graph_read \
                  scheduler_dag_pass dag_validate_chains dag_run_parse dag_run_write \
                  dag_run_emit dag_token_ok dag_active_runs dag_root_map \
-                 dag_edges_eval dag_mirror_state dag_retry_open dag_run_update \
-                 dag_scan_busy dag_retry_replenish \
-                 dag_try_register dag_scan_registrations dag_sweep_runs; do
+                  dag_edges_eval dag_mirror_state dag_retry_open dag_run_update \
+                  dag_scan_busy dag_retry_replenish \
+                  dag_token_age_le dag_retry_terminate \
+                  dag_try_register dag_scan_registrations dag_sweep_runs; do
         type "$fn" >/dev/null 2>&1 || { echo "runtime-lib selfcheck: missing $fn" >&2; return 1; }
     done
     return 0

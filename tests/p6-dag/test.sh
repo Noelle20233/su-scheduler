@@ -1280,7 +1280,76 @@ fi
 # 名额验证：FAILED 后 dag_active_runs 不含该 run
 n_act=$(dag_active_runs "$E_BASE")
 [ "$n_act" = "0" ] && ok "DAG-P7-10b 终态 run 不计活跃名额（dag_active_runs=0，检查项3/8）" \
-    || bad "DAG-P7-10b 名额未释放 active=$n_act"
+     || bad "DAG-P7-10b 名额未释放 active=$n_act"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §D01 — D-P6-10-01：历史 cycle-* 残留不得重登记为 PENDING 僵尸 run（年龄钳制）
+# 设备取证（docs/P6-10.md §4）：只清 dag/ 不清 cycle-*/last_tick 时，F2 有界扫描把
+#   旧 token 重登记为 PENDING run → 占满 DAG_RUNS_MAX 名额 → 新链饿死。修复：
+#   dag_scan_registrations 加窗口/年龄钳制（dag_token_age_le：距当前 token 超窗即跳过、
+#   不回 pending）。套件 preflight 复位保留（双保险）。
+# ═══════════════════════════════════════════════════════════════════════════
+ex_new   # ── D01-01 陈旧残留：上会话/清 dag 后遗留的旧 cycle 标记 → 不登记
+DAG_RUNS_MAX=1                        # 单名额：僵尸一旦登记即饿死当轮真实链
+ex_task zr 0900 ""; ex_task zz chain zr        # 根 0900（当轮 0830/0831 不执行）→ 仅陈旧标记引用它
+mkdir -p "$E_BASE/scheduler"
+printf 'zr\n' > "$E_BASE/scheduler/cycle-202609070000"   # 陈旧 token（距 202609080830 ≈ 1950min > 24h 窗）
+etick 0830
+[ -d "$E_BASE/dag/zr/runs/202609070000" ] \
+    && bad "DAG-D01-01 陈旧 cycle token 被重登记为僵尸 run（D-P6-10-01 复现）" \
+    || ok "DAG-D01-01 陈旧 cycle token（> 年龄窗）被登记扫描跳过（不建僵尸 run）"
+n_d01=$(dag_active_runs "$E_BASE")
+[ "$n_d01" = "0" ] && ok "DAG-D01-01b 陈旧残留不占活跃名额（dag_active_runs=0）" \
+    || bad "DAG-D01-01b 僵尸占额 active=$n_d01"
+ex_new   # ── D01-02 可解析性：垃圾 token 目录名（非数字/短）残留 → 不登记、不崩
+ex_task zr 0900 ""; ex_task zz chain zr
+mkdir -p "$E_BASE/scheduler"
+printf 'zr\n' > "$E_BASE/scheduler/cycle-20260908083a"   # 含字母（ok12 拒）
+printf 'zr\n' > "$E_BASE/scheduler/cycle-20260907"       # 短 token（长度≠12，ok12 拒）
+etick 0830
+[ -z "$(ls "$E_BASE/dag/zr/runs" 2>/dev/null)" ] \
+    && ok "DAG-D01-02 不可解析 cycle token（字母/短）不登记、零副作用" \
+    || bad "DAG-D01-02 垃圾 token 误登记: $(ls "$E_BASE/dag/zr/runs" 2>/dev/null | tr '\n' ' ')"
+ex_new   # ── D01-03 新链不饿死：陈旧残留存在时，当轮真实新链仍登记（修复前被僵尸占额）
+DAG_RUNS_MAX=1
+ex_task zr 0900 ""; ex_task zz chain zr                 # 陈旧根（0900 不触发）
+ex_task nr 0830 ""; ex_task nb chain nr                 # 当轮新链（0830 执行并 mark）
+mkdir -p "$E_BASE/scheduler"
+printf 'zr\n' > "$E_BASE/scheduler/cycle-202609010000"  # 陈旧残留（远超窗）
+etick 0830; etick 0831
+[ -f "$(run_of nr 202609080830)" ] \
+    && ok "DAG-D01-03 陈旧残留在场时新链 nr 仍正常登记（RUNS_MAX 未被僵尸占满，新链不饿死）" \
+    || bad "DAG-D01-03 新链被陈旧残留饿死（nr run 缺失）"
+[ ! -d "$E_BASE/dag/zr/runs/202609010000" ] \
+    && ok "DAG-D01-03b 同时陈旧 zr 未建僵尸 run" \
+    || bad "DAG-D01-03b zr 僵尸 run 仍在"
+ex_new   # ── D01-04 窗口内近期标记仍登记（钳制不误伤正常缺口补登）
+ex_task zr 0830 ""; ex_task zz chain zr
+touch "$E_SLOWDIR/zz"
+etick 0830                                              # 根执行 + mark cycle-202609080830
+etick 0831                                              # 登记距 cur 1 分钟前标记（窗内）
+[ -f "$(run_of zr 202609080830)" ] \
+    && ok "DAG-D01-04 年龄窗内（1 分钟前）的正常登记不受钳制影响（新链照常登记）" \
+    || bad "DAG-D01-04 近期标记被误钳（zr run 缺失）"
+# 年龄钳制原语：直接验证 dag_token_age_le 的窗/可解析/未来/非法语义
+age_ok=0
+dag_token_age_le 202609080830 202609080830 720 || age_ok=1                    # 同刻 → 0
+dag_token_age_le 202609080000 202609080830 720 || age_ok=$((age_ok+1))        # 8.5h 前 < 720 → 0
+dag_token_age_le 202609080830 202609080830 0 || age_ok=$((age_ok+1))          # win=0 同刻 → 0
+dag_token_age_le 202609070000 202609080830 720  && age_ok=$((age_ok+1))       # 跨日 >720 → 非0
+dag_token_age_le 202609080831 202609080830 720  && age_ok=$((age_ok+1))       # 未来 token → 非0
+dag_token_age_le 202609082400 202609080830 720  && age_ok=$((age_ok+1))       # 非法时/日 → 非0
+dag_token_age_le 2026090a0830 202609080830 720  && age_ok=$((age_ok+1))       # 含字母不可解析 → 非0
+dag_token_age_le abc           202609080830 720  && age_ok=$((age_ok+1))      # 非数字 → 非0
+[ "$age_ok" = "0" ] && ok "DAG-D01-05 dag_token_age_le 语义正确（窗内/跨日/未来/非法/不可解析）" \
+    || bad "DAG-D01-05 dag_token_age_le 判定异常 age_ok=$age_ok"
+# 接线静态守卫：登记扫描调用年龄钳制 + DAG_SCAN_MAX_AGE_MIN 默认常量
+grep -q 'dag_token_age_le "\$dgv_cand" "\$dgv_cur" "\$DAG_SCAN_MAX_AGE_MIN"' "$RT" \
+    && ok "DAG-D01-06 dag_scan_registrations 接线年龄钳制（候选登记前）" \
+    || bad "DAG-D01-06 登记扫描未接年龄钳制"
+grep -q '^DAG_SCAN_MAX_AGE_MIN=' "$RT" \
+    && ok "DAG-D01-07 DAG_SCAN_MAX_AGE_MIN 默认常量就位（可 env 覆盖）" \
+    || bad "DAG-D01-07 缺年龄窗常量"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # §posix — 自身与 fixtures 工具语法（lint 惯例：dash 可用则 dash -n，否则 bash -n；sh -n 恒跑）
