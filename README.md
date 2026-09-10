@@ -103,6 +103,7 @@ Use the `su-scheduler` command in your favorite terminal (Termux, etc.) to manag
 | `task-info <id>` | Get detailed task information 🔍 |
 | `task-output <id>` | View task output 📄 |
 | `task-kill <id>` | Terminate a task 💀 |
+| `chain [<chain-id>]` | Read-only DAG chain query: roots, runs, closure, catch-up headroom (P6-09) 🔗 |
 | `run <cmd : mods>` | Execute command directly with modifiers 🔧 |
 | `exec <cmd>` | Execute command directly 🔧 |
 
@@ -207,6 +208,14 @@ su-scheduler task-output time_0800_1_1673634890
 
 # Kill a task
 su-scheduler task-kill boot_1_1673634567
+
+# Query DAG chains (P6-09, read-only; managed mode; no daemon required)
+su-scheduler chain                 # all chain roots + latest run state + RUNS_MAX headroom
+su-scheduler chain backup_root     # one chain detail (accepts root OR member id)
+
+# Production task status (P2-08+; shows chain_*/note/reason + catch-up lines for
+# chain-related tasks; existing fields unchanged, new info appended)
+su-scheduler task status backup_sync
 ```
 
 ### Direct Execution (with modifiers)

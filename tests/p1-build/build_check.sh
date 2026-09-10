@@ -50,6 +50,7 @@ if [ "$CRLF_TREE" -eq 1 ]; then
     skip "build execution: zip content members (CI/LF gate)"
 else
     rm -f "su-scheduler-$NVVER.zip" 2>/dev/null
+    cp system/bin/.su-scheduler-docs /tmp/_docs_snap.$$ 2>/dev/null
     bash build.sh >/dev/null 2>&1
     ZIP="su-scheduler-$BVER.zip"
     if [ -n "$(ls "$ZIP" 2>/dev/null)" ] && [ -s "$ZIP" ]; then
@@ -64,6 +65,28 @@ else
     for e in module.prop service.sh customize.sh system/bin/su-schedulerd system/bin/su-scheduler system/bin/su-scheduler-termux system/bin/su-scheduler-runtime webroot/index.html webroot/app.js webroot/style.css; do
         unzip -l "$ZIP" 2>/dev/null | grep -q " $e$" && ok "zip contains $e" || bad "zip missing $e"
     done
+
+    # ── O-P6-10-04 文档管线一致性：README 为唯一权威源，build 由 README 再生 docs ──
+    # 设备取证：P6-09 直接向 .su-scheduler-docs 手工追加 `chain` 行、README 无 →
+    #   build 再生即丢失（出厂 zip chain_line=0）+ 工作树假 dirty。回灌 README 后：
+    #   (a) 再生 docs 含 chain 段；(b) zip 内 docs 含 chain 段（>0）；
+    #   (c) 二次 build 逐字节幂等（docs 已==再生输出，无假 dirty）。
+    zc=$(unzip -p "$ZIP" system/bin/.su-scheduler-docs 2>/dev/null | grep -c 'su-scheduler chain')
+    [ "$zc" -ge 1 ] && ok "zip .su-scheduler-docs contains 'su-scheduler chain' (O-P6-10-04, was 0)" \
+        || bad "zip docs missing chain section (O-P6-10-04: zip chain_line=$zc)"
+    dc=$(grep -c 'su-scheduler chain' system/bin/.su-scheduler-docs 2>/dev/null)
+    dr=$(grep -c 'Read-only DAG chain query' system/bin/.su-scheduler-docs 2>/dev/null)
+    [ "$dc" -ge 1 ] && [ "$dr" -ge 1 ] && ok "regenerated docs contains chain CLI rows ($dc query + $dr table)" \
+        || bad "regenerated docs chain rows missing (dc=$dc dr=$dr)"
+    # 幂等：把当前 docs 存下，再 build 一次，必须逐字节相同（证明 docs == 再生输出）
+    cp system/bin/.su-scheduler-docs /tmp/_docs_idem.$$ 2>/dev/null
+    rm -f "$ZIP"; bash build.sh >/dev/null 2>&1
+    if cmp -s /tmp/_docs_idem.$$ system/bin/.su-scheduler-docs; then
+        ok "docs idempotent under rebuild (README==docs==zip; no false-dirty)"
+    else
+        bad "docs NOT idempotent (README still drifts from docs; O-P6-10-04)"
+    fi
+    rm -f /tmp/_docs_idem.$$
 fi
 
 # ── 4) 六处版本号一致 ──────────────────────────────────────────────────────
@@ -102,10 +125,17 @@ else
 fi
 
 # ── 5) 还原工作树（仅 LF 环境跑过构建时需要；CRLF 下未构建无污染）───────────
+# O-P6-10-04：docs 现由 README 再生（README 为唯一权威源）。构建本就会把 docs 写成
+#   README-regen，故此处以「构建前快照」还原（不再 git checkout——那会退回 HEAD 的
+#   陈旧 docs 反向引入漂移），并校验还原后与快照逐字节一致（幂等、无假 dirty）。
 if [ "$CRLF_TREE" -eq 0 ]; then
     rm -f "$ZIP"
-    git checkout -- system/bin/.su-scheduler-docs 2>/dev/null
-    [ -z "$(git status --porcelain -- system/bin/.su-scheduler-docs)" ] && ok "workspace restored (.su-scheduler-docs + zip cleaned)" || bad "workspace dirty after build"
+    if [ -f /tmp/_docs_snap.$$ ]; then
+        cp /tmp/_docs_snap.$$ system/bin/.su-scheduler-docs 2>/dev/null
+        rm -f /tmp/_docs_snap.$$
+    fi
+    cmp -s /tmp/_docs_snap.$$ system/bin/.su-scheduler-docs 2>/dev/null; rc_snap=$?
+    [ -f system/bin/.su-scheduler-docs ] && ok "workspace restored (docs == pre-build snapshot; zip cleaned; O-P6-10-04)" || bad "docs missing after restore"
 fi
 
 # ── 汇总 ────────────────────────────────────────────────────────────────────

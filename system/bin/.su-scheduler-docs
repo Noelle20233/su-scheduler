@@ -1339,3 +1339,210 @@ su-scheduler task-output <task_id>
 | 10 | October |
 | 11 | November |
 | 12 | December |
+
+---
+
+## 🔗 兼容性与 P1 阶段状态（P1-13 追加）
+
+> 本章节为 P1 阶段（P1-01..P1-13）**追加**，不改动本文件既有任何章节。
+> 详细交接资料见 `docs/P1-HANDOVER.md`；兼容层架构见
+> `docs/architecture/compatibility-layer.md`。
+
+### 兼容性承诺
+
+- **配置格式不变**：`config.txt` 行格式 `<trigger> <command>[;] : <modifiers>`
+  与全部触发格式（boot / HHMM / HH:MM / weekly / nweekly / monthly /
+  nmonthly / yearly）、modifiers（--notify / --delete / --interactive /
+  --termux / --run-once-now / --msg）、heredoc 语义保持 v1.6.8 基线（基线
+  见 `docs/phase-1-baseline.md`）。
+- **旧解析与执行路径保留**：daemon、CLI、`service.sh`、`customize.sh`、
+  `build.sh` 与既有看护循环在 P1 期间零改动。
+- **P1 新增全部在测试域与文档**：内部 Task 模型（Schema v2）、状态机、
+  Provider 契约、Legacy Adapter、Task Registry、Trigger 决策、Action 执行、
+  运行时状态/事件、生命周期、只读 `task list` / `task status`——均不触碰
+  生产文件、不写回 `config.txt`。
+- **新旧状态不互覆盖**：旧工件（`status.txt`/`pid.txt`/`output.log`/
+  `exit_code.txt`/`end_time.txt`/`start_time.txt`）保持原义；新
+  `state.txt`/`events.log` 为**新增文件**，不与旧件同名。
+
+### P1 状态
+
+- **已实现**：P1-01..P1-12（基线、Task Schema v2、状态机、Provider 契约、
+  Legacy Adapter、Task Registry、Trigger 决策、Action 执行、运行时状态/事件、
+  生命周期、只读 Task CLI、P1 回归与设备冒烟脚本）。回归入口：
+  `bash tests/run_p1.sh`（11 套全绿，无 `[FAIL]`）。
+- **未实现（下一阶段，不视为已完成）**：**Watchdog 增强**、**WebUI**、
+  **Dependency**（依赖/条件触发）、App/Process/Service Action、
+  Health/Recovery 真实探测、daemon/CLI 生产接线——接口预留见
+  `docs/P1-HANDOVER.md` §5，任何文档不得把它们表述为已完成。
+- **升级与回滚**：P1 零生产改动，升级 = 合入 P1 提交（无迁移）；回滚 =
+  删除 P1 层与文档（生产零影响）。命令级手册见 `docs/P1-UPGRADE-ROLLBACK.md`。
+
+---
+
+## 🌐 WebUI 只读数据面（P3-05）
+
+> 本章节为 P3-05 追加，不改动本文件既有任何章节。
+
+Su Scheduler 提供**只读** WebUI（Dashboard / Task List / Task Detail / Logs），
+数据全部经 IPC（Runtime Read Aggregator，Runtime §22）读取——**不提供任何
+Root Shell，前端 JS 不读数据目录、不调系统命令/动态求值**。静态资源位于
+模块 `webroot/`（KernelSU 原生 WebUI 伺服），同时提供 CLI Reader 供主机/脚本使用：
+
+```bash
+# 主机/脚本验收与 KernelSU WebUI Bridge 共用同一 CLI Reader（只读白名单）
+su-scheduler webui GET_SUMMARY
+su-scheduler webui GET_TASK_DETAIL id=<base64(task_id)>
+su-scheduler webui GET_TASK_EVENTS id=<base64(task_id)> lines=<base64(50)>
+su-scheduler webui GET_DAEMON_LOG lines=<base64(100)>
+su-scheduler webui GET_TASK_LOG id=<base64(task_id)> lines=<base64(100)>
+```
+
+- 成功输出**单行统一 JSON**；失败输出 `{"ok":false,"rc":N,"error":"..."}`
+  （rc 6 = daemon_unavailable 离线；rc 3 = task_not_found）。
+- 日志读取有界（task/daemon ≤500 行、events ≤200 行），`truncated` 标志
+  明确提示「日志已截断」。
+- 页面范围与数据契约见 **`docs/P3-05-WEBUI-DATA.md`**；执行记录见 `docs/P3-05.md`。
+
+---
+
+## 🎛️ Task 控制操作（P3-07）
+
+> 本章节为 P3-07 追加，不改动本文件既有任何章节。
+
+WebUI 与 CLI 共用**同一控制 API**：CLI `su-scheduler task <op> <id>` 与 WebUI
+控制按钮（Task Detail 的 Start/Stop/Restart/Check/Enable/Disable/Logs）都经
+IPC op（`START_TASK`/`STOP_TASK`/`RESTART_TASK`/`CHECK_TASK`/`ENABLE_TASK`/
+`DISABLE_TASK`/`GET_TASK_LOG`）落到 daemon 的 Runtime §24 `tctl_*`（唯一控制
+语义 + TSM 状态机强制），旧 CLI 命令（`task-info`/`task-output`/`task-kill`/
+`tasks`/`status`/`stop`/`restart`）零改动保留。
+
+```bash
+su-scheduler task enable <id>      # 修改配置状态（仅 Managed）
+su-scheduler task disable <id>
+su-scheduler task start <id>       # 手动启动（已运行 → skip，不重复启动）
+su-scheduler task stop <id>        # 停止当前运行实例（只杀本运行目录 pid）
+su-scheduler task restart <id>     # 停止后重新启动
+su-scheduler task check <id>       # 立即执行一次健康检查
+su-scheduler task logs <id> [n]    # 查询 Task 日志
+```
+
+- **状态机强制**：start 经 `PENDING→STARTING→RUNNING`、stop 经
+  `RUNNING/HEALTHY→STOPPING→STOPPED`、终态重武装 `FAILED→PENDING`；非法操作
+  （如 STOPPING 中 start）返回错误且**不强行写状态文件**。
+- 支持稳定 Task ID 与旧运行 ID（旧运行 ID 控制其旧运行目录）。
+- 执行记录见 `docs/P3-07.md`。
+
+---
+
+## 🔒 安全与资源加固（P3-08）
+
+> 本章节为 P3-08 追加，不改动本文件既有任何章节。
+
+WebUI 作为高权限（root）平台的安全与资源加固（Runtime §25）：输入/文件/执行/
+资源四类，全部为叠加校验原语 + 既有入口收口（不重构、不加 eval、不临时拼接
+Root 命令）。
+
+- **输入安全**：IPC 白名单 + 参数键白名单（P3-04）；`secv_id_ok` Task ID 字符集
+  门（id-bearing op 外层拒绝路径穿越 id → invalid_request）；`secv_num_clamp`
+  数值钳制（日志 lines）；请求大小限制（IPC_REQ_MAX）。
+- **文件安全**：`secv_inside`/`secv_nosymlink`/`secv_guard_task_dir` 路径必须位于
+  允许目录（拒绝 `..`/符号链接逃逸）；`secv_fix_perms` 权限强制（ipc 0700 /
+  task-config 600 / 运行目录 700）；`secv_sweep_tmp` 临时文件清理（原子写兜底）。
+- **执行安全**：命令只读自已校验任务文件（WebUI/CLI 不能临时拼接 Root 命令）；
+  `secv_effective_timeout` 每个 Action 有超时（advanced.timeout ≤ TASK_RUNTIME_MAX）。
+- **资源安全**：`runtime_limit_task_log` 单 Task 日志字节上限；快照/任务目录上限
+  （P2-14）；`secv_ipc_ratelimit` IPC 频率限制（超限 → rc 7 `rate_limited`）。
+- 审计清单见 `docs/security-audit.md`；执行记录见 `docs/P3-08.md`。
+
+---
+
+## 🧪 回归测试（P2-01 追加）
+
+> 本章节为 P2-01 追加，不改动本文件既有任何章节。P0/P1 门禁的**唯一回归入口**
+> 已统一为 `tests/run_tests.sh`（取代并覆盖此前的 `tests/run_p1.sh` 与
+> `tests/_run_all.sh`；后两者保留为兼容子入口，见下）。
+
+### 唯一入口与层级
+
+```bash
+bash tests/run_tests.sh                # 全量：L1 + L2 + L4（无设备）
+bash tests/run_tests.sh --with-device  # 追加 L3 设备冒烟（无设备 → DEVICE_SKIPPED）
+bash tests/run_tests.sh --lint-only    # 只跑 L1 静态语法层（快速检查）
+```
+
+| 层 | 内容 | 套件 |
+| :-- | :-- | :-- |
+| L1 | 静态语法（`sh -n` / `bash -n`，LF 归一，CRLF 检出亦通过） | `tests/lint/syntax.sh` |
+| L2 | legacy 解析 golden 锁定（真实函数复现 + 逐字节比对） | `tests/legacy/golden.sh` |
+| L2 | `--delete` 删除管线语义锁定（Q13：单激活行 `grep -v && mv` 短路） | `tests/legacy/delete-pipeline.sh` |
+| L2 | 生产 Runtime 库边界（P2-02：daemon/CLI 共用原语、路径隔离、fallback） | `tests/runtime-lib/test.sh` |
+| L2 | Registry Shadow Mode（P2-03：启动快照、原子 reload、损坏 KEPT、旁路比对记录） | `tests/shadow/test.sh` |
+| L2 | Canonical↔Legacy Run ID 兼容（P2-04：双向映射、旧 CLI 原样可用、零改名） | `tests/idmap/test.sh` |
+| L2 | TriggerProvider 接入（P2-05：单一正式入口 trigger_decide、boot/time/advanced 经 Provider、保留 ron/delete/去重、新旧一致比对） | `tests/trigger/test.sh` |
+| L2 | CommandActionProvider 接入（P2-06：单一正式入口 action_run、Provider 委托既有 execute_task、四模式经统一 Action 入口、旧工件 status/pid/output/exit_code 保留、不建第二执行器） | `tests/action/test.sh` |
+| L2 | 统一状态与事件日志（P2-07：state.txt/events.log 双写与旧工件并存、一次性任务成功→STOPPED 不虚假 HEALTHY、健康 Provider 门槛、非法转换非致命、重启残留再水合、旧 CLI 仍读旧状态） | `tests/state/test.sh` |
+| L2 | 生产 Task CLI（P2-08：`task list|status`、Registry 只读挂载不重扫配置、稳定 Task ID 与旧运行 ID 双向查询、三态错误区分） | `tests/task-cli-prod/test.sh` |
+| L2 | daemon 生命周期（P2-09：启动序列、最后有效快照回退、stale PID 恢复、stop/restart/stale lock 真实链路、单常驻循环、service 60s 看护原样） | `tests/lifecycle-prod/test.sh` |
+| L2 | App Action（P2-10：package/activity/broadcast/service 结构化 spec、全参数校验拒绝 shell 注入、固定 am 模板构建、mock am 逐 argv 断言） | `tests/app-action/test.sh` |
+| L2 | Process/Port Health（P2-11：Process Check / Port Check、统一三态 HEALTHY/UNHEALTHY/UNKNOWN + 原因 + 延迟 + 目标、真实监听验证、P2-07 健康门槛打开） | `tests/health/test.sh` |
+| L2 | Supervisor 核心（P2-12：RUNNING→HEALTHY→UNHEALTHY→RECOVERING→STARTING\|FAILED 完整生命周期、统一事件循环无每任务常驻循环、恢复策略 retry.max/interval、真实 nc 闭环） | `tests/supervisor/test.sh` |
+| L2 | Recovery/Retry/Cooldown（P2-13：Restart/Start/Stop+Start/Execute Script 恢复动作、max_retry 钳制禁止无限重启、retry.interval 节奏、基础 cooldown） | `tests/recovery/test.sh` |
+| L2 | Crash Loop 与资源保护（P2-14：guard 降级窗口/节流/优雅重置、SIGKILL 崩溃序列抑制、日志/任务目录/快照上限、健康探针最小间隔、运行超时护栏、fake daemon 真实链路） | `tests/crashguard/test.sh` |
+| L2 | P2 综合回归（P2-15：daemon kill/task kill/脚本 hang/应用崩溃/重启 端到端集成、Supervisor+CrashGuard+Health+Recovery 故障自愈闭环、重启残留收尾） | `tests/p2-integration/test.sh` |
+| L2 | P2 发布评审（P2-15：KernelSU/Magisk/APatch 安装结构 + 发布契约、systemless 覆盖、数据独立模块目录、manager-agnostic 安装） | `tests/p2-install/test.sh` |
+| L2 | Canonical Task Config Store（P3-02：双模式 legacy/managed 权威、导入幂等、失败原子性、回滚、导出、新建 ID `task_` 命名空间、损坏回退、接线） | `tests/config-v2/test.sh` |
+| L2 | Task v2 编辑校验矩阵（P3-06：ID 路径穿越拒绝、trigger 枚举、App Action 注入全拒、recovery script 绝对路径可读、数值范围钳制、保存原子性、后端权威校验） | `tests/config-v2/validation.sh` |
+| L2 | Registry 正式调度接管（P3-03：Registry 从 Shadow 提升为正式调度源、双模式 legacy/managed、TriggerProvider→ActionProvider、同周期去重、配置变更不重复执行、损坏 KEPT、task.v2 快照移除监督兜底、旧 CLI 查询/终止、单任务错误隔离、审计日志、接线） | `tests/scheduler-prod/test.sh` |
+| L2 | 本地 IPC 控制面（P3-04：请求/响应文件通道、固定格式、base64 值、19 op 白名单（P3-07 起含 CHECK_TASK）、可区分错误码、写操作仅 managed、START/STOP/RESTART 经 action_run→§24 tctl_*、重复请求不重复启动、原子响应、接线） | `tests/ipc/test.sh` |
+| L2 | IPC 安全边界（P3-04：fuzz/注入零副作用、Shell 元字符不进入执行路径、同 req_id 幂等、已运行不重复 START、单轮有界不阻塞、0700 权限、未授权写 permission_denied、daemon 停止 daemon_unavailable、超时 operation_timeout） | `tests/ipc/security.sh` |
+| L2 | WebUI 只读数据面（P3-05：GET_SUMMARY/GET_TASK_DETAIL/GET_TASK_EVENTS/GET_DAEMON_LOG 统一 JSON、GET_TASK_LOG meta 行、JSON 转义防注入、空/损坏/daemon 离线三态、CLI Reader 只读白名单 + JSON 信封、零 exec） | `tests/webui/read-only.test.sh` |
+| L2 | WebUI 安全（P3-05：webroot 无 Root 直执特征、恶意请求零 exec/零 config 写、`<script>`/引号/换行 JSON 转义、malformed→invalid_request、有界日志 + truncated 标志） | `tests/webui/security.test.sh` |
+| L2 | WebUI Task Editor（P3-06：GET_TASK_EDIT/EDIT_TASK/VALIDATE_TASK(payload) 分步表单保存/校验/回滚、合法保存重载、非法拒绝、旧配置不变、无重复 ID、App Action 注入拒、Health/Recovery 可被 Supervisor 读取） | `tests/webui/editor.test.sh` |
+| L2 | Task 控制操作（P3-07：WebUI 与 CLI 共用同一控制 API `task enable\|disable\|start\|stop\|restart\|check\|logs`，§24 tctl_* + TSM 强制可追踪、并发 start skip、stop 不误杀、旧运行 ID 控制旧运行目录、CHECK_TASK 立即健康检查、enable/disable 仅 managed、CLI 子命令经 IPC 全链路、失败不破坏 Registry/旧工件） | `tests/task-control/test.sh` |
+| L2 | 安全与资源加固（P3-08 输入安全：IPC 白名单/格式 fuzz、Task ID 字符集门、请求大小限制、START/CREATE/UPDATE 命令注入全拒、App Action/脚本路径校验，全零副作用） | `tests/security/fuzz.sh` |
+| L2 | 安全与资源加固（P3-08 路径安全：路径穿越/符号链接/允许目录约束/Task ID 门/IPC 穿越 id 拒绝零泄露、相对脚本拒） | `tests/security/path-validation.sh` |
+| L2 | 安全与资源加固（P3-08 文件安全：secv_fix_perms 强制 0700/600、原子写 tmp 清理、secv_sweep_tmp、未授权写 permission_denied） | `tests/security/permission.sh` |
+| L2 | 安全与资源加固（P3-08 资源安全：100 Task 单循环无 100 永久循环、日志/快照/任务目录上限、单任务错误隔离、IPC 频率限制 rc 7、CPU/内存有界） | `tests/resource/stress.sh` |
+| L2 | P3 综合回归（P3-09：安装契约→daemon 生命周期/Runtime 加载→Legacy 继续执行→Task v2 导入→Registry 调度→WebUI Dashboard→Task Editor 保存/回滚→App Action→Process/Port Health→Retry/Cooldown 钳制→Crash Loop→Task 控制→配置损坏回退→旧 CLI 查询→日志轮转→重启状态恢复 端到端协同，48 断言） | `tests/p3-integration/test.sh` |
+| L2 | Dependency/Condition Schema 与持久化（P4-02：`dependency=a,b,c` 逗号规范写回/空格容错规范化、`[?]<task-id>[:<STATE>]` 单条语法、STATE ∈ {STOPPED,FAILED}、condition 可打印 ASCII ≤256、DEP_MAX=32/COND_MAX_LEN=256、editor/store/CLI 后端权威校验、非法拒绝且原文件逐字节不变、Legacy 零影响） | `tests/p4-dependency/test.sh` |
+| L2 | CLI 行为门禁（Q1/Q2/Q3/Q4/Q9：`log -n`、`add` 触发器集、`list` 空态、`task-output` 去重、yearly 归一） | `tests/cli/test.sh` |
+| L2 | P1 层九套 + 跨层集成回归 | state-machine / providers / legacy-adapter / task-registry / trigger-decision / action-run / runtime / lifecycle / task-cli / p1-regression |
+| L4 | 构建 + 八处版本一致性（含 docs 头部与 changelog，Q12） | `tests/p1-build/build_check.sh` |
+| L3 | 设备冒烟（真实 KernelSU 设备，`adb` 通道；P1 legacy 冒烟） | `tests/p1-device/smoke.sh` |
+| L3 | P3 设备矩阵冒烟（P3-09：真机 18 项覆盖 + mksh `\|` 缺陷探测判定，`adb root`；结果见 docs/P3-DEVICE-MATRIX.md） | `tests/p3-device/smoke.sh` |
+
+**判定**：输出不得出现 `[FAIL]`；允许跳过项仅限 L3（`DEVICE_SKIPPED` 明示）与
+CRLF 检出下的构建执行（`[SKIP]` 明示，CI/LF 为构建闸）。**结果可追溯**：每次
+运行把完整逐层输出落盘 `tests/results/run_tests-<时间戳>.log`（`*.log` 已被
+`.gitignore` 忽略，不污染工作树），末尾打印日志路径。
+
+### CI 门禁
+
+`.github/workflows/test.yml`：`main` push（生产/测试/文档变更路径）与 PR 上运行
+`bash tests/run_tests.sh`（`ubuntu-latest` 标准 runner 自带工具，C3 合规；
+无 adb → L3 不参与）。**成功与失败均上传 trace 日志工件（30 天保留，
+P3-01）**——成功回归 trace 亦作为发布门禁证据存档。
+
+### 兼容性说明
+
+- `bash tests/run_p1.sh` 仍可用：P1 层专用子入口（9 套 + p1-regression + build-check），
+  不含 L1 与 CLI 门禁——新任务请使用 `tests/run_tests.sh`。
+- `tests/_run_all.sh` 已由 `tests/run_tests.sh` 取代（不再作为推荐入口）。
+- Q1–Q4/Q9/Q11/Q12 处理与 Q10（`--boot`）决策记录见 `docs/P2-01.md`；基线文档
+  `docs/phase-1-baseline.md` §6.1 有逐项状态表。
+
+### 📄 P3 出口与发布文档（P3-10 追加）
+
+> 本章节为 P3-10 追加，不改动本文件既有任何章节。
+
+- **出口评审**：`docs/P3-EXIT-REPORT.md`（P3 出口标准 11 项覆盖矩阵、功能/兼容/安全/
+  发布分类核验、D-IPC 修复说明、约束审计）。
+- **交接资料**：`docs/P3-HANDOVER.md`（新成员阅读路径、P3 流程全景、已实现清单、
+  P4 接口预留点、安全边界）。
+- **升级与回滚**：`docs/P3-UPGRADE-ROLLBACK.md`（发布候选安装、卸载/回滚、故障排查）。
+- **设备矩阵**：`docs/P3-DEVICE-MATRIX.md`（KernelSU×Android 16 真机 P3-09/10
+  **25 PASS / 0 FAIL / 3 BLOCKED**→D-IPC 修复；**P4-01 复验 28 PASS / 0 FAIL /
+  0 BLOCKED**，7/8/14 转 PASS；其余 14 格为发布限制）。
+- **P4 Dependency 需求输入**：`docs/P4-DEPENDENCY-REQUIREMENTS.md`（WAITING 接线点、
+  功能/非功能需求、安全边界、禁止事项）。
