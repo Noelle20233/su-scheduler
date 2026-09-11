@@ -85,12 +85,17 @@
 #   L2  tests/p6-verify/test.sh P6-11 综合验证（tick 三档+IPC 延迟基线、并发拒新
 #       时延、dash/mksh/node 兼容扩展面、保存失败 I/O 原子性、双模式互切实弹、
 #       P5 基线↔当前 Runtime 旧→新→旧→新宿主演练；git 历史不可用时演练组 SKIP）
+#   L2  tests/p7-mountify/test.sh P7-01 Mountify 兼容（纯委托挂载：opt-out 标记
+#       零出现/chcon 标签/无自 bind 静态契约、service.sh 无 mount 命令行、
+#       MODDIR 回退保留、runtime_drift_check 漂移诊断四态单测）
 #   L2  tests/p1-regression/test.sh     P1 跨层集成（44 断言）
 #   L4  tests/p1-build/build_check.sh   构建+八处版本一致性
 # 可选 L3：--with-device 追加 tests/p1-device/smoke.sh（legacy 真机冒烟）、
 #   tests/p3-device/smoke.sh（P3 综合 18 项）与 tests/p6-device/smoke.sh
 #   （P6-10 九场景：跳拍补偿/CronID/IPC 错误透传/DAG 波次+kill-9/控制/WebUI dag 键/
-#   配置期拒绝/还原基线；真实 Android 冒烟；无 adb/设备时明示 DEVICE_SKIPPED 不计失败）。
+#   配置期拒绝/还原基线；真实 Android 冒烟；无 adb/设备时明示 DEVICE_SKIPPED 不计失败）
+#   与 tests/p7-device/smoke.sh（P7-01：无退订标记/挂载文件在位/system_file
+#   上下文/CLI-on-PATH/Mountify 接管取证（按启动态条件 SKIP））。
 # 判定（AGENTS §4）：输出不得出现 [FAIL]；全部通过 → exit 0。
 # 可追溯（P2-01 出口）：完整逐层输出落盘
 #   tests/results/run_tests-<时间戳>.log（*.log 已被 .gitignore 忽略，
@@ -219,6 +224,7 @@ else
         "tests/p6-webui/test.sh" \
         "tests/p6-cli/test.sh" \
         "tests/p6-verify/test.sh" \
+        "tests/p7-mountify/test.sh" \
         "tests/p1-regression/test.sh" \
         "tests/p1-build/build_check.sh"; do
         run_suite "$suite"
@@ -232,6 +238,7 @@ else
         run_suite "tests/p1-device/smoke.sh" 900
         run_suite "tests/p3-device/smoke.sh" 900
         run_suite "tests/p6-device/smoke.sh" 5400
+        run_suite "tests/p7-device/smoke.sh" 300
     fi
 fi
 

@@ -232,6 +232,18 @@ set_perm_recursive $MODPATH/system/bin 0 0 0755 0755
 # Ensure the boot service script is executable
 set_perm $MODPATH/service.sh 0 0 0755
 
+# 🏷️ [PHASE 3.5] SELinux labeling (Mountify / magic-mount compatibility)
+# This module does NOT opt out of the host mount system: KernelSU/Magisk/APatch
+# magic mount handles it natively, and the Mountify metamodule mirrors the
+# source files' SELinux context onto its copy. A raw unzip can leave our
+# binaries as shell_data_file (observed on-device), which the mounter would
+# then propagate. Label them system_file so whatever mounts them exposes the
+# correct context. Best effort: chcon may be absent on exotic hosts.
+ui_print "- 🏷️ Labeling binaries as system_file for mount compatibility..."
+for SS_BIN in su-scheduler su-schedulerd su-scheduler-termux su-scheduler-runtime .su-scheduler-docs; do
+    chcon u:object_r:system_file:s0 "$MODPATH/system/bin/$SS_BIN" 2>/dev/null
+done
+
 # 🎉 Final Celebration
 ui_print "*********************************************************"
 ui_print "✅ Installation Complete! You're now a power user. 🚀"

@@ -169,6 +169,23 @@ EOF
 3.  Reboot.
 4.  Open terminal and type `su-scheduler` to start commanding!
 
+### 🧷 Mounting & Mountify Compatibility
+
+This module **delegates mounting entirely to the host mount system** — it
+never opts out (no `skip_mount`), never bind-mounts, and never overlays
+`/system/bin` itself. KernelSU / Magisk / APatch magic mount places the
+module's `system/bin` files at `/system/bin` natively, and
+[Mountify](https://github.com/backslashxx/mountify) — a metamodule — takes
+over when installed, re-staging them as a fresh per-boot copy. Both mean
+**module updates take effect on reboot, not live** (no live-edit). The
+installer labels the binaries `u:object_r:system_file:s0` so the mounter
+binds/copies them with the correct SELinux context (a raw unzip can leave a
+stale `shell_data_file` label). If `/system/bin` is not yet mounted (e.g.
+early boot), `service.sh` falls back to running the daemon straight from the
+module directory. `su-schedulerd` logs a one-line **Runtime version drift**
+warning when the mounted runtime and the module-directory copy differ, as a
+"reboot to propagate" hint.
+
 ---
 
 ## 📖 Usage Examples

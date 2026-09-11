@@ -36,6 +36,11 @@ done
 sleep 5
 
 # 🚀 [Phase 2] The Ignition
+# Mounting is delegated to the host mount system: KernelSU/Magisk/APatch magic
+# mount places our system/bin files here natively, and the Mountify metamodule
+# (when installed) re-stages them as a fresh per-boot copy. Both mean module
+# updates take effect on reboot, not live. This script never binds or overlays
+# /system/bin itself; it only picks the daemon and keeps it alive.
 # We try to start the daemon from the system path (magic mounted) first.
 # 🎯 Determine the correct binary path
 if [ -f "/system/bin/su-schedulerd" ]; then
