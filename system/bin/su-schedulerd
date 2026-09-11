@@ -6,7 +6,7 @@
 # Description: The background engine that makes magic happen.
 # ---------------------------------------------------------------------------------------
 
-VERSION="1.6.8"
+VERSION="1.6.9"
 
 # 🧹 CRITICAL: Clean environment to prevent shell interference
 unset $(env | grep -E '^(TERMUX_|PREFIX|ANDROID_|COLORTERM|TERM_PROGRAM)' | cut -d= -f1)
@@ -73,7 +73,7 @@ runtime_drift_check() {
     [ "${RUNTIME_LOADED:-0}" -eq 1 ] || return 0
     SS_MODRT="${SS_MODRT:-/data/adb/modules/su-scheduler/system/bin/su-scheduler-runtime}"
     [ -r "$SS_MODRT" ] || return 0
-    SS_MODVER=$(grep -m1 '^RUNTIME_LIB_VERSION=' "$SS_MODRT" 2>/dev/null | sed 's/^RUNTIME_LIB_VERSION="//; s/"$//')
+    SS_MODVER=$(grep -m1 '^RUNTIME_LIB_VERSION=' "$SS_MODRT" 2>/dev/null | sed 's/^RUNTIME_LIB_VERSION="1.6.9"$//')
     [ -n "$SS_MODVER" ] || return 0
     if [ "$SS_MODVER" != "${RUNTIME_LIB_VERSION:-}" ]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [WARNING] 🧪 Runtime version drift: mounted v${RUNTIME_LIB_VERSION:-?} != module-dir v$SS_MODVER (reboot to propagate update)" >> "$LOG_FILE" 2>/dev/null

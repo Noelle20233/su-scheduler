@@ -2,7 +2,7 @@
 
 > **A Modern Automation Powerhouse for Android** ⚡📱
 
-![Status](https://img.shields.io/badge/Status-Stable-brightgreen.svg?style=for-the-badge) ![Root](https://img.shields.io/badge/Root-REQUIRED-red.svg?style=for-the-badge) ![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge) ![Version](https://img.shields.io/badge/Version-1.6.8-blue.svg?style=for-the-badge)
+![Status](https://img.shields.io/badge/Status-Stable-brightgreen.svg?style=for-the-badge) ![Root](https://img.shields.io/badge/Root-REQUIRED-red.svg?style=for-the-badge) ![License](https://img.shields.io/badge/License-MIT-blue.svg?style=for-the-badge) ![Version](https://img.shields.io/badge/Version-1.6.9-blue.svg?style=for-the-badge)
 
 ---
 

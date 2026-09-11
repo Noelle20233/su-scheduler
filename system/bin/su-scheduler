@@ -6,7 +6,7 @@
 # ---------------------------------------------------------------------------------------
 
 # Version
-VERSION="1.6.8"
+VERSION="1.6.9"
 
 # 🧹 Clean environment
 unset $(env | grep -E '^(TERMUX_|PREFIX|ANDROID_|COLORTERM|TERM_PROGRAM)' | cut -d= -f1 2>/dev/null)

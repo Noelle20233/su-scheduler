@@ -1,8 +1,8 @@
 {
-  "version": "v1.6.8",
-  "versionCode": 11608,
-  "downloadURL": "https://github.com/rexackermann/su-scheduler/releases/download/v1.6.8/su-scheduler-v1.6.8.zip",
-  "changelog": "chore: bump version to v1.6.8 [skip ci]",
+  "version": "v1.6.9",
+  "versionCode": 11609,
+  "downloadURL": "https://github.com/rexackermann/su-scheduler/releases/download/v1.6.9/su-scheduler-v1.6.9.zip",
+  "changelog": "doc: \u6d4b\u8bd5",
   "forumURL": "https://github.com/rexackermann/su-scheduler",
   "updateType": "stable"
 }
